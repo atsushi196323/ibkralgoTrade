@@ -22,9 +22,9 @@ class IBKRConnection:
         max_retries: int = 5,
         base_delay_seconds: float = 1.0,
     ) -> None:
-        self.host: str = host or os.getenv("IBKR_HOST", "127.0.0.1")
-        self.port: int = int(port or os.getenv("IBKR_PORT", "7497"))
-        self.client_id: int = int(client_id or os.getenv("IBKR_CLIENT_ID", "1"))
+        self.host: str = host if host is not None else os.getenv("IBKR_HOST", "127.0.0.1")
+        self.port: int = int(port if port is not None else os.getenv("IBKR_PORT", "7497"))
+        self.client_id: int = int(client_id if client_id is not None else os.getenv("IBKR_CLIENT_ID", "1"))
         self.max_retries: int = max_retries
         self.base_delay_seconds: float = base_delay_seconds
 
