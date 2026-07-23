@@ -1,0 +1,245 @@
+"""execution/position_manager.py の単体テスト。"""
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from execution.position_manager import (
+    Position,
+    PositionManager,
+    STRATEGY_TYPE_DAY,
+    STRATEGY_TYPE_SWING,
+    STRATEGY_TYPE_UNKNOWN,
+)
+
+
+def _make_broker_position(symbol: str, position: float, avg_cost: float):
+    contract = MagicMock(symbol=symbol)
+    return MagicMock(contract=contract, position=position, avgCost=avg_cost)
+
+
+def _make_mock_ib(broker_positions: list) -> MagicMock:
+    ib = MagicMock()
+    ib.reqPositionsAsync = AsyncMock(return_value=broker_positions)
+    return ib
+
+
+def test_has_position_false_when_empty() -> None:
+    manager = PositionManager()
+
+    assert manager.has_position("AAPL") is False
+    assert manager.get_position("AAPL") is None
+
+
+def test_count_open_positions() -> None:
+    manager = PositionManager()
+
+    assert manager.count_open_positions() == 0
+
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    manager.open_position("MSFT", entry_price=200.0, quantity=1)
+    assert manager.count_open_positions() == 2
+
+    manager.close_position("AAPL")
+    assert manager.count_open_positions() == 1
+
+
+def test_open_symbols_returns_empty_list_when_no_positions() -> None:
+    manager = PositionManager()
+
+    assert manager.open_symbols() == []
+
+
+def test_open_symbols_returns_all_held_symbols() -> None:
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    manager.open_position("MSFT", entry_price=200.0, quantity=1)
+
+    assert set(manager.open_symbols()) == {"AAPL", "MSFT"}
+
+    manager.close_position("AAPL")
+    assert manager.open_symbols() == ["MSFT"]
+
+
+def test_open_position_creates_position_with_highest_price_at_entry() -> None:
+    manager = PositionManager()
+
+    position = manager.open_position("AAPL", entry_price=100.0, quantity=5)
+
+    assert isinstance(position, Position)
+    assert manager.has_position("AAPL") is True
+    assert position.symbol == "AAPL"
+    assert position.entry_price == 100.0
+    assert position.quantity == 5
+    assert position.highest_price == 100.0
+    assert position.risk_per_share == 0.0
+    assert position.strategy_type == STRATEGY_TYPE_UNKNOWN
+    assert manager.get_position("AAPL") is position
+
+
+def test_open_position_stores_risk_per_share_when_given() -> None:
+    manager = PositionManager()
+
+    position = manager.open_position("AAPL", entry_price=100.0, quantity=5, risk_per_share=4.5)
+
+    assert position.risk_per_share == 4.5
+
+
+def test_open_position_stores_strategy_type_when_given() -> None:
+    manager = PositionManager()
+
+    swing_position = manager.open_position(
+        "AAPL", entry_price=100.0, quantity=5, strategy_type=STRATEGY_TYPE_SWING
+    )
+    day_position = manager.open_position(
+        "MSFT", entry_price=200.0, quantity=1, strategy_type=STRATEGY_TYPE_DAY
+    )
+
+    assert swing_position.strategy_type == STRATEGY_TYPE_SWING
+    assert day_position.strategy_type == STRATEGY_TYPE_DAY
+
+
+def test_open_position_raises_on_empty_strategy_type() -> None:
+    manager = PositionManager()
+
+    with pytest.raises(ValueError):
+        manager.open_position("AAPL", entry_price=100.0, quantity=1, strategy_type="")
+
+
+@pytest.mark.parametrize("entry_price,quantity", [(0.0, 1), (-1.0, 1), (100.0, 0), (100.0, -1)])
+def test_open_position_raises_on_invalid_args(entry_price, quantity) -> None:
+    manager = PositionManager()
+
+    with pytest.raises(ValueError):
+        manager.open_position("AAPL", entry_price=entry_price, quantity=quantity)
+
+
+def test_open_position_raises_on_negative_risk_per_share() -> None:
+    manager = PositionManager()
+
+    with pytest.raises(ValueError):
+        manager.open_position("AAPL", entry_price=100.0, quantity=1, risk_per_share=-1.0)
+
+
+def test_open_position_raises_when_already_open() -> None:
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+
+    with pytest.raises(ValueError):
+        manager.open_position("AAPL", entry_price=110.0, quantity=1)
+
+
+def test_update_highest_price_raises_the_bar() -> None:
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+
+    position = manager.update_highest_price("AAPL", 120.0)
+
+    assert position.highest_price == 120.0
+
+
+def test_update_highest_price_does_not_decrease() -> None:
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    manager.update_highest_price("AAPL", 120.0)
+
+    position = manager.update_highest_price("AAPL", 110.0)
+
+    assert position.highest_price == 120.0
+
+
+def test_update_highest_price_raises_keyerror_when_no_position() -> None:
+    manager = PositionManager()
+
+    with pytest.raises(KeyError):
+        manager.update_highest_price("AAPL", 100.0)
+
+
+def test_close_position_removes_and_returns_position() -> None:
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+
+    closed = manager.close_position("AAPL")
+
+    assert closed.symbol == "AAPL"
+    assert manager.has_position("AAPL") is False
+
+
+def test_close_position_raises_keyerror_when_no_position() -> None:
+    manager = PositionManager()
+
+    with pytest.raises(KeyError):
+        manager.close_position("AAPL")
+
+
+# --- sync_with_broker_async ------------------------------------------------
+
+
+def test_sync_discovers_untracked_broker_position() -> None:
+    manager = PositionManager()
+    ib = _make_mock_ib([_make_broker_position("AAPL", 10, 150.0)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    assert manager.has_position("AAPL") is True
+    position = manager.get_position("AAPL")
+    assert position.entry_price == 150.0
+    assert position.quantity == 10
+    assert position.highest_price == 150.0
+    assert position.strategy_type == STRATEGY_TYPE_UNKNOWN
+
+
+def test_sync_ignores_zero_quantity_broker_positions() -> None:
+    manager = PositionManager()
+    ib = _make_mock_ib([_make_broker_position("AAPL", 0, 150.0)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    assert manager.has_position("AAPL") is False
+
+
+def test_sync_overwrites_existing_position_with_broker_values() -> None:
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=5)
+    ib = _make_mock_ib([_make_broker_position("AAPL", 8, 105.0)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    position = manager.get_position("AAPL")
+    assert position.entry_price == 105.0
+    assert position.quantity == 8
+
+
+def test_sync_preserves_highest_price_above_broker_avg_cost() -> None:
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=5)
+    manager.update_highest_price("AAPL", 120.0)
+    ib = _make_mock_ib([_make_broker_position("AAPL", 5, 100.0)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    assert manager.get_position("AAPL").highest_price == 120.0
+
+
+def test_sync_keeps_local_only_position_not_reported_by_broker() -> None:
+    # ドライラン注文でローカルに建てたが、ブローカー側には未反映のポジション。
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    ib = _make_mock_ib([])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    assert manager.has_position("AAPL") is True
+    assert manager.get_position("AAPL").entry_price == 100.0
+
+
+def test_sync_prevents_duplicate_entry_for_symbol_already_held_at_broker() -> None:
+    manager = PositionManager()
+    ib = _make_mock_ib([_make_broker_position("RIVN", 3, 20.0)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    # 既にブローカー側で保有中なので、新規エントリー判定側は
+    # has_position=True を見て買い注文をスキップできる。
+    assert manager.has_position("RIVN") is True
