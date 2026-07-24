@@ -51,6 +51,12 @@ SCREENER_NUM_CANDIDATES: int = 50
 # IBKRのペーシング制限を避けるため、PER取得(reqFundamentalDataAsync)を
 # 連続発行せずこの秒数だけ間隔を空ける
 SCREENER_PE_REQUEST_INTERVAL_SECONDS: float = 1.0
+# 長期トレンドフィルター: 明確な下降トレンド(200日移動平均割れ)の銘柄を除外する。
+# 75銘柄・447トレードの実データ検証で、長期トレンドと平均回帰戦略の
+# profit_factorに弱い正の相関(+0.16〜+0.18)が確認されたための追加条件。
+SCREENER_ENABLE_TREND_FILTER: bool = True
+SCREENER_TREND_MA_WINDOW: int = 200
+SCREENER_TREND_LOOKBACK_DURATION: str = "300 D"
 
 # 監視ループのポーリング間隔（秒）: 市場時間中/時間外で切り替える
 POLL_INTERVAL_SECONDS: float = 60.0
@@ -313,6 +319,9 @@ async def _refresh_watchlist_async(ib: IB, fallback_watchlist: List[str]) -> Lis
         scan_code=SCREENER_SCAN_CODE,
         number_of_rows=SCREENER_NUM_CANDIDATES,
         pe_request_interval_seconds=SCREENER_PE_REQUEST_INTERVAL_SECONDS,
+        enable_trend_filter=SCREENER_ENABLE_TREND_FILTER,
+        trend_ma_window=SCREENER_TREND_MA_WINDOW,
+        trend_lookback_duration=SCREENER_TREND_LOOKBACK_DURATION,
     )
 
     try:

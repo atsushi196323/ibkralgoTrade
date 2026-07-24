@@ -33,36 +33,44 @@ def test_init_uses_hardcoded_defaults_when_no_args_or_env(monkeypatch, mock_ib_c
     monkeypatch.delenv("IBKR_HOST", raising=False)
     monkeypatch.delenv("IBKR_PORT", raising=False)
     monkeypatch.delenv("IBKR_CLIENT_ID", raising=False)
+    monkeypatch.delenv("IBKR_MARKET_DATA_TYPE", raising=False)
 
     connection = IBKRConnection()
 
     assert connection.host == "127.0.0.1"
     assert connection.port == 7497
     assert connection.client_id == 1
+    # ペーパー口座はリアルタイムデータの購読契約を持たないことが多いため、
+    # 未設定時は遅延データ(3)をデフォルトにする。
+    assert connection.market_data_type == 3
 
 
 def test_init_reads_from_env_vars(monkeypatch, mock_ib_class) -> None:
     monkeypatch.setenv("IBKR_HOST", "10.0.0.5")
     monkeypatch.setenv("IBKR_PORT", "4002")
     monkeypatch.setenv("IBKR_CLIENT_ID", "42")
+    monkeypatch.setenv("IBKR_MARKET_DATA_TYPE", "1")
 
     connection = IBKRConnection()
 
     assert connection.host == "10.0.0.5"
     assert connection.port == 4002
     assert connection.client_id == 42
+    assert connection.market_data_type == 1
 
 
 def test_init_explicit_args_override_env(monkeypatch, mock_ib_class) -> None:
     monkeypatch.setenv("IBKR_HOST", "10.0.0.5")
     monkeypatch.setenv("IBKR_PORT", "4002")
     monkeypatch.setenv("IBKR_CLIENT_ID", "42")
+    monkeypatch.setenv("IBKR_MARKET_DATA_TYPE", "1")
 
-    connection = IBKRConnection(host="192.168.1.1", port=7496, client_id=99)
+    connection = IBKRConnection(host="192.168.1.1", port=7496, client_id=99, market_data_type=4)
 
     assert connection.host == "192.168.1.1"
     assert connection.port == 7496
     assert connection.client_id == 99
+    assert connection.market_data_type == 4
 
 
 def test_init_registers_disconnected_handler(mock_ib_class) -> None:
@@ -89,6 +97,29 @@ def test_connect_async_succeeds_on_first_attempt(mock_ib_class) -> None:
     mock_instance.connectAsync.assert_awaited_once_with(
         "127.0.0.1", 7497, clientId=1
     )
+
+
+def test_connect_async_sets_market_data_type_on_success(mock_ib_class) -> None:
+    _, mock_instance = mock_ib_class
+    connection = IBKRConnection(host="127.0.0.1", port=7497, client_id=1, market_data_type=3)
+
+    asyncio.run(connection.connect_async())
+
+    mock_instance.reqMarketDataType.assert_called_once_with(3)
+
+
+def test_connect_async_does_not_set_market_data_type_when_all_attempts_fail(
+    mock_ib_class,
+) -> None:
+    _, mock_instance = mock_ib_class
+    mock_instance.connectAsync = AsyncMock(side_effect=ConnectionRefusedError("always fails"))
+    connection = IBKRConnection(max_retries=2, base_delay_seconds=1.0)
+
+    with patch("core.connection.asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(ConnectionError):
+            asyncio.run(connection.connect_async())
+
+    mock_instance.reqMarketDataType.assert_not_called()
 
 
 def test_connect_async_retries_with_exponential_backoff_then_succeeds(

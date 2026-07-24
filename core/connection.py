@@ -12,6 +12,13 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# ib.reqMarketDataType()に渡すマーケットデータ種別。
+# https://interactivebrokers.github.io/tws-api/market_data_type.html
+MARKET_DATA_TYPE_LIVE: int = 1
+MARKET_DATA_TYPE_FROZEN: int = 2
+MARKET_DATA_TYPE_DELAYED: int = 3
+MARKET_DATA_TYPE_DELAYED_FROZEN: int = 4
+
 
 class IBKRConnection:
     def __init__(
@@ -19,12 +26,21 @@ class IBKRConnection:
         host: Optional[str] = None,
         port: Optional[int] = None,
         client_id: Optional[int] = None,
+        market_data_type: Optional[int] = None,
         max_retries: int = 5,
         base_delay_seconds: float = 1.0,
     ) -> None:
         self.host: str = host if host is not None else os.getenv("IBKR_HOST", "127.0.0.1")
         self.port: int = int(port if port is not None else os.getenv("IBKR_PORT", "7497"))
         self.client_id: int = int(client_id if client_id is not None else os.getenv("IBKR_CLIENT_ID", "1"))
+        # ペーパー口座はリアルタイムデータの購読契約を持たないことが多く、
+        # 未設定のままだとreqMktData/reqHistoricalDataが実データを返せず
+        # 検証ができない。デフォルトは遅延データ(3)とし、購読契約がある
+        # 場合のみ環境変数でLIVE(1)に切り替えられるようにする。
+        self.market_data_type: int = int(
+            market_data_type if market_data_type is not None
+            else os.getenv("IBKR_MARKET_DATA_TYPE", str(MARKET_DATA_TYPE_DELAYED))
+        )
         self.max_retries: int = max_retries
         self.base_delay_seconds: float = base_delay_seconds
 
@@ -44,6 +60,8 @@ class IBKRConnection:
                 )
                 await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
                 logger.info("TWSへの接続に成功しました。")
+                self.ib.reqMarketDataType(self.market_data_type)
+                logger.info("マーケットデータタイプを設定しました: %s", self.market_data_type)
                 return self.ib
             except Exception as exc:
                 last_error = exc
