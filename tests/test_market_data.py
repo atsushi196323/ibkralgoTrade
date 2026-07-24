@@ -6,7 +6,58 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pandas as pd
 import pytest
 
-from data.market_data import get_intraday_bars_async
+from data.market_data import get_current_price_async, get_intraday_bars_async
+
+
+def _make_ticker(market_price, close):
+    ticker = MagicMock()
+    ticker.marketPrice = MagicMock(return_value=market_price)
+    ticker.close = close
+    return ticker
+
+
+def test_get_current_price_returns_market_price_when_available() -> None:
+    ib = MagicMock()
+    contract = MagicMock(symbol="AAPL")
+    ticker = _make_ticker(market_price=150.0, close=149.5)
+    ib.reqTickersAsync = AsyncMock(return_value=[ticker])
+
+    price = asyncio.run(get_current_price_async(ib, contract))
+
+    assert price == 150.0
+
+
+def test_get_current_price_falls_back_to_close_when_market_price_is_nan() -> None:
+    ib = MagicMock()
+    contract = MagicMock(symbol="AAPL")
+    ticker = _make_ticker(market_price=float("nan"), close=149.5)
+    ib.reqTickersAsync = AsyncMock(return_value=[ticker])
+
+    price = asyncio.run(get_current_price_async(ib, contract))
+
+    assert price == 149.5
+
+
+def test_get_current_price_returns_none_when_market_price_and_close_are_both_nan() -> None:
+    ib = MagicMock()
+    contract = MagicMock(symbol="AAPL")
+    ticker = _make_ticker(market_price=float("nan"), close=float("nan"))
+    ib.reqTickersAsync = AsyncMock(return_value=[ticker])
+
+    price = asyncio.run(get_current_price_async(ib, contract))
+
+    assert price is None
+
+
+def test_get_current_price_returns_none_when_market_price_and_close_are_both_none() -> None:
+    ib = MagicMock()
+    contract = MagicMock(symbol="AAPL")
+    ticker = _make_ticker(market_price=None, close=None)
+    ib.reqTickersAsync = AsyncMock(return_value=[ticker])
+
+    price = asyncio.run(get_current_price_async(ib, contract))
+
+    assert price is None
 
 
 def test_get_intraday_bars_delegates_to_historical_bars_with_given_params() -> None:
