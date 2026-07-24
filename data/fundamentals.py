@@ -45,10 +45,19 @@ async def run_market_cap_scan_async(
     scan_data = await ib.reqScannerDataAsync(subscription)
 
     stocks = [item.contractDetails.contract for item in scan_data]
-    logger.info(
-        "時価総額スキャン完了: scan_code=%s cap=[%.0f, %.0f] hits=%d",
-        scan_code, market_cap_above, market_cap_below, len(stocks),
-    )
+    if not stocks:
+        # MOST_ACTIVE等の一般的なscan_codeで0件になるのは通常考えにくく、
+        # 口座にマーケットスキャナーの購読権限が無いケースが多い。
+        logger.warning(
+            "時価総額スキャンの結果が0件でした: scan_code=%s cap=[%.0f, %.0f]。"
+            "マーケットスキャナーの購読権限が無い可能性があります。",
+            scan_code, market_cap_above, market_cap_below,
+        )
+    else:
+        logger.info(
+            "時価総額スキャン完了: scan_code=%s cap=[%.0f, %.0f] hits=%d",
+            scan_code, market_cap_above, market_cap_below, len(stocks),
+        )
     return stocks
 
 

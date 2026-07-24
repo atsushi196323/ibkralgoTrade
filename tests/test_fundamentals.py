@@ -39,6 +39,19 @@ def test_run_market_cap_scan_returns_contracts_from_scan_results() -> None:
     assert [s.symbol for s in stocks] == ["AAPL", "MSFT"]
 
 
+def test_run_market_cap_scan_warns_when_zero_hits(caplog) -> None:
+    ib = MagicMock()
+    ib.reqScannerDataAsync = AsyncMock(return_value=[])
+
+    with caplog.at_level("WARNING", logger="data.fundamentals"):
+        stocks = asyncio.run(
+            run_market_cap_scan_async(ib, market_cap_above=1e9, market_cap_below=1e11)
+        )
+
+    assert stocks == []
+    assert any("購読権限" in record.message for record in caplog.records)
+
+
 def test_run_market_cap_scan_builds_subscription_with_market_cap_filters() -> None:
     ib = MagicMock()
     ib.reqScannerDataAsync = AsyncMock(return_value=[])
