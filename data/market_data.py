@@ -29,6 +29,9 @@ async def get_current_price_async(ib: IB, contract: Stock) -> Optional[float]:
     price = ticker.marketPrice()
     if price is None or price != price:  # NaNチェック
         price = ticker.close
+    if price is None or price != price:  # フォールバック先(close)もNaN/Noneの場合、取得失敗として扱う
+        logger.warning("%s の現在価格を取得できませんでした（marketPrice/closeともに欠測）。", contract.symbol)
+        return None
     logger.info("%s の現在価格: %s", contract.symbol, price)
     return price
 

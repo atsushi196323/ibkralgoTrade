@@ -13,6 +13,7 @@ from main import (
     DAY_STOP_LOSS_PCT,
     SWING_STOP_LOSS_PCT,
     _refresh_watchlist_async,
+    main,
     process_symbol_async,
     run_watchlist_cycle_async,
 )
@@ -529,3 +530,82 @@ def test_refresh_watchlist_falls_back_when_screening_raises() -> None:
         result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"]))
 
     assert result == ["FALLBACK"]
+
+
+# --- main()のTWS接続維持（切断検知・再接続） ---------------------------------------
+
+
+def _make_fake_connection(connect_side_effect) -> MagicMock:
+    connection = MagicMock()
+    connection.connect_async = AsyncMock(side_effect=connect_side_effect)
+    connection.disconnect_async = AsyncMock()
+    return connection
+
+
+def test_main_reconnects_when_ib_reports_disconnected() -> None:
+    ib_disconnected = MagicMock()
+    ib_disconnected.isConnected = MagicMock(return_value=False)
+    ib_connected = MagicMock()
+    ib_connected.isConnected = MagicMock(return_value=True)
+    connection = _make_fake_connection([ib_disconnected, ib_connected])
+
+    sleep_calls = {"n": 0}
+
+    async def fake_sleep(_seconds):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 2:
+            raise KeyboardInterrupt()
+
+    with patch("main.IBKRConnection", return_value=connection), \
+        patch("main.is_regular_trading_hours", return_value=False), \
+        patch("main.asyncio.sleep", new=fake_sleep):
+        asyncio.run(main())
+
+    # 1回目: ib=None -> connect。2回目: 前回のibがisConnected()=Falseを返す -> 再接続。
+    assert connection.connect_async.await_count == 2
+    connection.disconnect_async.assert_awaited_once()
+
+
+def test_main_continues_after_unexpected_exception_in_cycle() -> None:
+    ib = MagicMock()
+    ib.isConnected = MagicMock(return_value=True)
+    connection = _make_fake_connection([ib])
+
+    sleep_calls = {"n": 0}
+
+    async def fake_sleep(_seconds):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 2:
+            raise KeyboardInterrupt()
+
+    with patch("main.IBKRConnection", return_value=connection), \
+        patch("main.is_regular_trading_hours", return_value=True), \
+        patch("main._refresh_watchlist_async", new=AsyncMock(return_value=["AAPL"])), \
+        patch(
+            "main.run_watchlist_cycle_async", new=AsyncMock(side_effect=RuntimeError("boom")),
+        ) as mock_cycle, \
+        patch("main.asyncio.sleep", new=fake_sleep):
+        asyncio.run(main())
+
+    # サイクル処理中の例外でプロセス全体が落ちず、次のループでも処理が継続される
+    assert mock_cycle.await_count == 2
+    connection.disconnect_async.assert_awaited_once()
+
+
+def test_main_retries_after_connection_error_exhausted() -> None:
+    connection = _make_fake_connection(ConnectionError("TWSへの接続に失敗しました"))
+
+    sleep_calls = {"n": 0}
+
+    async def fake_sleep(_seconds):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 2:
+            raise KeyboardInterrupt()
+
+    with patch("main.IBKRConnection", return_value=connection), \
+        patch("main.asyncio.sleep", new=fake_sleep):
+        asyncio.run(main())
+
+    # connect_asyncのリトライを使い果たしても、プロセスを落とさず再試行し続ける
+    assert connection.connect_async.await_count == 2
+    connection.disconnect_async.assert_awaited_once()

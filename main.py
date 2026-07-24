@@ -345,20 +345,41 @@ async def main() -> None:
     watchlist: List[str] = list(WATCHLIST)
     last_screened_date: Optional[date] = None
 
+    ib: Optional[IB] = None
     try:
-        ib = await connection.connect_async()
         while True:
-            if is_regular_trading_hours():
-                today = datetime.now(US_EASTERN).date()
-                if today != last_screened_date:
-                    watchlist = await _refresh_watchlist_async(ib, watchlist)
-                    last_screened_date = today
+            try:
+                # TWSとの接続はメンテナンスやネットワーク瞬断で稼働中に切れうるため、
+                # サイクルの先頭で毎回接続状態を確認し、切れていれば再接続する
+                # （connect_async自体は指数的バックオフ付きリトライを内包している）。
+                if ib is None or not ib.isConnected():
+                    ib = await connection.connect_async()
 
-                await run_watchlist_cycle_async(ib, watchlist, position_manager, trade_journal)
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
-            else:
-                logger.info("市場時間外のため、シグナル評価をスキップします。")
+                if is_regular_trading_hours():
+                    today = datetime.now(US_EASTERN).date()
+                    if today != last_screened_date:
+                        watchlist = await _refresh_watchlist_async(ib, watchlist)
+                        last_screened_date = today
+
+                    await run_watchlist_cycle_async(ib, watchlist, position_manager, trade_journal)
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                else:
+                    logger.info("市場時間外のため、シグナル評価をスキップします。")
+                    await asyncio.sleep(CLOSED_MARKET_POLL_INTERVAL_SECONDS)
+            except ConnectionError:
+                # connect_asyncのリトライを使い果たした場合（延長メンテナンス等）。
+                # プロセスを落とさず、時間外ポーリング間隔でリトライし続ける。
+                logger.exception(
+                    "TWSへの再接続に失敗しました。%.0f秒後に再試行します。",
+                    CLOSED_MARKET_POLL_INTERVAL_SECONDS,
+                )
                 await asyncio.sleep(CLOSED_MARKET_POLL_INTERVAL_SECONDS)
+            except Exception:
+                # サイクル処理中の予期しないエラー（サイクル途中の切断等を含む）で
+                # プロセス全体を落とさない。次のループ先頭でisConnected()により
+                # 再接続要否を判定する。
+                logger.exception("監視サイクルの処理中にエラーが発生しました。次のサイクルで再試行します。")
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
     except KeyboardInterrupt:
         logger.info("ユーザーの割り込みにより停止します。")
     finally:
