@@ -78,6 +78,7 @@ backtest/
   run.py                    バックテスト/ウォークフォワードのCLI
 scripts/
   check_market_data.py      実機でマーケットデータの取得経路を切り分ける診断CLI
+  export_tax_report.py      確定申告用CSVを出力するCLI
 tests/                      単体テスト。IBKRへの実接続は不要（すべてモック）
 conftest.py                 pytest共通設定
 ```
@@ -110,11 +111,15 @@ conftest.py                 pytest共通設定
 
 ブローカー同期で発見した出所不明のポジションは、より安全側であるスイング基準で決済判定する。
 
+### ブローカー同期の対象
+
+`ib.reqPositionsAsync()` は全口座・全アセットクラスの建玉を返すため、取り込む対象を **米国株（`secType="STK"`）・USD建て・ロング（数量が正）** に限定する。シンボル文字列だけで突き合わせると、AAPLのコールオプションや他国上場の同名株を現物ポジションとして誤って取り込む。ショートは本Botがロング専用であるため対象外とする（取り込むと決済時のSELL数量が負になり発注処理が落ちる）。
+
 ### リスク管理
 
 - **1トレードあたりのリスク:** 口座資金の **1%**。損切り幅から逆算して発注数量を決める（固定ロットではない）
 - **最大同時保有ポジション数:** **5銘柄**。銘柄ごとの1%リスクが積み上がるのを防ぐ
-- **日次サーキットブレーカー:** 当日の実現損益が口座資金の **-3%** に達したら新規エントリーを停止する。既存ポジションの決済判定（損切り等）は継続する
+- **日次サーキットブレーカー:** 当日の実現損益（**手数料控除後**）が口座資金の **-3%** に達したら新規エントリーを停止する。既存ポジションの決済判定（損切り等）は継続する
 - **最大ロット数:** ドライラン検証中の安全弁として `execution/order_manager.MAX_POSITION_SIZE`（現在10株）でハードクランプする
 
 ### 銘柄選定
@@ -221,6 +226,11 @@ python -m backtest.run --symbol RIVN --duration "2 Y" --mode backtest
 # マーケットデータ取得経路の診断（IB Gateway接続時、米国市場の取引時間内に実行）
 python -m scripts.check_market_data
 python -m scripts.check_market_data --symbol MSFT --wait 10
+
+# 確定申告用CSVの出力（既定は前年分。IBKR接続不要）
+python -m scripts.export_tax_report
+python -m scripts.export_tax_report --year 2026
+python -m scripts.export_tax_report --all-years
 ```
 
 ## 9. 開発時の禁止事項 (Constraints)
