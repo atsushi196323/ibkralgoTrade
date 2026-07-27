@@ -157,3 +157,21 @@ def test_export_returns_zero_and_writes_header_only_when_no_matching_trades(tmp_
         reader = csv.DictReader(f)
         rows = list(reader)
     assert rows == []
+
+
+def test_money_columns_are_rounded_to_avoid_float_artifacts() -> None:
+    """二進浮動小数の誤差がそのまま出ると税理士へ渡す書類として体裁が悪い。"""
+    trades = [
+        TradeRecord(
+            symbol="AAPL", entry_price=180.0, exit_price=198.0, quantity=10,
+            reason="TAKE_PROFIT", pnl=180.0, pnl_pct=10.0, r_multiple=2.0,
+            closed_at="2026-05-20T15:00:00+00:00",
+            commission=2.5, usd_jpy_rate=152.3, entry_date="2026-04-02T14:31:00+00:00",
+        )
+    ]
+
+    row = build_tax_export_rows(trades)[0]
+
+    # 丸めなければ 27033.250000000004 になる
+    assert row.pnl_jpy == 27033.25
+    assert row.pnl_usd == 177.5

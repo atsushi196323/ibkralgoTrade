@@ -53,6 +53,17 @@ def _closed_at_to_jst_year(closed_at: str) -> int:
     return datetime.fromisoformat(closed_at).astimezone(JST).year
 
 
+# 金額列の丸め桁数。二進浮動小数の誤差がそのままCSVに出ると
+# (例: 27033.250000000004) 税理士へ渡す書類として体裁が悪いため、
+# 通貨の最小単位より1桁細かいところで丸める。
+# 税務上の端数処理そのものは税理士の判断に委ねるため、ここでは切り捨て等は行わない。
+_MONEY_DIGITS: int = 2
+
+
+def _round_money(value: Optional[float]) -> Optional[float]:
+    return None if value is None else round(value, _MONEY_DIGITS)
+
+
 def _to_export_row(trade: TradeRecord) -> TaxExportRow:
     return TaxExportRow(
         symbol=trade.symbol,
@@ -61,12 +72,12 @@ def _to_export_row(trade: TradeRecord) -> TaxExportRow:
         quantity=trade.quantity,
         entry_price_usd=trade.entry_price,
         exit_price_usd=trade.exit_price,
-        cost_usd=trade.entry_price * trade.quantity,
-        proceeds_usd=trade.exit_price * trade.quantity,
+        cost_usd=_round_money(trade.entry_price * trade.quantity),
+        proceeds_usd=_round_money(trade.exit_price * trade.quantity),
         commission_usd=trade.commission,
         usd_jpy_rate=trade.usd_jpy_rate,
-        pnl_usd=trade.net_pnl_usd,
-        pnl_jpy=trade.net_pnl_jpy,
+        pnl_usd=_round_money(trade.net_pnl_usd),
+        pnl_jpy=_round_money(trade.net_pnl_jpy),
     )
 
 
