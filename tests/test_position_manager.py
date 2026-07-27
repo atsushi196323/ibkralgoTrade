@@ -17,8 +17,11 @@ from execution.position_manager import (
 )
 
 
-def _make_broker_position(symbol: str, position: float, avg_cost: float):
-    contract = MagicMock(symbol=symbol)
+def _make_broker_position(
+    symbol: str, position: float, avg_cost: float,
+    sec_type: str = "STK", currency: str = "USD",
+):
+    contract = MagicMock(symbol=symbol, secType=sec_type, currency=currency)
     return MagicMock(contract=contract, position=position, avgCost=avg_cost)
 
 
@@ -380,3 +383,84 @@ def test_highest_price_is_not_rewritten_when_unchanged(tmp_path) -> None:
         assert mock_save.call_count == 0
         manager.update_highest_price("AAPL", 110.0)  # 高値更新 -> 保存する
         assert mock_save.call_count == 1
+
+
+# --- ブローカー同期の対象絞り込み ------------------------------------------------
+
+
+def test_sync_ignores_option_position_with_the_same_underlying_symbol() -> None:
+    """AAPLのコールオプションもcontract.symbolは"AAPL"になる。
+
+    シンボル文字列だけで突き合わせると、オプションの建玉を現物ポジションとして
+    取り込み、存在しない現物株の決済判定を始めてしまう。
+    """
+    manager = PositionManager()
+    ib = _make_mock_ib([_make_broker_position("AAPL", 1, 500.0, sec_type="OPT")])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    assert manager.has_position("AAPL") is False
+
+
+@pytest.mark.parametrize("sec_type", ["OPT", "FUT", "CASH", "BOND"])
+def test_sync_only_tracks_stock_positions(sec_type) -> None:
+    manager = PositionManager()
+    ib = _make_mock_ib([_make_broker_position("XYZ", 10, 100.0, sec_type=sec_type)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    assert manager.count_open_positions() == 0
+
+
+def test_sync_ignores_non_usd_listing_of_the_same_symbol() -> None:
+    # 例: トロント上場銘柄はcontract.symbolが米国株と衝突しうる
+    manager = PositionManager()
+    ib = _make_mock_ib([_make_broker_position("SHOP", 10, 100.0, currency="CAD")])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    assert manager.has_position("SHOP") is False
+
+
+def test_sync_ignores_short_positions() -> None:
+    """本Botはロング専用。ショートを取り込むと決済時のSELL数量が負になる。"""
+    manager = PositionManager()
+    ib = _make_mock_ib([_make_broker_position("AAPL", -50, 100.0)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    assert manager.has_position("AAPL") is False
+
+
+def test_sync_tracks_us_stock_long_position() -> None:
+    manager = PositionManager()
+    ib = _make_mock_ib([_make_broker_position("AAPL", 10, 100.0)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    assert manager.get_position("AAPL").quantity == 10
+
+
+def test_sync_picks_tracked_position_out_of_a_mixed_portfolio() -> None:
+    manager = PositionManager()
+    ib = _make_mock_ib([
+        _make_broker_position("AAPL", 2, 500.0, sec_type="OPT"),
+        _make_broker_position("EUR", 10000, 1.1, sec_type="CASH"),
+        _make_broker_position("MSFT", -20, 400.0),
+        _make_broker_position("AAPL", 10, 190.0),
+    ])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    assert manager.open_symbols() == ["AAPL"]
+    assert manager.get_position("AAPL").quantity == 10
+
+
+def test_sync_does_not_persist_when_nothing_is_tracked(tmp_path) -> None:
+    path = str(tmp_path / "positions.json")
+    manager = PositionManager(state_path=path)
+    ib = _make_mock_ib([_make_broker_position("AAPL", 1, 500.0, sec_type="OPT")])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    assert not os.path.exists(path)
