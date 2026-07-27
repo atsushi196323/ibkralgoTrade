@@ -62,6 +62,64 @@ def test_record_trade_persists_none_r_multiple(journal_path) -> None:
     assert trades[0].r_multiple is None
 
 
+def test_record_trade_persists_commission_and_usd_jpy_rate(journal_path) -> None:
+    journal = TradeJournal(journal_path)
+
+    journal.record_trade(
+        symbol="AAPL", entry_price=100.0, exit_price=110.0, quantity=10,
+        reason="TAKE_PROFIT", pnl=100.0, pnl_pct=10.0, r_multiple=2.0,
+        commission=1.5, usd_jpy_rate=150.0,
+    )
+
+    trade = journal.load_trades()[0]
+    assert trade.commission == pytest.approx(1.5)
+    assert trade.usd_jpy_rate == pytest.approx(150.0)
+    # net_pnl_usd = pnl(100.0) - commission(1.5)
+    assert trade.net_pnl_usd == pytest.approx(98.5)
+    # net_pnl_jpy = net_pnl_usd(98.5) * usd_jpy_rate(150.0)
+    assert trade.net_pnl_jpy == pytest.approx(98.5 * 150.0)
+
+
+def test_record_trade_persists_entry_date(journal_path) -> None:
+    journal = TradeJournal(journal_path)
+
+    journal.record_trade(
+        symbol="AAPL", entry_price=100.0, exit_price=110.0, quantity=10,
+        reason="TAKE_PROFIT", pnl=100.0, pnl_pct=10.0, r_multiple=2.0,
+        entry_date="2026-01-05T00:00:00+00:00",
+    )
+
+    trade = journal.load_trades()[0]
+    assert trade.entry_date == "2026-01-05T00:00:00+00:00"
+
+
+def test_record_trade_defaults_commission_and_rate_when_omitted(journal_path) -> None:
+    journal = TradeJournal(journal_path)
+
+    journal.record_trade(
+        symbol="AAPL", entry_price=100.0, exit_price=110.0, quantity=10,
+        reason="TAKE_PROFIT", pnl=100.0, pnl_pct=10.0, r_multiple=2.0,
+    )
+
+    trade = journal.load_trades()[0]
+    assert trade.commission == pytest.approx(0.0)
+    assert trade.usd_jpy_rate is None
+    assert trade.net_pnl_jpy is None
+
+
+def test_load_trades_falls_back_when_reading_legacy_csv_without_new_columns(journal_path) -> None:
+    # commission/usd_jpy_rate列を持たない旧フォーマットのCSVでも読めること
+    with open(journal_path, "w", newline="", encoding="utf-8") as f:
+        f.write("symbol,entry_price,exit_price,quantity,reason,pnl,pnl_pct,r_multiple,closed_at\n")
+        f.write("AAPL,100.0,110.0,10,TAKE_PROFIT,100.0,10.0,2.0,2026-01-01T00:00:00+00:00\n")
+
+    journal = TradeJournal(journal_path)
+    trade = journal.load_trades()[0]
+
+    assert trade.commission == pytest.approx(0.0)
+    assert trade.usd_jpy_rate is None
+
+
 def test_load_trades_returns_empty_list_when_file_missing(journal_path) -> None:
     journal = TradeJournal(journal_path)
 
@@ -113,6 +171,42 @@ def test_compute_stats_mixed_wins_and_losses(journal_path) -> None:
     assert stats.total_pnl == pytest.approx(50.0)
     assert stats.profit_factor == pytest.approx(100.0 / 50.0)
     assert stats.avg_r_multiple == pytest.approx((2.0 + (-1.0)) / 2)
+
+
+def test_compute_stats_total_pnl_jpy_none_when_no_rate_recorded(journal_path) -> None:
+    journal = TradeJournal(journal_path)
+    journal.record_trade(
+        symbol="AAPL", entry_price=100.0, exit_price=110.0, quantity=10,
+        reason="TAKE_PROFIT", pnl=100.0, pnl_pct=10.0, r_multiple=2.0,
+    )
+
+    stats = journal.compute_stats()
+
+    assert stats.total_pnl_jpy is None
+
+
+def test_compute_stats_total_pnl_jpy_sums_only_trades_with_rate(journal_path) -> None:
+    journal = TradeJournal(journal_path)
+    journal.record_trade(
+        symbol="AAPL", entry_price=100.0, exit_price=110.0, quantity=10,
+        reason="TAKE_PROFIT", pnl=100.0, pnl_pct=10.0, r_multiple=2.0,
+        commission=0.0, usd_jpy_rate=150.0,
+    )
+    # usd_jpy_rate未記録(旧レコード相当)は円換算合計から除外される
+    journal.record_trade(
+        symbol="MSFT", entry_price=200.0, exit_price=190.0, quantity=5,
+        reason="STOP_LOSS", pnl=-50.0, pnl_pct=-5.0, r_multiple=-1.0,
+    )
+    journal.record_trade(
+        symbol="GOOG", entry_price=100.0, exit_price=105.0, quantity=2,
+        reason="TAKE_PROFIT", pnl=10.0, pnl_pct=5.0, r_multiple=1.0,
+        commission=1.0, usd_jpy_rate=145.0,
+    )
+
+    stats = journal.compute_stats()
+
+    # (100.0 - 0.0) * 150.0 + (10.0 - 1.0) * 145.0
+    assert stats.total_pnl_jpy == pytest.approx(100.0 * 150.0 + 9.0 * 145.0)
 
 
 def test_summarize_trade_records_all_wins_infinite_profit_factor() -> None:

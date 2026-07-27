@@ -15,12 +15,13 @@
 - **ブローカーAPI:** `ib_insync` (公式 `ibapi` ではなく、非同期処理に最適化されたラッパーを使用)
 - **データ処理:** `pandas`, `numpy`
 - **環境変数管理:** `python-dotenv`
-- **接続先:** TWS (Trader Workstation) ペーパートレード環境
+- **接続先:** TWS (Trader Workstation) または IB Gateway のペーパートレード環境（`core/connection.py` はib_insyncの標準ソケットAPIのみに依存しており、TWS固有のGUI機能には依存しないため、どちらでも動作する）
 
 ## 3. 実行環境と設定 (Environment & Config)
 
 - **Host:** 127.0.0.1
 - **Port:** 7497 (※TWSのペーパートレード用ポート。本番環境への移行時は7496に変更すること)
+  - IB Gatewayで検証する場合は `.env` の `IBKR_PORT` を `4002`(ペーパー)に変更する（コード変更は不要。本番用ポートは`4001`だが7.開発時の禁止事項により直接接続は禁止）
 - **Client ID:** 1 (重複を避けること)
 
 ## 4. ディレクトリ構成 (Architecture)

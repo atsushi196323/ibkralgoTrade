@@ -25,7 +25,7 @@ DEFAULT_JOURNAL_PATH: str = "logs/trade_journal.csv"
 
 _FIELDNAMES: List[str] = [
     "symbol", "entry_price", "exit_price", "quantity", "reason",
-    "pnl", "pnl_pct", "r_multiple", "closed_at",
+    "pnl", "pnl_pct", "r_multiple", "closed_at", "commission", "usd_jpy_rate", "entry_date",
 ]
 
 
@@ -40,6 +40,29 @@ class TradeRecord:
     pnl_pct: float
     r_multiple: Optional[float]
     closed_at: str
+    # 決済往復にかかった手数料（USD建て）。ドライラン中は実約定が無いため0.0。
+    commission: float = 0.0
+    # 決済時点のUSD/JPYレート。確定申告向けの円換算に使う（未記録の古いレコードはNone）。
+    usd_jpy_rate: Optional[float] = None
+    # 建玉日時(ISO8601)。確定申告の取得年月日として使う。
+    # ブローカー同期で発見した未追跡ポジション由来の決済等、不明な場合はNone。
+    entry_date: Optional[str] = None
+
+    @property
+    def net_pnl_usd(self) -> float:
+        """手数料控除後の実現損益（USD）。"""
+        return self.pnl - self.commission
+
+    @property
+    def net_pnl_jpy(self) -> Optional[float]:
+        """手数料控除後の実現損益を、決済時点のUSD/JPYレートで円換算した額。
+
+        確定申告で必要な「約定日ごとのレートでの円換算」作業を自動化するためのもの。
+        usd_jpy_rateが記録されていない場合（実発注導入前の記録等）はNoneを返す。
+        """
+        if self.usd_jpy_rate is None:
+            return None
+        return self.net_pnl_usd * self.usd_jpy_rate
 
 
 @dataclass
@@ -49,6 +72,9 @@ class TradeStats:
     total_pnl: float
     profit_factor: float
     avg_r_multiple: Optional[float]
+    # usd_jpy_rateが記録されている取引の、手数料控除後・円換算後の実現損益合計。
+    # 1件もusd_jpy_rateを持たない場合はNone（確定申告の年間集計に使う想定）。
+    total_pnl_jpy: Optional[float] = None
 
 
 class TradeJournal:
@@ -65,6 +91,9 @@ class TradeJournal:
         pnl: float,
         pnl_pct: float,
         r_multiple: Optional[float],
+        commission: float = 0.0,
+        usd_jpy_rate: Optional[float] = None,
+        entry_date: Optional[str] = None,
     ) -> TradeRecord:
         record = TradeRecord(
             symbol=symbol,
@@ -76,13 +105,19 @@ class TradeJournal:
             pnl_pct=pnl_pct,
             r_multiple=r_multiple,
             closed_at=datetime.now(timezone.utc).isoformat(),
+            commission=commission,
+            usd_jpy_rate=usd_jpy_rate,
+            entry_date=entry_date,
         )
         self._append_to_file(record)
 
         logger.info(
-            "[%s] トレードジャーナルに記録しました: pnl=%.2f(%.2f%%) r=%s reason=%s",
+            "[%s] トレードジャーナルに記録しました: pnl=%.2f(%.2f%%) r=%s reason=%s "
+            "commission=%.2f usd_jpy_rate=%s",
             symbol, pnl, pnl_pct,
             f"{r_multiple:.2f}" if r_multiple is not None else "N/A", reason,
+            commission,
+            f"{usd_jpy_rate:.4f}" if usd_jpy_rate is not None else "N/A",
         )
         return record
 
@@ -117,6 +152,10 @@ class TradeJournal:
                         pnl_pct=float(row["pnl_pct"]),
                         r_multiple=float(row["r_multiple"]) if row.get("r_multiple") else None,
                         closed_at=row["closed_at"],
+                        # commission/usd_jpy_rate/entry_date列が無い旧フォーマットのCSVでも読めるようにフォールバックする。
+                        commission=float(row["commission"]) if row.get("commission") else 0.0,
+                        usd_jpy_rate=float(row["usd_jpy_rate"]) if row.get("usd_jpy_rate") else None,
+                        entry_date=row.get("entry_date") or None,
                     )
                 )
         return trades
@@ -159,10 +198,14 @@ def summarize_trade_records(trades: List[TradeRecord]) -> TradeStats:
     r_values = [t.r_multiple for t in trades if t.r_multiple is not None]
     avg_r_multiple = (sum(r_values) / len(r_values)) if r_values else None
 
+    jpy_values = [t.net_pnl_jpy for t in trades if t.net_pnl_jpy is not None]
+    total_pnl_jpy = sum(jpy_values) if jpy_values else None
+
     return TradeStats(
         num_trades=num_trades,
         win_rate_pct=win_rate_pct,
         total_pnl=total_pnl,
         profit_factor=profit_factor,
         avg_r_multiple=avg_r_multiple,
+        total_pnl_jpy=total_pnl_jpy,
     )
