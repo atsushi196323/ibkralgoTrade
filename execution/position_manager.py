@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_STATE_PATH: str = "logs/positions.json"
 
+# ブローカー同期で取り込む対象を、このBotが扱う建玉だけに絞り込む条件。
+# `ib.reqPositionsAsync()` は全口座・全アセットクラスの建玉を返すため、
+# シンボル文字列だけで突き合わせると、AAPLのオプションやカナダ上場の同名株を
+# 「AAPLの現物ポジション」として取り込んでしまう。
+TRACKED_SEC_TYPE: str = "STK"
+TRACKED_CURRENCY: str = "USD"
+
 # エントリーのトリガーとなったシグナルの種別。将来的に決済ルールを
 # 種別ごとに出し分けたり、デイトレード分のみ引け前に強制決済したりする
 # 判定に使う。
@@ -200,6 +207,48 @@ class PositionManager:
         self._save()
         return position
 
+    def _is_tracked_position(self, broker_position: object) -> bool:
+        """ブローカー側の建玉が、このBotの管理対象かを判定する。
+
+        `ib.reqPositionsAsync()` は全口座・全アセットクラスの建玉を返すため、
+        シンボル文字列だけで突き合わせると別物を取り込む危険がある。
+        """
+        if broker_position.position == 0:
+            return False
+
+        contract = broker_position.contract
+        symbol = getattr(contract, "symbol", "?")
+
+        sec_type = getattr(contract, "secType", None)
+        if sec_type != TRACKED_SEC_TYPE:
+            # 例: AAPLのコールオプションもcontract.symbolは"AAPL"になる
+            logger.info(
+                "[%s] 現物株(%s)ではないブローカー建玉のため、追跡対象外とします: secType=%s",
+                symbol, TRACKED_SEC_TYPE, sec_type,
+            )
+            return False
+
+        currency = getattr(contract, "currency", None)
+        if currency != TRACKED_CURRENCY:
+            # 例: トロント上場の同名株はcontract.symbolが衝突しうる
+            logger.info(
+                "[%s] %s建てではないブローカー建玉のため、追跡対象外とします: currency=%s",
+                symbol, TRACKED_CURRENCY, currency,
+            )
+            return False
+
+        if broker_position.position < 0:
+            # 本Botは押し目買いのロングのみを扱う。ショートを取り込むと
+            # 決済時にSELLの数量が負になり、発注処理が例外で落ちる。
+            logger.warning(
+                "[%s] ショートポジション(%s株)を検出しましたが、本Botはロング専用のため"
+                "追跡対象外とします。手動で建てた建玉の場合は自分で管理すること。",
+                symbol, broker_position.position,
+            )
+            return False
+
+        return True
+
     async def sync_with_broker_async(self, ib: IB) -> None:
         """ブローカー側の実ポジションと同期する。
 
@@ -211,12 +260,15 @@ class PositionManager:
 
         ブローカー側に存在しないローカルポジション（このBotがドライラン注文で
         建てたが未約定の想定ポジションなど）はそのまま保持し、削除しない。
+
+        取り込むのは米国株の現物ロングのみ（TRACKED_SEC_TYPE / TRACKED_CURRENCY）。
+        それ以外はこのBotの管理対象外として無視する。
         """
         broker_positions = await ib.reqPositionsAsync()
         changed = False
 
         for broker_position in broker_positions:
-            if broker_position.position == 0:
+            if not self._is_tracked_position(broker_position):
                 continue
 
             changed = True
