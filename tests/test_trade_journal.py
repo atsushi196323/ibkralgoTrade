@@ -303,3 +303,43 @@ def test_compute_daily_pnl_defaults_to_today() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         journal = TradeJournal(os.path.join(tmp_dir, "trades.csv"))
         assert journal.compute_daily_pnl() == 0.0
+
+
+def test_compute_daily_pnl_deducts_commission(journal_path) -> None:
+    """サーキットブレーカーはグロスではなく手数料控除後で判定する。
+
+    グロスで判定すると往復手数料の分だけ資金の減りを過小評価し、
+    実際には上限を超えてから発動することになる。
+    """
+    journal = TradeJournal(journal_path)
+    journal._append_to_file(
+        TradeRecord(
+            symbol="AAPL", entry_price=100.0, exit_price=110.0, quantity=1,
+            reason="TAKE_PROFIT", pnl=10.0, pnl_pct=10.0, r_multiple=2.0,
+            closed_at="2026-07-22T15:00:00+00:00", commission=2.0,
+        )
+    )
+    journal._append_to_file(
+        TradeRecord(
+            symbol="MSFT", entry_price=100.0, exit_price=90.0, quantity=1,
+            reason="STOP_LOSS", pnl=-10.0, pnl_pct=-10.0, r_multiple=-1.0,
+            closed_at="2026-07-22T18:00:00+00:00", commission=3.0,
+        )
+    )
+
+    # グロスなら 10 - 10 = 0 だが、手数料5.0を引いて -5.0
+    assert journal.compute_daily_pnl(reference_date=date(2026, 7, 22)) == pytest.approx(-5.0)
+
+
+def test_compute_daily_pnl_matches_gross_when_no_commission(journal_path) -> None:
+    # ドライラン中は実約定が無く手数料0.0固定のため、従来と同じ値になること
+    journal = TradeJournal(journal_path)
+    journal._append_to_file(
+        TradeRecord(
+            symbol="AAPL", entry_price=100.0, exit_price=110.0, quantity=1,
+            reason="TAKE_PROFIT", pnl=10.0, pnl_pct=10.0, r_multiple=2.0,
+            closed_at="2026-07-22T15:00:00+00:00",
+        )
+    )
+
+    assert journal.compute_daily_pnl(reference_date=date(2026, 7, 22)) == pytest.approx(10.0)
