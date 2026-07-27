@@ -166,11 +166,15 @@ class TradeJournal:
     def compute_daily_pnl(self, reference_date: Optional[date] = None) -> float:
         """指定日（省略時は米国東部時間の当日）に決済されたトレードの実現損益合計。
 
+        日次損失サーキットブレーカー(main.MAX_DAILY_LOSS_PCT)の判定基準になるため、
+        **手数料控除後**の純損益を返す。グロスで判定すると、往復手数料の分だけ
+        実際の資金の減りを過小評価し、上限を超えてから発動することになる。
+
         取引日の区切りを市場時間（core.market_hours）と揃えるため、米国東部時間で判定する。
         """
         target_date = reference_date or datetime.now(US_EASTERN).date()
         return sum(
-            trade.pnl for trade in self.load_trades()
+            trade.net_pnl_usd for trade in self.load_trades()
             if datetime.fromisoformat(trade.closed_at).astimezone(US_EASTERN).date() == target_date
         )
 
