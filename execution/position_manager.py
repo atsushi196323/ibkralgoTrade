@@ -9,13 +9,18 @@ strategy/exit_signal.py の判定に必要な状態を提供する。
 決済判断の基準として利用する。
 """
 
+import json
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from ib_insync import IB
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_STATE_PATH: str = "logs/positions.json"
 
 # エントリーのトリガーとなったシグナルの種別。将来的に決済ルールを
 # 種別ごとに出し分けたり、デイトレード分のみ引け前に強制決済したりする
@@ -39,11 +44,89 @@ class Position:
     risk_per_share: float = 0.0
     # エントリーのトリガーとなったシグナル種別("swing"/"day"/"unknown")
     strategy_type: str = STRATEGY_TYPE_UNKNOWN
+    # 建玉日時(ISO8601, UTC)。確定申告の取得年月日として使う。
+    # ブローカー側で発見した未追跡ポジション(このBotが建てたものではない)は
+    # 実際の建玉日が分からないためNoneのままとする。
+    entry_date: Optional[str] = None
 
 
 class PositionManager:
-    def __init__(self) -> None:
+    """保有ポジションを管理する。
+
+    `state_path` を指定すると、状態変化のたびにJSONへ保存し、生成時に
+    復元する。ドライラン中はブローカー側に建玉が存在しないため、永続化が
+    無いとプロセスを再起動した時点で保有中の想定ポジションと
+    `highest_price`（トレーリングストップの基準）が失われ、決済も
+    ジャーナル記録もされないまま消滅する。
+
+    `state_path` を省略した場合は完全にインメモリで動作する（単体テスト用）。
+    """
+
+    def __init__(self, state_path: Optional[str] = None) -> None:
         self._positions: Dict[str, Position] = {}
+        self.state_path = state_path
+        if state_path:
+            self._load()
+
+    # --- 永続化 ---------------------------------------------------------------
+
+    def _load(self) -> None:
+        if not self.state_path or not os.path.exists(self.state_path):
+            return
+
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            positions = [Position(**item) for item in payload["positions"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            # 状態ファイルが壊れていてもボットの起動自体は止めない。
+            # 破棄せずリネームして残し、後から中身を確認できるようにする。
+            logger.exception(
+                "ポジション状態ファイルの読み込みに失敗しました: %s。"
+                "空の状態で開始し、ファイルは .corrupt を付けて退避します。",
+                self.state_path,
+            )
+            self._quarantine_state_file()
+            return
+
+        self._positions = {position.symbol: position for position in positions}
+        if self._positions:
+            logger.info(
+                "ポジション状態を復元しました: %d件 %s",
+                len(self._positions), list(self._positions),
+            )
+
+    def _quarantine_state_file(self) -> None:
+        try:
+            os.replace(self.state_path, f"{self.state_path}.corrupt")
+        except OSError:
+            logger.exception("破損した状態ファイルの退避に失敗しました: %s", self.state_path)
+
+    def _save(self) -> None:
+        if not self.state_path:
+            return
+
+        directory = os.path.dirname(self.state_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        payload = {
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "positions": [asdict(position) for position in self._positions.values()],
+        }
+
+        # 書き込み中にプロセスが落ちても状態ファイルを壊さないよう、
+        # 一時ファイルへ書いてから置換する。
+        temp_path = f"{self.state_path}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(temp_path, self.state_path)
+        except OSError:
+            # 保存に失敗してもインメモリの状態は正しいため、取引は継続する。
+            logger.exception("ポジション状態の保存に失敗しました: %s", self.state_path)
+
+    # --- 参照 -----------------------------------------------------------------
 
     def has_position(self, symbol: str) -> bool:
         return symbol in self._positions
@@ -86,12 +169,14 @@ class PositionManager:
             highest_price=entry_price,
             risk_per_share=risk_per_share,
             strategy_type=strategy_type,
+            entry_date=datetime.now(timezone.utc).isoformat(),
         )
         self._positions[symbol] = position
         logger.info(
             "[%s] ポジションを新規建てしました: entry=%.2f qty=%s strategy=%s",
             symbol, entry_price, quantity, strategy_type,
         )
+        self._save()
         return position
 
     def update_highest_price(self, symbol: str, current_price: float) -> Position:
@@ -99,8 +184,11 @@ class PositionManager:
         if position is None:
             raise KeyError(f"{symbol} のポジションが存在しません。")
 
+        # 高値が更新された時だけ保存する。この関数はサイクルごとに
+        # 全保有銘柄分呼ばれるため、毎回書き込むと無駄が大きい。
         if current_price > position.highest_price:
             position.highest_price = current_price
+            self._save()
         return position
 
     def close_position(self, symbol: str) -> Position:
@@ -109,6 +197,7 @@ class PositionManager:
             raise KeyError(f"{symbol} のポジションが存在しません。")
 
         logger.info("[%s] ポジションを決済しました。", symbol)
+        self._save()
         return position
 
     async def sync_with_broker_async(self, ib: IB) -> None:
@@ -124,11 +213,13 @@ class PositionManager:
         建てたが未約定の想定ポジションなど）はそのまま保持し、削除しない。
         """
         broker_positions = await ib.reqPositionsAsync()
+        changed = False
 
         for broker_position in broker_positions:
             if broker_position.position == 0:
                 continue
 
+            changed = True
             symbol = broker_position.contract.symbol
             entry_price = float(broker_position.avgCost)
             quantity = int(broker_position.position)
@@ -149,3 +240,6 @@ class PositionManager:
                 existing.entry_price = entry_price
                 existing.quantity = quantity
                 existing.highest_price = max(existing.highest_price, entry_price)
+
+        if changed:
+            self._save()
