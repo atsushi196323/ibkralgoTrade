@@ -1,7 +1,10 @@
 """execution/position_manager.py の単体テスト。"""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+import json
+import os
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -76,6 +79,28 @@ def test_open_position_creates_position_with_highest_price_at_entry() -> None:
     assert position.risk_per_share == 0.0
     assert position.strategy_type == STRATEGY_TYPE_UNKNOWN
     assert manager.get_position("AAPL") is position
+
+
+def test_open_position_stamps_entry_date_in_utc() -> None:
+    manager = PositionManager()
+    before = datetime.now(timezone.utc)
+
+    position = manager.open_position("AAPL", entry_price=100.0, quantity=5)
+
+    after = datetime.now(timezone.utc)
+    assert position.entry_date is not None
+    entry_dt = datetime.fromisoformat(position.entry_date)
+    assert before <= entry_dt <= after
+
+
+def test_sync_discovered_position_has_no_entry_date() -> None:
+    manager = PositionManager()
+    ib = _make_mock_ib([_make_broker_position("AAPL", 10, 150.0)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    # ブローカー側で発見した未追跡ポジションは実際の建玉日が不明なためNone
+    assert manager.get_position("AAPL").entry_date is None
 
 
 def test_open_position_stores_risk_per_share_when_given() -> None:
@@ -243,3 +268,115 @@ def test_sync_prevents_duplicate_entry_for_symbol_already_held_at_broker() -> No
     # 既にブローカー側で保有中なので、新規エントリー判定側は
     # has_position=True を見て買い注文をスキップできる。
     assert manager.has_position("RIVN") is True
+
+
+# --- 状態の永続化 ---------------------------------------------------------------
+
+
+def _state_path(tmp_path) -> str:
+    return str(tmp_path / "positions.json")
+
+
+def test_positions_survive_restart(tmp_path) -> None:
+    """ドライラン中はブローカー側に建玉が無いため、永続化が唯一の復元手段。"""
+    path = _state_path(tmp_path)
+
+    manager = PositionManager(state_path=path)
+    manager.open_position(
+        "AAPL", entry_price=100.0, quantity=5, risk_per_share=5.0,
+        strategy_type=STRATEGY_TYPE_SWING,
+    )
+    manager.update_highest_price("AAPL", 130.0)
+
+    restored = PositionManager(state_path=path)
+    position = restored.get_position("AAPL")
+
+    assert position is not None
+    assert position.entry_price == 100.0
+    assert position.quantity == 5
+    assert position.risk_per_share == 5.0
+    assert position.strategy_type == STRATEGY_TYPE_SWING
+    # トレーリングストップの基準となる高値が失われないこと
+    assert position.highest_price == 130.0
+
+
+def test_entry_date_survives_restart(tmp_path) -> None:
+    path = _state_path(tmp_path)
+    manager = PositionManager(state_path=path)
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    original = manager.get_position("AAPL").entry_date
+
+    restored = PositionManager(state_path=path)
+
+    assert restored.get_position("AAPL").entry_date == original
+
+
+def test_closed_position_is_removed_from_state(tmp_path) -> None:
+    path = _state_path(tmp_path)
+    manager = PositionManager(state_path=path)
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    manager.close_position("AAPL")
+
+    restored = PositionManager(state_path=path)
+
+    assert restored.has_position("AAPL") is False
+    assert restored.count_open_positions() == 0
+
+
+def test_broker_synced_positions_are_persisted(tmp_path) -> None:
+    path = _state_path(tmp_path)
+    manager = PositionManager(state_path=path)
+    ib = _make_mock_ib([_make_broker_position("RIVN", 3, 20.0)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+    restored = PositionManager(state_path=path)
+
+    assert restored.get_position("RIVN").quantity == 3
+
+
+def test_starts_empty_when_state_file_does_not_exist(tmp_path) -> None:
+    manager = PositionManager(state_path=_state_path(tmp_path))
+
+    assert manager.count_open_positions() == 0
+
+
+def test_corrupt_state_file_does_not_prevent_startup(tmp_path) -> None:
+    path = _state_path(tmp_path)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{壊れたJSON")
+
+    manager = PositionManager(state_path=path)
+
+    assert manager.count_open_positions() == 0
+    # 中身を後から確認できるよう、破棄せず退避されていること
+    assert os.path.exists(f"{path}.corrupt")
+
+
+def test_state_file_with_unexpected_shape_does_not_prevent_startup(tmp_path) -> None:
+    path = _state_path(tmp_path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"positions": [{"unknown_field": 1}]}, f)
+
+    manager = PositionManager(state_path=path)
+
+    assert manager.count_open_positions() == 0
+
+
+def test_no_state_file_is_written_without_state_path(tmp_path) -> None:
+    # state_path未指定ならインメモリのみ（単体テスト用の既定動作）
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_highest_price_is_not_rewritten_when_unchanged(tmp_path) -> None:
+    path = _state_path(tmp_path)
+    manager = PositionManager(state_path=path)
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+
+    with patch.object(PositionManager, "_save") as mock_save:
+        manager.update_highest_price("AAPL", 90.0)   # 高値未更新 -> 保存しない
+        assert mock_save.call_count == 0
+        manager.update_highest_price("AAPL", 110.0)  # 高値更新 -> 保存する
+        assert mock_save.call_count == 1

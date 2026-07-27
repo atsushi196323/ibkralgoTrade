@@ -11,7 +11,10 @@ from execution.position_manager import PositionManager, STRATEGY_TYPE_DAY, STRAT
 from execution.trade_journal import TradeJournal
 from main import (
     DAY_STOP_LOSS_PCT,
+    MAX_WATCHLIST_SIZE,
+    POLL_INTERVAL_SECONDS,
     SWING_STOP_LOSS_PCT,
+    MarketDataCaches,
     _refresh_watchlist_async,
     main,
     process_symbol_async,
@@ -39,8 +42,8 @@ def test_process_symbol_opens_position_on_swing_daily_buy_signal(trade_journal) 
     daily_df = _make_df([100.0] * 19 + [80.0])  # 大きく下落 -> 日足で買いシグナル
     intraday_df = _make_df([100.0] * 20)  # 横ばい -> 短期足はシグナルなし
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
-        patch("main.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
@@ -72,8 +75,8 @@ def test_process_symbol_opens_position_on_intraday_buy_signal_when_daily_flat(tr
     daily_df = _make_df([100.0] * 20)  # 日足は横ばい -> シグナルなし
     intraday_df = _make_df([100.0] * 19 + [90.0])  # 短期足は下落 -> 買いシグナル
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
-        patch("main.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
@@ -99,8 +102,8 @@ def test_process_symbol_skips_entry_when_risk_based_quantity_is_zero(trade_journ
     daily_df = _make_df([100.0] * 19 + [80.0])  # 大きく下落 -> 買いシグナル
     intraday_df = _make_df([100.0] * 20)
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
-        patch("main.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=1.0)), \
@@ -120,8 +123,8 @@ def test_process_symbol_does_not_open_position_when_no_buy_signal_on_either_time
     daily_df = _make_df([100.0] * 20)  # 横ばい -> シグナルなし
     intraday_df = _make_df([100.0] * 20)  # 横ばい -> シグナルなし
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
-        patch("main.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock()) as mock_price, \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
@@ -138,8 +141,8 @@ def test_process_symbol_skips_entry_when_both_timeframes_have_no_data(trade_jour
     ib = MagicMock()
     position_manager = PositionManager()
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
-        patch("main.get_historical_bars_async", new=AsyncMock(return_value=pd.DataFrame())), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=pd.DataFrame())), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=pd.DataFrame())), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
@@ -160,8 +163,8 @@ def test_process_symbol_skips_entry_when_max_concurrent_positions_reached(trade_
     daily_df = _make_df([100.0] * 19 + [80.0])  # 大きく下落 -> 買いシグナル
     intraday_df = _make_df([100.0] * 20)
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)) as mock_qualify, \
-        patch("main.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)) as mock_qualify, \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
@@ -189,8 +192,8 @@ def test_process_symbol_skips_entry_when_daily_loss_circuit_breaker_tripped(trad
     daily_df = _make_df([100.0] * 19 + [80.0])  # 大きく下落 -> 買いシグナル
     intraday_df = _make_df([100.0] * 20)
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
-        patch("main.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
@@ -215,8 +218,9 @@ def test_daily_loss_circuit_breaker_does_not_block_exits(trade_journal) -> None:
         reason="STOP_LOSS", pnl=-4_000.0, pnl_pct=-4.0, r_multiple=-1.0,
     )
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
@@ -232,10 +236,13 @@ def test_process_symbol_closes_position_on_exit_signal(trade_journal) -> None:
     contract = MagicMock(symbol="AAPL")
     ib = MagicMock()
     position_manager = PositionManager()
-    position_manager.open_position("AAPL", entry_price=100.0, quantity=3, risk_per_share=5.0)
+    opened_position = position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=3, risk_per_share=5.0,
+    )
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
@@ -257,6 +264,12 @@ def test_process_symbol_closes_position_on_exit_signal(trade_journal) -> None:
     assert trade.pnl_pct == pytest.approx(-10.0)
     # r_multiple = (90-100) / risk_per_share(5.0) = -2.0
     assert trade.r_multiple == pytest.approx(-2.0)
+    # ポジションの建玉日時(取得年月日)が決済記録にそのまま引き継がれること
+    assert trade.entry_date == opened_position.entry_date
+    # 決済時点のUSD/JPYレートが記録され、円換算損益が自動計算されること
+    assert trade.commission == pytest.approx(0.0)
+    assert trade.usd_jpy_rate == pytest.approx(150.0)
+    assert trade.net_pnl_jpy == pytest.approx(trade.pnl * 150.0)
 
     stats = trade_journal.compute_stats()
     assert stats.num_trades == 1
@@ -271,8 +284,9 @@ def test_process_symbol_records_none_r_multiple_when_risk_per_share_unknown(trad
     # risk_per_share未指定(=0.0、ブローカー同期で発見されたポジション相当)
     position_manager.open_position("AAPL", entry_price=100.0, quantity=3)
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()):
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
@@ -288,7 +302,7 @@ def test_process_symbol_keeps_position_when_no_exit_signal(trade_journal) -> Non
     position_manager = PositionManager()
     position_manager.open_position("AAPL", entry_price=100.0, quantity=3)
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=101.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
@@ -307,8 +321,9 @@ def test_process_symbol_updates_highest_price_for_trailing_stop(trade_journal) -
     position_manager.open_position("AAPL", entry_price=100.0, quantity=1)
     position_manager.update_highest_price("AAPL", 115.0)
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=108.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
@@ -331,8 +346,9 @@ def test_day_position_uses_tighter_stop_loss_than_swing_position(trade_journal) 
         "AAPL", entry_price=100.0, quantity=1, strategy_type=STRATEGY_TYPE_DAY,
     )
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=97.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.is_day_trade_flatten_time", return_value=False), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
@@ -352,7 +368,7 @@ def test_swing_position_keeps_open_at_move_that_would_stop_out_a_day_position(tr
         "AAPL", entry_price=100.0, quantity=1, strategy_type=STRATEGY_TYPE_SWING,
     )
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=97.0)), \
         patch("main.is_day_trade_flatten_time", return_value=False), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
@@ -372,8 +388,9 @@ def test_day_position_force_closed_at_eod_flatten_time_even_without_exit_signal(
         "AAPL", entry_price=100.0, quantity=2, strategy_type=STRATEGY_TYPE_DAY,
     )
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=100.5)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.is_day_trade_flatten_time", return_value=True), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
@@ -394,7 +411,7 @@ def test_swing_position_not_force_closed_at_eod_flatten_time(trade_journal) -> N
         "AAPL", entry_price=100.0, quantity=2, strategy_type=STRATEGY_TYPE_SWING,
     )
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=100.5)), \
         patch("main.is_day_trade_flatten_time", return_value=True), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
@@ -413,8 +430,8 @@ def test_process_symbol_opens_day_position_with_day_specific_risk_per_share(trad
     daily_df = _make_df([100.0] * 20)  # 日足は横ばい -> シグナルなし
     intraday_df = _make_df([100.0] * 19 + [90.0])  # 短期足は下落 -> 買いシグナル(day)
 
-    with patch("main.qualify_stock_async", new=AsyncMock(return_value=contract)), \
-        patch("main.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
@@ -609,3 +626,92 @@ def test_main_retries_after_connection_error_exhausted() -> None:
     # connect_asyncのリトライを使い果たしても、プロセスを落とさず再試行し続ける
     assert connection.connect_async.await_count == 2
     connection.disconnect_async.assert_awaited_once()
+
+
+# --- ペーシング制限対策 ----------------------------------------------------------
+
+
+def test_watchlist_is_capped_to_limit_screening_request_volume() -> None:
+    """監視銘柄1件につき毎サイクル1回の日中足リクエストが発生するため、
+    スクリーニングが何件返しても監視対象は上限で頭打ちにする。"""
+    screened = [f"SYM{i}" for i in range(MAX_WATCHLIST_SIZE + 15)]
+
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=screened)):
+        result = asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"]))
+
+    assert len(result) == MAX_WATCHLIST_SIZE
+    assert result == screened[:MAX_WATCHLIST_SIZE]
+
+
+def test_watchlist_below_cap_is_kept_intact() -> None:
+    screened = ["CHEAP1", "CHEAP2"]
+
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=screened)):
+        result = asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"]))
+
+    assert result == screened
+
+
+def test_poll_interval_keeps_watchlist_within_ibkr_pacing_limit() -> None:
+    """IBKRのヒストリカルデータ制限(10分あたり60件)を設定値が満たしていること。
+
+    監視銘柄1件あたり毎サイクル1リクエスト(日中足)なので、
+        MAX_WATCHLIST_SIZE * (600 / POLL_INTERVAL_SECONDS) <= 60
+    を満たす必要がある。片方だけ変更して制限を割るのを防ぐための番人。
+    """
+    requests_per_10min = MAX_WATCHLIST_SIZE * (600.0 / POLL_INTERVAL_SECONDS)
+
+    assert requests_per_10min <= 60
+
+
+def test_daily_bars_are_fetched_once_per_symbol_across_cycles(trade_journal) -> None:
+    """日足はキャッシュされ、サイクルごとに取り直さないこと。"""
+    ib = MagicMock()
+    ib.reqPositionsAsync = AsyncMock(return_value=[])
+    position_manager = PositionManager()
+    caches = MarketDataCaches()
+
+    daily_df = _make_df([100.0] * 20)      # 横ばい -> シグナルなし
+    intraday_df = _make_df([100.0] * 20)
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch(
+            "data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)
+        ) as mock_daily, \
+        patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)) as mock_intraday:
+
+        async def run():
+            for _ in range(3):
+                await run_watchlist_cycle_async(
+                    ib, ["AAPL"], position_manager, trade_journal, caches,
+                )
+
+        asyncio.run(run())
+
+    # 日足は1取引日に1本しか増えないため1回だけ
+    mock_daily.assert_awaited_once()
+    # 日中足はデイトレードのシグナルそのものなので毎サイクル取得する
+    assert mock_intraday.await_count == 3
+
+
+def test_contracts_are_qualified_once_per_symbol_across_cycles(trade_journal) -> None:
+    ib = MagicMock()
+    ib.reqPositionsAsync = AsyncMock(return_value=[])
+    position_manager = PositionManager()
+    caches = MarketDataCaches()
+
+    with patch(
+        "data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))
+    ) as mock_qualify, \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
+        patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))):
+
+        async def run():
+            for _ in range(3):
+                await run_watchlist_cycle_async(
+                    ib, ["AAPL"], position_manager, trade_journal, caches,
+                )
+
+        asyncio.run(run())
+
+    mock_qualify.assert_awaited_once()

@@ -6,7 +6,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pandas as pd
 import pytest
 
-from data.market_data import get_current_price_async, get_intraday_bars_async
+from data.market_data import (
+    get_current_price_async,
+    get_historical_bars_async,
+    get_historical_pacer,
+    get_intraday_bars_async,
+    get_usd_jpy_rate_async,
+)
 
 
 def _make_ticker(market_price, close):
@@ -16,48 +22,231 @@ def _make_ticker(market_price, close):
     return ticker
 
 
-def test_get_current_price_returns_market_price_when_available() -> None:
-    ib = MagicMock()
-    contract = MagicMock(symbol="AAPL")
-    ticker = _make_ticker(market_price=150.0, close=149.5)
-    ib.reqTickersAsync = AsyncMock(return_value=[ticker])
+def _make_ib(snapshot_ticker=None, streaming_ticker=None) -> MagicMock:
+    """現在価格の取得経路ごとに返す値を仕込んだIBモックを作る。
 
-    price = asyncio.run(get_current_price_async(ib, contract))
+    Noneを渡した経路は「価格が取れない」状態（NaNのティッカー）にする。
+    """
+    ib = MagicMock()
+    ib.reqTickersAsync = AsyncMock(
+        return_value=[snapshot_ticker if snapshot_ticker is not None else _make_nan_ticker()]
+    )
+    ib.reqMktData = MagicMock(
+        return_value=streaming_ticker if streaming_ticker is not None else _make_nan_ticker()
+    )
+    return ib
+
+
+def _make_nan_ticker():
+    return _make_ticker(market_price=float("nan"), close=float("nan"))
+
+
+# 各テストで待機時間を消費しないよう、ストリーミングは即時判定のみにする。
+_NO_WAIT = {"streaming_timeout_seconds": 0.0, "allow_historical_fallback": False}
+
+
+# --- 現在価格: 取得経路のフォールバック連鎖 -------------------------------------
+
+
+def test_get_current_price_prefers_streaming_over_snapshot() -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib(
+        streaming_ticker=_make_ticker(market_price=151.0, close=149.5),
+        snapshot_ticker=_make_ticker(market_price=150.0, close=149.5),
+    )
+
+    price = asyncio.run(get_current_price_async(ib, contract, **_NO_WAIT))
+
+    assert price == 151.0
+    # ストリーミングで取れたならスナップショットは発行しない
+    ib.reqTickersAsync.assert_not_awaited()
+
+
+def test_get_current_price_cancels_streaming_subscription() -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib(streaming_ticker=_make_ticker(market_price=151.0, close=149.5))
+
+    asyncio.run(get_current_price_async(ib, contract, **_NO_WAIT))
+
+    # 購読を張りっぱなしにするとIBKRの同時購読数上限を食い潰す
+    ib.cancelMktData.assert_called_once_with(contract)
+
+
+def test_get_current_price_falls_back_to_snapshot_when_streaming_has_no_data() -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib(snapshot_ticker=_make_ticker(market_price=150.0, close=149.5))
+
+    price = asyncio.run(get_current_price_async(ib, contract, **_NO_WAIT))
 
     assert price == 150.0
 
 
-def test_get_current_price_falls_back_to_close_when_market_price_is_nan() -> None:
-    ib = MagicMock()
+def test_get_current_price_falls_back_to_snapshot_when_streaming_raises() -> None:
     contract = MagicMock(symbol="AAPL")
-    ticker = _make_ticker(market_price=float("nan"), close=149.5)
-    ib.reqTickersAsync = AsyncMock(return_value=[ticker])
+    ib = _make_ib(snapshot_ticker=_make_ticker(market_price=150.0, close=149.5))
+    ib.reqMktData = MagicMock(side_effect=RuntimeError("購読に失敗"))
 
-    price = asyncio.run(get_current_price_async(ib, contract))
+    price = asyncio.run(get_current_price_async(ib, contract, **_NO_WAIT))
+
+    assert price == 150.0
+
+
+def test_get_current_price_falls_back_to_historical_close_when_realtime_unavailable() -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib()
+    bars = pd.DataFrame({"close": [148.0, 149.0, 152.5]})
+
+    with patch(
+        "data.market_data.get_historical_bars_async", new=AsyncMock(return_value=bars)
+    ) as mock_get_bars:
+        price = asyncio.run(
+            get_current_price_async(ib, contract, streaming_timeout_seconds=0.0)
+        )
+
+    assert price == 152.5
+    assert mock_get_bars.await_args.kwargs["what_to_show"] == "TRADES"
+
+
+def test_get_current_price_uses_midpoint_bars_for_forex_fallback() -> None:
+    # 為替には出来高を伴う取引が無いため、TRADESではバーが返らない
+    contract = MagicMock(symbol="USD", secType="CASH")
+    ib = _make_ib()
+
+    with patch(
+        "data.market_data.get_historical_bars_async",
+        new=AsyncMock(return_value=pd.DataFrame({"close": [155.2]})),
+    ) as mock_get_bars:
+        price = asyncio.run(
+            get_current_price_async(ib, contract, streaming_timeout_seconds=0.0)
+        )
+
+    assert price == 155.2
+    assert mock_get_bars.await_args.kwargs["what_to_show"] == "MIDPOINT"
+
+
+def test_get_current_price_skips_historical_fallback_when_disabled() -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib()
+
+    with patch(
+        "data.market_data.get_historical_bars_async", new=AsyncMock()
+    ) as mock_get_bars:
+        price = asyncio.run(get_current_price_async(ib, contract, **_NO_WAIT))
+
+    assert price is None
+    mock_get_bars.assert_not_awaited()
+
+
+def test_get_current_price_returns_none_when_every_source_fails() -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib()
+
+    with patch(
+        "data.market_data.get_historical_bars_async",
+        new=AsyncMock(return_value=pd.DataFrame()),
+    ):
+        price = asyncio.run(
+            get_current_price_async(ib, contract, streaming_timeout_seconds=0.0)
+        )
+
+    assert price is None
+
+
+# --- 現在価格: 個々のフィールドの扱い -------------------------------------------
+
+
+def test_get_current_price_falls_back_to_close_when_market_price_is_nan() -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib(snapshot_ticker=_make_ticker(market_price=float("nan"), close=149.5))
+
+    price = asyncio.run(get_current_price_async(ib, contract, **_NO_WAIT))
 
     assert price == 149.5
 
 
 def test_get_current_price_returns_none_when_market_price_and_close_are_both_nan() -> None:
-    ib = MagicMock()
     contract = MagicMock(symbol="AAPL")
-    ticker = _make_ticker(market_price=float("nan"), close=float("nan"))
-    ib.reqTickersAsync = AsyncMock(return_value=[ticker])
+    ib = _make_ib(snapshot_ticker=_make_nan_ticker())
 
-    price = asyncio.run(get_current_price_async(ib, contract))
+    price = asyncio.run(get_current_price_async(ib, contract, **_NO_WAIT))
 
     assert price is None
 
 
 def test_get_current_price_returns_none_when_market_price_and_close_are_both_none() -> None:
-    ib = MagicMock()
     contract = MagicMock(symbol="AAPL")
-    ticker = _make_ticker(market_price=None, close=None)
-    ib.reqTickersAsync = AsyncMock(return_value=[ticker])
+    ib = _make_ib(snapshot_ticker=_make_ticker(market_price=None, close=None))
 
-    price = asyncio.run(get_current_price_async(ib, contract))
+    price = asyncio.run(get_current_price_async(ib, contract, **_NO_WAIT))
 
     assert price is None
+
+
+@pytest.mark.parametrize("bad_price", [0.0, -1.0])
+def test_get_current_price_rejects_non_positive_prices(bad_price) -> None:
+    # IBKRはデータ未受信のフィールドを0で埋めてくることがあり、
+    # そのまま採用すると建値0のポジションやゼロ除算を招く
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib(snapshot_ticker=_make_ticker(market_price=bad_price, close=bad_price))
+
+    price = asyncio.run(get_current_price_async(ib, contract, **_NO_WAIT))
+
+    assert price is None
+
+
+def test_get_current_price_returns_none_when_snapshot_returns_no_tickers() -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib()
+    ib.reqTickersAsync = AsyncMock(return_value=[])
+
+    price = asyncio.run(get_current_price_async(ib, contract, **_NO_WAIT))
+
+    assert price is None
+
+
+def test_get_current_price_waits_for_streaming_tick_before_giving_up() -> None:
+    """初回ポーリング時点で未受信でも、待機後に届いたティックを拾えること。"""
+    contract = MagicMock(symbol="AAPL")
+    ticker = MagicMock()
+    ticker.close = float("nan")
+    # 1回目はNaN、2回目に価格が届く
+    ticker.marketPrice = MagicMock(side_effect=[float("nan"), 150.0])
+
+    ib = _make_ib(streaming_ticker=ticker)
+
+    with patch("data.market_data.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+        price = asyncio.run(
+            get_current_price_async(
+                ib, contract, streaming_timeout_seconds=4.0, allow_historical_fallback=False,
+            )
+        )
+
+    assert price == 150.0
+    mock_sleep.assert_awaited_once()
+    ib.reqTickersAsync.assert_not_awaited()
+
+
+# --- USD/JPY -------------------------------------------------------------------
+
+
+def test_get_usd_jpy_rate_returns_market_price() -> None:
+    ib = _make_ib(snapshot_ticker=_make_ticker(market_price=150.25, close=150.0))
+
+    rate = asyncio.run(get_usd_jpy_rate_async(ib, **_NO_WAIT))
+
+    assert rate == 150.25
+    # Forex("USDJPY")コントラクトでreqTickersAsyncが呼ばれること
+    called_contract = ib.reqTickersAsync.call_args.args[0]
+    assert called_contract.symbol == "USD"
+    assert called_contract.currency == "JPY"
+
+
+def test_get_usd_jpy_rate_returns_none_when_unavailable() -> None:
+    ib = _make_ib(snapshot_ticker=_make_ticker(market_price=None, close=None))
+
+    rate = asyncio.run(get_usd_jpy_rate_async(ib, **_NO_WAIT))
+
+    assert rate is None
 
 
 def test_get_intraday_bars_delegates_to_historical_bars_with_given_params() -> None:
@@ -110,3 +299,39 @@ def test_get_intraday_bars_accepts_known_intraday_bar_sizes(bar_size) -> None:
         "data.market_data.get_historical_bars_async", new=AsyncMock(return_value=pd.DataFrame())
     ):
         asyncio.run(get_intraday_bars_async(ib, contract, bar_size=bar_size))
+
+
+# --- ペーシング制限 --------------------------------------------------------------
+
+
+def test_historical_request_consumes_a_pacing_slot() -> None:
+    """IBKRの「10分あたり60件」制限を超えると空のバー列が返り、違反を検知できない。
+
+    そのため発行前に必ず枠を確保していること。
+    """
+    ib = MagicMock()
+    ib.reqHistoricalDataAsync = AsyncMock(return_value=[])
+    contract = MagicMock(symbol="AAPL")
+    pacer = get_historical_pacer()
+
+    assert pacer.used_in_window() == 0
+
+    asyncio.run(get_historical_bars_async(ib, contract))
+
+    assert pacer.used_in_window() == 1
+
+
+def test_every_historical_caller_shares_one_pacer() -> None:
+    # IBKRの制限はクライアント単位で課されるため、呼び出し箇所ごとに
+    # 別のペーサーを持っては意味がない
+    ib = MagicMock()
+    ib.reqHistoricalDataAsync = AsyncMock(return_value=[])
+    pacer = get_historical_pacer()
+
+    async def run():
+        await get_historical_bars_async(ib, MagicMock(symbol="AAPL"))
+        await get_intraday_bars_async(ib, MagicMock(symbol="MSFT"))
+
+    asyncio.run(run())
+
+    assert pacer.used_in_window() == 2

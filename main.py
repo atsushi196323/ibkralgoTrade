@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -10,15 +10,16 @@ from ib_insync import IB, Stock
 
 from core.connection import IBKRConnection
 from core.market_hours import US_EASTERN, is_day_trade_flatten_time, is_regular_trading_hours
+from data.cache import ContractCache, DailyBarCache
 from data.market_data import (
     get_current_price_async,
-    get_historical_bars_async,
     get_intraday_bars_async,
-    qualify_stock_async,
+    get_usd_jpy_rate_async,
 )
 from execution.account import get_account_equity_async
 from execution.order_manager import place_dry_run_order_async
 from execution.position_manager import (
+    DEFAULT_STATE_PATH,
     Position,
     PositionManager,
     STRATEGY_TYPE_DAY,
@@ -48,6 +49,11 @@ SCREENER_MAX_MARKET_CAP: float = 200_000_000_000.0
 SCREENER_MAX_PE_RATIO: float = 15.0
 SCREENER_SCAN_CODE: str = "MOST_ACTIVE"
 SCREENER_NUM_CANDIDATES: int = 50
+# スクリーニング結果から実際に監視する銘柄数の上限。
+# 監視銘柄1件につき毎サイクル1回の日中足リクエストが発生するため、
+# ここを絞ることがIBKRのペーシング制限(10分あたり60件)対策の要になる。
+# 目安: 監視銘柄数 <= POLL_INTERVAL_SECONDS / 10 なら制限内に収まる。
+MAX_WATCHLIST_SIZE: int = 10
 # IBKRのペーシング制限を避けるため、PER取得(reqFundamentalDataAsync)を
 # 連続発行せずこの秒数だけ間隔を空ける
 SCREENER_PE_REQUEST_INTERVAL_SECONDS: float = 1.0
@@ -58,8 +64,13 @@ SCREENER_ENABLE_TREND_FILTER: bool = True
 SCREENER_TREND_MA_WINDOW: int = 200
 SCREENER_TREND_LOOKBACK_DURATION: str = "300 D"
 
-# 監視ループのポーリング間隔（秒）: 市場時間中/時間外で切り替える
-POLL_INTERVAL_SECONDS: float = 60.0
+# 監視ループのポーリング間隔（秒）: 市場時間中/時間外で切り替える。
+# 市場時間中の間隔は、IBKRのヒストリカルデータ制限(10分あたり60件)から逆算して
+# 決めている。監視銘柄1件あたり毎サイクル1リクエスト(日中足)なので、
+#     MAX_WATCHLIST_SIZE * (600 / POLL_INTERVAL_SECONDS) <= 60
+# を満たす必要がある。10銘柄・180秒なら約33件/10分で、日足の初回取得や
+# スクリーニングの分の余裕も残る。
+POLL_INTERVAL_SECONDS: float = 180.0
 CLOSED_MARKET_POLL_INTERVAL_SECONDS: float = 300.0
 
 # スイングトレード判定用（日足）のプルバックパラメータ
@@ -91,6 +102,19 @@ class ExitParams:
     trailing_stop_pct: float
 
 
+@dataclass(frozen=True)
+class MarketDataCaches:
+    """サイクルをまたいで使い回すIBKRデータのキャッシュ束。
+
+    ペーシング制限対策の中心。main()で1つ生成してサイクル間で共有する。
+    省略した場合は呼び出しごとに新規生成される（＝キャッシュが効かない）ため、
+    単体テスト以外では必ず共有インスタンスを渡すこと。
+    """
+
+    contracts: ContractCache = field(default_factory=ContractCache)
+    daily_bars: DailyBarCache = field(default_factory=DailyBarCache)
+
+
 # strategy_type("swing"/"day")ごとの決済パラメータ。ブローカー同期で発見された
 # STRATEGY_TYPE_UNKNOWNのポジションは、より安全側であるswing基準にフォールバックする
 # （_process_exit_async参照）。
@@ -120,9 +144,11 @@ MAX_DAILY_LOSS_PCT: float = 3.0
 
 
 async def _detect_buy_signal_async(
-    ib: IB, contract: Stock, symbol: str
+    ib: IB, contract: Stock, symbol: str, caches: MarketDataCaches,
 ) -> Optional[Tuple[SignalResult, str]]:
-    daily_df = await get_historical_bars_async(ib, contract)
+    # 日足は1取引日に1本しか増えないためキャッシュから引く。日中足は
+    # デイトレードのシグナルそのものなので毎回取得する。
+    daily_df = await caches.daily_bars.get_async(ib, contract)
     intraday_df = await get_intraday_bars_async(
         ib, contract, duration=INTRADAY_DURATION, bar_size=INTRADAY_BAR_SIZE,
     )
@@ -155,6 +181,7 @@ async def _detect_buy_signal_async(
 
 async def _process_entry_async(
     ib: IB, symbol: str, position_manager: PositionManager, trade_journal: TradeJournal,
+    caches: MarketDataCaches,
 ) -> None:
     if position_manager.count_open_positions() >= MAX_CONCURRENT_POSITIONS:
         logger.info(
@@ -163,9 +190,9 @@ async def _process_entry_async(
         )
         return
 
-    contract = await qualify_stock_async(ib, symbol)
+    contract = await caches.contracts.get_async(ib, symbol)
 
-    signal_result = await _detect_buy_signal_async(ib, contract, symbol)
+    signal_result = await _detect_buy_signal_async(ib, contract, symbol, caches)
     if signal_result is None:
         return
     _signal, strategy_type = signal_result
@@ -211,14 +238,19 @@ async def _process_entry_async(
     )
 
 
-def _record_closed_trade(
-    trade_journal: TradeJournal, closed_position: Position, exit_price: float, reason: str, pnl_pct: float,
+async def _record_closed_trade(
+    ib: IB, trade_journal: TradeJournal, closed_position: Position, exit_price: float, reason: str, pnl_pct: float,
 ) -> None:
     pnl = (exit_price - closed_position.entry_price) * closed_position.quantity
     r_multiple = (
         (exit_price - closed_position.entry_price) / closed_position.risk_per_share
         if closed_position.risk_per_share > 0 else None
     )
+
+    # ドライラン中は実約定の手数料が発生しないため0固定。
+    # 実発注(placeOrder)を有効化する際は、FillのcommissionReport.commissionを渡すこと。
+    commission = 0.0
+    usd_jpy_rate = await get_usd_jpy_rate_async(ib)
 
     trade_journal.record_trade(
         symbol=closed_position.symbol,
@@ -229,6 +261,9 @@ def _record_closed_trade(
         pnl=pnl,
         pnl_pct=pnl_pct,
         r_multiple=r_multiple,
+        commission=commission,
+        usd_jpy_rate=usd_jpy_rate,
+        entry_date=closed_position.entry_date,
     )
 
     stats = trade_journal.compute_stats()
@@ -241,12 +276,13 @@ def _record_closed_trade(
 
 async def _process_exit_async(
     ib: IB, symbol: str, position_manager: PositionManager, trade_journal: TradeJournal,
+    caches: MarketDataCaches,
 ) -> None:
     position = position_manager.get_position(symbol)
     if position is None:
         return
 
-    contract = await qualify_stock_async(ib, symbol)
+    contract = await caches.contracts.get_async(ib, symbol)
     price = await get_current_price_async(ib, contract)
     if price is None:
         logger.warning("%s の現在価格が取得できなかったため決済判定をスキップします。", symbol)
@@ -261,7 +297,7 @@ async def _process_exit_async(
         pnl_pct = (price - position.entry_price) / position.entry_price * 100.0
         await place_dry_run_order_async(ib, contract, action="SELL", quantity=position.quantity)
         closed_position = position_manager.close_position(symbol)
-        _record_closed_trade(trade_journal, closed_position, price, REASON_EOD_FLATTEN, pnl_pct)
+        await _record_closed_trade(ib, trade_journal, closed_position, price, REASON_EOD_FLATTEN, pnl_pct)
         return
 
     exit_params = EXIT_PARAMS_BY_STRATEGY_TYPE.get(
@@ -282,21 +318,27 @@ async def _process_exit_async(
 
     await place_dry_run_order_async(ib, contract, action="SELL", quantity=position.quantity)
     closed_position = position_manager.close_position(symbol)
-    _record_closed_trade(trade_journal, closed_position, price, result.reason, result.pnl_pct)
+    await _record_closed_trade(ib, trade_journal, closed_position, price, result.reason, result.pnl_pct)
 
 
 async def process_symbol_async(
     ib: IB, symbol: str, position_manager: PositionManager, trade_journal: TradeJournal,
+    caches: Optional[MarketDataCaches] = None,
 ) -> None:
+    caches = caches if caches is not None else MarketDataCaches()
+
     if position_manager.has_position(symbol):
-        await _process_exit_async(ib, symbol, position_manager, trade_journal)
+        await _process_exit_async(ib, symbol, position_manager, trade_journal, caches)
     else:
-        await _process_entry_async(ib, symbol, position_manager, trade_journal)
+        await _process_entry_async(ib, symbol, position_manager, trade_journal, caches)
 
 
 async def run_watchlist_cycle_async(
     ib: IB, watchlist: List[str], position_manager: PositionManager, trade_journal: TradeJournal,
+    caches: Optional[MarketDataCaches] = None,
 ) -> None:
+    caches = caches if caches is not None else MarketDataCaches()
+
     await position_manager.sync_with_broker_async(ib)
 
     # スクリーニング結果でウォッチリストが日次で入れ替わっても、既に保有中の
@@ -306,7 +348,7 @@ async def run_watchlist_cycle_async(
 
     for symbol in symbols_to_process:
         try:
-            await process_symbol_async(ib, symbol, position_manager, trade_journal)
+            await process_symbol_async(ib, symbol, position_manager, trade_journal, caches)
         except Exception:
             logger.exception("%s の処理中にエラーが発生しました。", symbol)
 
@@ -334,14 +376,30 @@ async def _refresh_watchlist_async(ib: IB, fallback_watchlist: List[str]) -> Lis
         logger.warning("スクリーニング結果が0件のため、既存のウォッチリストを維持します。")
         return fallback_watchlist
 
+    # 監視銘柄1件につき毎サイクル1回の日中足リクエストが発生するため、
+    # スクリーニングが何件返しても監視対象は上限で頭打ちにする。
+    # これを外すとIBKRのペーシング制限に張り付き、全銘柄の処理が遅延する。
+    if len(screened) > MAX_WATCHLIST_SIZE:
+        logger.info(
+            "スクリーニング結果%d件のうち、上位%d件のみを監視対象にします"
+            "（IBKRのペーシング制限対策）。",
+            len(screened), MAX_WATCHLIST_SIZE,
+        )
+        screened = screened[:MAX_WATCHLIST_SIZE]
+
     logger.info("スクリーニング結果でウォッチリストを更新しました: %s", screened)
     return screened
 
 
 async def main() -> None:
     connection = IBKRConnection()
-    position_manager = PositionManager()
+    # 状態ファイルを指定して、再起動しても保有ポジションと
+    # トレーリングストップの基準（高値）を引き継げるようにする。
+    position_manager = PositionManager(state_path=DEFAULT_STATE_PATH)
     trade_journal = TradeJournal()
+    # キャッシュはサイクル間で共有する。ここで毎サイクル作り直すと
+    # ペーシング制限対策の意味が無くなる。
+    caches = MarketDataCaches()
     watchlist: List[str] = list(WATCHLIST)
     last_screened_date: Optional[date] = None
 
@@ -361,7 +419,9 @@ async def main() -> None:
                         watchlist = await _refresh_watchlist_async(ib, watchlist)
                         last_screened_date = today
 
-                    await run_watchlist_cycle_async(ib, watchlist, position_manager, trade_journal)
+                    await run_watchlist_cycle_async(
+                        ib, watchlist, position_manager, trade_journal, caches,
+                    )
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 else:
                     logger.info("市場時間外のため、シグナル評価をスキップします。")
