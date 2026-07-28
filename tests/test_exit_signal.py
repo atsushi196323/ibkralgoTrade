@@ -9,6 +9,9 @@ from strategy.exit_signal import (
     REASON_TRAILING_STOP,
     ExitSignalResult,
     detect_exit_signal,
+    detect_resting_order_exit,
+    resolve_stop_price,
+    resolve_take_profit_price,
 )
 
 
@@ -234,3 +237,124 @@ def test_returns_exit_signal_result_with_expected_fields() -> None:
     assert result.highest_price == pytest.approx(105.0)
     assert result.pnl_pct == pytest.approx(-10.0)
     assert result.drawdown_from_high_pct == pytest.approx((90.0 - 105.0) / 105.0 * 100.0)
+
+
+# --- ブローカー側に置く待機注文 -------------------------------------------------------
+
+
+def test_resolve_order_prices_from_entry_and_percentages() -> None:
+    assert resolve_stop_price(100.0, 5.0) == pytest.approx(95.0)
+    assert resolve_take_profit_price(100.0, 10.0) == pytest.approx(110.0)
+
+
+@pytest.mark.parametrize("entry,pct", [(0.0, 5.0), (-1.0, 5.0), (100.0, 0.0), (100.0, -5.0)])
+def test_resolve_order_prices_reject_invalid_inputs(entry: float, pct: float) -> None:
+    with pytest.raises(ValueError):
+        resolve_stop_price(entry, pct)
+    with pytest.raises(ValueError):
+        resolve_take_profit_price(entry, pct)
+
+
+def test_no_resting_order_exit_when_price_stays_between_the_orders() -> None:
+    assert detect_resting_order_exit(
+        stop_price=95.0, take_profit_price=110.0, bar_low=97.0, bar_high=105.0,
+    ) is None
+
+
+def test_stop_fills_at_the_stop_price_when_touched_without_a_gap() -> None:
+    result = detect_resting_order_exit(
+        stop_price=95.0, take_profit_price=110.0,
+        bar_low=94.0, bar_high=101.0, bar_open=100.0,
+    )
+
+    assert result is not None
+    assert result.reason == REASON_STOP_LOSS
+    assert result.fill_price == pytest.approx(95.0)
+
+
+def test_stop_fills_at_the_open_when_the_market_gaps_below_it() -> None:
+    """窓を開けて下落した場合、逆指値より不利な始値で約定すること。
+
+    逆指値はトリガー後に成行注文になるため、値段は保証されない。
+    ここをモデル化しないと、1トレードのリスクを口座の1%に収める前提が
+    崩れる場面（ギャップ）で損失を過小評価する。
+    """
+    result = detect_resting_order_exit(
+        stop_price=95.0, take_profit_price=110.0,
+        bar_low=88.0, bar_high=92.0, bar_open=90.0,
+    )
+
+    assert result.reason == REASON_STOP_LOSS
+    assert result.fill_price == pytest.approx(90.0)
+
+
+def test_take_profit_fills_at_the_limit_price_when_touched_without_a_gap() -> None:
+    result = detect_resting_order_exit(
+        stop_price=95.0, take_profit_price=110.0,
+        bar_low=99.0, bar_high=112.0, bar_open=100.0,
+    )
+
+    assert result.reason == REASON_TAKE_PROFIT
+    assert result.fill_price == pytest.approx(110.0)
+
+
+def test_take_profit_fills_at_the_open_when_the_market_gaps_above_it() -> None:
+    """指値は値段より不利には約定しないため、窓を開けた分は有利に働く。"""
+    result = detect_resting_order_exit(
+        stop_price=95.0, take_profit_price=110.0,
+        bar_low=114.0, bar_high=120.0, bar_open=115.0,
+    )
+
+    assert result.reason == REASON_TAKE_PROFIT
+    assert result.fill_price == pytest.approx(115.0)
+
+
+def test_stop_takes_precedence_when_both_orders_are_reachable() -> None:
+    """どちらが先か判別できないバーでは、保守的に損切りを優先すること。"""
+    result = detect_resting_order_exit(
+        stop_price=95.0, take_profit_price=110.0,
+        bar_low=90.0, bar_high=115.0, bar_open=100.0,
+    )
+
+    assert result.reason == REASON_STOP_LOSS
+
+
+def test_live_polling_uses_the_observed_price_for_both_high_and_low() -> None:
+    """ライブのポーリングでは、観測した現在値だけで判定する（バー内は不明）。"""
+    assert detect_resting_order_exit(
+        stop_price=95.0, take_profit_price=110.0, bar_low=96.0, bar_high=96.0,
+    ) is None
+
+    hit = detect_resting_order_exit(
+        stop_price=95.0, take_profit_price=110.0, bar_low=94.0, bar_high=94.0,
+    )
+    assert hit.reason == REASON_STOP_LOSS
+    # 始値が無いのでギャップの有無を判別できない。逆指値(95.0)どおりに約定したと
+    # 仮定するのは楽観的すぎるため、観測できた価格(94.0)を採る。
+    assert hit.fill_price == pytest.approx(94.0)
+
+
+def test_unknown_gap_is_resolved_against_the_position_on_both_sides() -> None:
+    """始値が分からない場合は、損切りも利確も不利な側に倒すこと。
+
+    分からないものを有利側に倒すと、バックテストが実運用より良く見える。
+    """
+    stop = detect_resting_order_exit(
+        stop_price=95.0, take_profit_price=110.0, bar_low=80.0, bar_high=80.0,
+    )
+    take_profit = detect_resting_order_exit(
+        stop_price=95.0, take_profit_price=110.0, bar_low=130.0, bar_high=130.0,
+    )
+
+    # 損切りは観測値まで滑ったものとして扱う。
+    assert stop.fill_price == pytest.approx(80.0)
+    # 利確は指値どおり。観測値(130.0)まで伸びた分は取れたことにしない。
+    assert take_profit.fill_price == pytest.approx(110.0)
+
+
+@pytest.mark.parametrize("stop,take_profit", [(0.0, 110.0), (95.0, 0.0), (-1.0, 110.0)])
+def test_detect_resting_order_exit_rejects_invalid_prices(stop: float, take_profit: float) -> None:
+    with pytest.raises(ValueError):
+        detect_resting_order_exit(
+            stop_price=stop, take_profit_price=take_profit, bar_low=100.0, bar_high=100.0,
+        )
