@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest>=8.0.0
+# バックテスト検証用の日足取得(scripts/fetch_bars.py)。ボット本体は依存しない。
+yfinance>=0.2.40

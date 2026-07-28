@@ -7,16 +7,20 @@
 実行例:
     python -m backtest.run --symbol RIVN --duration "2 Y" --bar-size "1 day"
     python -m backtest.run --symbol RIVN --mode backtest --duration "2 Y"
-    python -m backtest.run --csv data/RIVN.csv --mode backtest
-    python -m backtest.run --csv data/RIVN.csv --no-costs   # コスト影響の比較用
+    python -m backtest.run --csv bars/RIVN.csv --mode backtest
+    python -m backtest.run --csv bars/RIVN.csv --no-costs   # コスト影響の比較用
+    python -m backtest.run --csv-dir bars              # 複数銘柄で判断する
+
+CSVは `python -m scripts.fetch_bars` で用意できる（IBKR接続不要）。
 """
 
 import argparse
 import asyncio
+import glob
 import logging
 import os
 from dataclasses import replace
-from typing import Optional
+from typing import Dict, Optional
 
 import pandas as pd
 
@@ -24,6 +28,7 @@ from backtest.costs import ZERO_COST, CostModel
 from backtest.csv_source import load_bars_from_csv
 from backtest.engine import BacktestConfig, run_backtest
 from backtest.metrics import PerformanceMetrics, compute_metrics
+from backtest.multi_symbol import format_report, run_multi_symbol_walk_forward
 from backtest.walk_forward import (
     DEFAULT_MIN_TRADES_FOR_SELECTION,
     ParameterGrid,
@@ -38,6 +43,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ライブでは1サイクルに1回しか鳴らないが、バックテストでは
+# 「バー数 × グリッドの組合せ数 × ウィンドウ数 × 銘柄数」回呼ばれるロガー群。
+# INFOのまま42銘柄・10年を回すと出力だけで数百MB・十数分かかり、
+# 検証そのものより桁違いに重くなる。既定では黙らせ、--verbose で戻す。
+_PER_BAR_LOGGERS = (
+    "strategy.pullback",
+    "strategy.exit_signal",
+    "execution.position_sizing",
+    "backtest.engine",
+)
+
+
+def _configure_log_levels(verbose: bool) -> None:
+    level = logging.INFO if verbose else logging.WARNING
+    for name in _PER_BAR_LOGGERS:
+        logging.getLogger(name).setLevel(level)
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="プルバック戦略のバックテスト/ウォークフォワード検証")
@@ -48,6 +70,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--csv",
         help="ヒストリカルバーのCSVパス。指定するとIBKRへ接続せずこのファイルを使う。",
+    )
+    parser.add_argument(
+        "--csv-dir",
+        help="CSVを並べたディレクトリ。中の全銘柄をウォークフォワード検証して"
+             "銘柄横断で集計する（単一銘柄の成績は運なので、判断はこちらで行う）。",
     )
     parser.add_argument(
         "--price-column",
@@ -66,6 +93,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-trades", type=int, default=DEFAULT_MIN_TRADES_FOR_SELECTION,
         help="学習期間でこの回数以上トレードした設定だけを選定対象にする。",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="1バーごとのシグナル判定ログも出す（デバッグ用。大量の出力になる）。",
     )
 
     costs = parser.add_argument_group("取引コスト（既定値はIBKR Tiered・米国株相当）")
@@ -86,8 +117,12 @@ def _parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
 
-    if not args.csv and not args.symbol:
-        parser.error("--symbol は必須です（--csv を使う場合のみ省略できます）。")
+    if args.csv and args.csv_dir:
+        parser.error("--csv と --csv-dir は同時に指定できません。")
+    if not args.csv and not args.csv_dir and not args.symbol:
+        parser.error("--symbol は必須です（--csv / --csv-dir を使う場合のみ省略できます）。")
+    if args.csv_dir and args.mode != "walk-forward":
+        parser.error("--csv-dir は --mode walk-forward でのみ使えます。")
 
     return args
 
@@ -142,10 +177,55 @@ def _log_metrics(metrics: PerformanceMetrics, total_commission: Optional[float] 
         logger.info("支払い手数料の合計=%.2f USD（上記の損益は控除後）", total_commission)
 
 
+def _load_csv_directory(directory: str, price_column: Optional[str]) -> Dict[str, pd.DataFrame]:
+    """ディレクトリ内の *.csv を「銘柄 -> バー」の辞書として読み込む。"""
+    paths = sorted(glob.glob(os.path.join(directory, "*.csv")))
+    if not paths:
+        raise ValueError(f"CSVが1件も見つかりません: {directory}")
+
+    frames: Dict[str, pd.DataFrame] = {}
+    for path in paths:
+        symbol = os.path.splitext(os.path.basename(path))[0].upper()
+        try:
+            frames[symbol] = load_bars_from_csv(path, price_column=price_column)
+        except ValueError:
+            # 1銘柄の不備で検証全体を止めない。
+            logger.exception("%s を読み込めなかったため除外します。", path)
+
+    if not frames:
+        raise ValueError(f"読み込めたCSVが1件もありません: {directory}")
+    return frames
+
+
+def _run_multi_symbol(args: argparse.Namespace, cost_model: CostModel) -> None:
+    frames = _load_csv_directory(args.csv_dir, args.price_column)
+    logger.info("%d銘柄を読み込みました: %s", len(frames), list(frames))
+
+    report = run_multi_symbol_walk_forward(
+        frames, ParameterGrid(),
+        train_bars=args.train_bars, test_bars=args.test_bars,
+        costs=cost_model, step_bars=args.step_bars,
+        min_trades_for_selection=args.min_trades,
+    )
+
+    print("\n" + format_report(report, symbol_order=list(frames)))
+
+    total_commission = sum(
+        t.commission for outcome in report.outcomes for t in outcome.trades
+    )
+    print(f"\n  支払い手数料の合計 : {total_commission:,.2f} USD（上記の損益は控除後）")
+
+
 async def main() -> None:
     args = _parse_args()
-    symbol = _resolve_symbol(args)
+    _configure_log_levels(args.verbose)
     cost_model = _build_cost_model(args)
+
+    if args.csv_dir:
+        _run_multi_symbol(args, cost_model)
+        return
+
+    symbol = _resolve_symbol(args)
 
     df = await _load_bars_async(args)
 
