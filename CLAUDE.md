@@ -77,10 +77,12 @@ backtest/
   csv_source.py             CSVからのバー読み込み（IBKR接続不要のデータ源）
   metrics.py                勝率・プロフィットファクター・最大DD・シャープレシオ
   walk_forward.py           ウォークフォワード検証（過剰最適化の検出）
+  multi_symbol.py           複数銘柄のウォークフォワードと銘柄横断の集計
   run.py                    バックテスト/ウォークフォワードのCLI
 scripts/
   check_market_data.py      実機でマーケットデータの取得経路を切り分ける診断CLI
   check_screener.py         スキャナー・PER取得の購読権限を切り分ける診断CLI
+  fetch_bars.py             検証用の日足をCSVへ保存する（yfinance、IBKR接続不要）
   export_tax_report.py      確定申告用CSVを出力するCLI
 tests/                      単体テスト。IBKRへの実接続は不要（すべてモック）
 conftest.py                 pytest共通設定
@@ -125,6 +127,18 @@ CSVに `open` / `high` / `low` があれば使い、無ければ終値で代用�
 **学習期間で `min_trades_for_selection`（既定5）回以上トレードした設定だけを選定対象にする。** 満たす候補が1つも無いウィンドウは検証を見送り、`WalkForwardResult.skipped_windows` に数える。少数トレードの偶然で選んだ設定を検証しても、過剰最適化の検出にならないため。
 
 なお `profit_factor` は負けトレードが0件だと `inf` になる（`metrics.py`）。`inf` 同士は大小がつかずグリッドの並び順で機械的に選ばれてしまうため、選定スコアは総リターンを第2キーにして決着させている。
+
+### 複数銘柄での判断
+
+**単一銘柄の成績は運である。** エッジの有無は `--csv-dir` で複数銘柄を回し、銘柄横断の集計で判断すること（`backtest/multi_symbol.py`）。
+
+集計は**銘柄独立・等ウェイト**。銘柄ごとに独立したウォークフォワードを回し、全銘柄のout-of-sampleトレードを1つの母集団として合算する。各銘柄は同じ初期資金から始まる別々の検証であり、資金を共有しない。
+
+したがってこれが答えるのは「**押し目買いにエッジがあるか**」だけで、「この設定で口座がいくら増えるか」ではない。後者には資金を共有して同時保有数（`MAX_CONCURRENT_POSITIONS`）と日次サーキットブレーカーまで再現するポートフォリオ検証が要る。**合算の `total_pnl` を口座の損益として読んではならない。**
+
+合算のプロフィットファクターに加えて、**PFの中央値（銘柄別）とプラスで終えた銘柄の割合**も見ること。合算値が1銘柄の大当たりで押し上げられていないかを確認するための指標で、極端に偏っていれば再現性は低い。
+
+なお `strategy/pullback.py` の移動平均計算は、バックテストがこの関数をバーごと・グリッドの組合せごとに呼ぶ（42銘柄・10年で3000万回規模）ため、DataFrameの複製と全期間の `rolling()` を避けて直近ウィンドウの平均を直接取っている。結果は同じだが、素朴に書くと実行時間が倍以上になる。
 
 ### バックテストのデータ源
 
@@ -297,14 +311,21 @@ python -m pytest -q
 python -m backtest.run --symbol RIVN --duration "2 Y" --mode walk-forward
 python -m backtest.run --symbol RIVN --duration "2 Y" --mode backtest
 
+# 検証用の日足を取得（IBKR接続不要。保存先 bars/ は .gitignore 済み）
+python -m scripts.fetch_bars --symbols AAPL MSFT JNJ --period 10y
+python -m scripts.fetch_bars --symbols-file symbols.txt --period 10y
+
 # バックテスト（CSVデータ源。IBKR接続不要）
-python -m backtest.run --csv data/RIVN.csv --mode backtest
-python -m backtest.run --csv data/RIVN.csv --slippage-pct 0.1   # コスト前提を変える
-python -m backtest.run --csv data/RIVN.csv --no-costs           # コスト影響の比較専用
+python -m backtest.run --csv bars/RIVN.csv --mode backtest
+python -m backtest.run --csv bars/RIVN.csv --slippage-pct 0.1   # コスト前提を変える
+python -m backtest.run --csv bars/RIVN.csv --no-costs           # コスト影響の比較専用
+
+# 複数銘柄で判断する（エッジの有無はこれで見る。42銘柄・10年で約20分）
+python -m backtest.run --csv-dir bars
 
 # ウォークフォワードのウィンドウ設定（既定: test_barsずつスライド・最低5トレード）
-python -m backtest.run --csv data/RIVN.csv --train-bars 252 --test-bars 63
-python -m backtest.run --csv data/RIVN.csv --step-bars 315 --min-trades 1  # 旧来の進め方
+python -m backtest.run --csv bars/RIVN.csv --train-bars 252 --test-bars 63
+python -m backtest.run --csv bars/RIVN.csv --step-bars 315 --min-trades 1  # 旧来の進め方
 
 # マーケットデータ取得経路の診断（IB Gateway接続時、米国市場の取引時間内に実行）
 python -m scripts.check_market_data

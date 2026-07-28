@@ -31,11 +31,13 @@ def detect_pullback_signal(
             f"移動平均ウィンドウ({ma_window})に対してデータ点数が不足しています: {len(df)}"
         )
 
-    working_df = df.copy()
-    working_df["ma"] = working_df["close"].rolling(window=ma_window).mean()
-
-    latest_close: float = float(working_df["close"].iloc[-1])
-    moving_average: float = float(working_df["ma"].iloc[-1])
+    closes = df["close"]
+    latest_close: float = float(closes.iloc[-1])
+    # 使うのは最新バー時点の移動平均だけなので、直近ma_window本の平均を直接取る。
+    # DataFrameを複製して全期間のrolling().mean()を計算すると結果は同じだが、
+    # バックテストはこの関数をバーごと・グリッドの組合せごとに呼ぶため
+    # （42銘柄・10年で3000万回規模）、そこが実行時間の大半を占めてしまう。
+    moving_average: float = float(closes.iloc[-ma_window:].mean())
     deviation_pct: float = (latest_close - moving_average) / moving_average * 100.0
 
     should_buy: bool = deviation_pct <= -threshold_pct
