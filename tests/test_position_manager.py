@@ -5,9 +5,11 @@ import json
 import os
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from core.market_hours import US_EASTERN
 from execution.position_manager import (
     Position,
     PositionManager,
@@ -464,3 +466,141 @@ def test_sync_does_not_persist_when_nothing_is_tracked(tmp_path) -> None:
     asyncio.run(manager.sync_with_broker_async(ib))
 
     assert not os.path.exists(path)
+
+
+# --- 当日中の再エントリー禁止（クールダウン） -----------------------------------------
+
+
+def test_symbol_is_not_in_cooldown_before_any_close() -> None:
+    manager = PositionManager()
+
+    assert manager.is_in_cooldown("AAPL") is False
+
+
+def test_close_position_starts_a_same_day_cooldown() -> None:
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    manager.close_position("AAPL")
+
+    assert manager.is_in_cooldown("AAPL") is True
+    assert manager.is_in_cooldown("MSFT") is False
+
+
+def test_cooldown_expires_on_the_next_trading_day() -> None:
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    manager.close_position("AAPL", now=datetime(2026, 3, 10, 15, 0, tzinfo=US_EASTERN))
+
+    same_day = datetime(2026, 3, 10, 15, 30, tzinfo=US_EASTERN)
+    next_day = datetime(2026, 3, 11, 9, 35, tzinfo=US_EASTERN)
+
+    assert manager.is_in_cooldown("AAPL", now=same_day) is True
+    assert manager.is_in_cooldown("AAPL", now=next_day) is False
+
+
+def test_cooldown_uses_us_eastern_trading_day_not_local_midnight() -> None:
+    """取引日の区切りは米国東部時間で判定すること。
+
+    日本時間で判定すると、東部時間の取引時間中（日本時間の深夜〜早朝）に
+    日付が変わり、同じ取引日の中でクールダウンが解除されてしまう。
+    """
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    # 東部時間 3/10 14:00 = 日本時間 3/11 03:00（日本時間では既に翌日）
+    manager.close_position("AAPL", now=datetime(2026, 3, 10, 14, 0, tzinfo=US_EASTERN))
+
+    japan_next_day = datetime(2026, 3, 11, 4, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+
+    assert manager.is_in_cooldown("AAPL", now=japan_next_day) is True
+
+
+def test_cooldown_survives_restart(tmp_path) -> None:
+    """プロセスを再起動してもクールダウンが引き継がれること。
+
+    引き継がないと、再起動のたびに損切り直後の銘柄を買い直せてしまう。
+    """
+    state_path = str(tmp_path / "positions.json")
+    manager = PositionManager(state_path=state_path)
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    manager.close_position("AAPL")
+
+    restored = PositionManager(state_path=state_path)
+
+    assert restored.is_in_cooldown("AAPL") is True
+
+
+def test_stale_cooldowns_are_dropped_on_load(tmp_path) -> None:
+    """過去日のクールダウンは復元時に捨てること（状態ファイルの肥大化防止）。"""
+    state_path = tmp_path / "positions.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "saved_at": "2020-01-01T00:00:00+00:00",
+                "positions": [],
+                "last_exit_days": {"AAPL": "2020-01-01"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manager = PositionManager(state_path=str(state_path))
+
+    assert manager.is_in_cooldown("AAPL") is False
+
+
+def test_state_file_without_cooldown_key_still_loads(tmp_path) -> None:
+    """クールダウン導入前に書かれた状態ファイルも読めること。"""
+    state_path = tmp_path / "positions.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "saved_at": "2026-01-01T00:00:00+00:00",
+                "positions": [
+                    {
+                        "symbol": "AAPL", "entry_price": 100.0, "quantity": 3,
+                        "highest_price": 105.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manager = PositionManager(state_path=str(state_path))
+
+    assert manager.has_position("AAPL") is True
+    assert manager.is_in_cooldown("AAPL") is False
+
+
+# --- ブローカー側に置いた待機注文 ------------------------------------------------------
+
+
+def test_resting_order_prices_are_persisted_and_restored(tmp_path) -> None:
+    """待機注文の値段が再起動後も引き継がれること。
+
+    引き継がないと、再起動後のポジションは待機注文の存在を見失い、
+    ブローカー側で約定済みでもボットが決済に気付けない。
+    """
+    state_path = str(tmp_path / "positions.json")
+    manager = PositionManager(state_path=state_path)
+    manager.open_position(
+        "AAPL", entry_price=100.0, quantity=3,
+        stop_price=95.0, take_profit_price=110.0, oca_group="OCA_1",
+    )
+
+    restored = PositionManager(state_path=state_path).get_position("AAPL")
+
+    assert restored.stop_price == pytest.approx(95.0)
+    assert restored.take_profit_price == pytest.approx(110.0)
+    assert restored.oca_group == "OCA_1"
+
+
+def test_broker_synced_position_has_no_resting_orders() -> None:
+    """ブローカー同期で取り込んだ建玉は待機注文を持たない（値段は0のまま）。"""
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=3)
+    position = manager.get_position("AAPL")
+
+    assert position.stop_price == 0.0
+    assert position.take_profit_price == 0.0
+    assert position.oca_group is None

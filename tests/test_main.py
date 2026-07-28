@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pandas as pd
 import pytest
 
-from execution.order_manager import DryRunOrderResult
+from execution.order_manager import DryRunBracketResult, DryRunOrderResult
 from execution.position_manager import PositionManager, STRATEGY_TYPE_DAY, STRATEGY_TYPE_SWING
 from execution.trade_journal import TradeJournal
 from main import (
@@ -24,6 +24,14 @@ from main import (
 
 def _make_df(closes: list) -> pd.DataFrame:
     return pd.DataFrame({"close": closes})
+
+
+def _bracket_result(quantity: int, symbol: str = "AAPL") -> DryRunBracketResult:
+    """新規建て時のブラケット注文の戻り値（値段は呼び出し側の検証対象外）。"""
+    return DryRunBracketResult(
+        symbol=symbol, quantity=quantity, stop_price=0.0, take_profit_price=0.0,
+        oca_group="OCA_TEST",
+    )
 
 
 @pytest.fixture
@@ -48,16 +56,19 @@ def test_process_symbol_opens_position_on_swing_daily_buy_signal(trade_journal) 
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
-            "main.place_dry_run_order_async",
-            new=AsyncMock(
-                return_value=DryRunOrderResult(symbol="AAPL", action="BUY", quantity=250, order_type="MKT")
-            ),
+            "main.place_dry_run_bracket_order_async",
+            new=AsyncMock(return_value=_bracket_result(quantity=250)),
         ) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
     # risk_amount=100,000*1%=1,000 / per_share_risk=80*5%=4.0 -> qty=250
-    mock_order.assert_awaited_once_with(ib, contract, action="BUY", quantity=250)
+    # 損切り(-5%) / 利確(+10%) はブローカー側の待機注文として発注する。
+    mock_order.assert_awaited_once_with(
+        ib, contract, quantity=250,
+        stop_price=pytest.approx(80.0 * 0.95),
+        take_profit_price=pytest.approx(80.0 * 1.10),
+    )
     assert position_manager.has_position("AAPL") is True
     position = position_manager.get_position("AAPL")
     assert position.entry_price == 80.0
@@ -65,6 +76,10 @@ def test_process_symbol_opens_position_on_swing_daily_buy_signal(trade_journal) 
     # risk_per_share = 80 * stop_loss_pct(5%) / 100 = 4.0
     assert position.risk_per_share == pytest.approx(4.0)
     assert position.strategy_type == STRATEGY_TYPE_SWING
+    # 再起動後も待機注文を把握できるよう、値段とOCAグループを永続化する。
+    assert position.stop_price == pytest.approx(80.0 * 0.95)
+    assert position.take_profit_price == pytest.approx(80.0 * 1.10)
+    assert position.oca_group == "OCA_TEST"
 
 
 def test_process_symbol_opens_position_on_intraday_buy_signal_when_daily_flat(trade_journal) -> None:
@@ -81,10 +96,8 @@ def test_process_symbol_opens_position_on_intraday_buy_signal_when_daily_flat(tr
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
-            "main.place_dry_run_order_async",
-            new=AsyncMock(
-                return_value=DryRunOrderResult(symbol="AAPL", action="BUY", quantity=222, order_type="MKT")
-            ),
+            "main.place_dry_run_bracket_order_async",
+            new=AsyncMock(return_value=_bracket_result(quantity=222)),
         ) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
@@ -715,3 +728,188 @@ def test_contracts_are_qualified_once_per_symbol_across_cycles(trade_journal) ->
         asyncio.run(run())
 
     mock_qualify.assert_awaited_once()
+
+
+# --- ブローカー側の待機注文による決済 ------------------------------------------------
+
+
+def test_resting_stop_order_closes_the_position_without_a_market_order(trade_journal) -> None:
+    """逆指値がブローカー側で約定していたら、ボットからは何も発注しないこと。
+
+    約定価格は、ポーリングで観測できた現在値(85.0)を採る。逆指値(95.0)どおりに
+    約定したと仮定するのは楽観的すぎるため（ポーリングの間に窓を開けて
+    下抜けた可能性を否定できない）、不利な側に倒して記録する。
+    """
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=3, risk_per_share=5.0,
+        stop_price=95.0, take_profit_price=110.0, oca_group="OCA_1",
+    )
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=85.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order, \
+        patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()) as mock_cancel:
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    # 既にブローカー側で約定しているので、ボットからは何も発注しない。
+    mock_order.assert_not_awaited()
+    # OCAグループの相方はIBKRが自動で取り消すため、取り消し要求も出さない。
+    mock_cancel.assert_not_awaited()
+
+    assert position_manager.has_position("AAPL") is False
+    trade = trade_journal.load_trades()[0]
+    assert trade.reason == "STOP_LOSS"
+    assert trade.exit_price == pytest.approx(85.0)
+    assert trade.pnl == pytest.approx((85.0 - 100.0) * 3)
+
+
+def test_resting_limit_order_closes_position_at_the_take_profit_price(trade_journal) -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=3, risk_per_share=5.0,
+        stop_price=95.0, take_profit_price=110.0, oca_group="OCA_1",
+    )
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=115.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    mock_order.assert_not_awaited()
+    trade = trade_journal.load_trades()[0]
+    assert trade.reason == "TAKE_PROFIT"
+    assert trade.exit_price == pytest.approx(110.0)
+
+
+def test_trailing_stop_cancels_resting_orders_before_selling_at_market(trade_journal) -> None:
+    """ボット側の判断で成行決済する際は、先に待機注文を取り消すこと。
+
+    取り消さないと建玉が無いのに売り注文だけが残り、次にその銘柄を
+    建てた瞬間に意図しない決済が起きる。
+    """
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=3, risk_per_share=5.0,
+        stop_price=95.0, take_profit_price=110.0, oca_group="OCA_1",
+    )
+    # 高値108まで伸びた後、104へ下落 -> 高値から-3.7%でトレーリング発火(swing基準は-5%…
+    # ではなく、ここではデフォルトのswing 5%に届くよう102.5まで下げる)
+    position_manager.update_highest_price("AAPL", 108.0)
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=102.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order, \
+        patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()) as mock_cancel:
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    mock_cancel.assert_awaited_once_with(ib, "AAPL", "OCA_1")
+    mock_order.assert_awaited_once_with(ib, contract, action="SELL", quantity=3)
+    assert trade_journal.load_trades()[0].reason == "TRAILING_STOP"
+
+
+def test_eod_flatten_cancels_resting_orders_before_selling_at_market(trade_journal) -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=2, strategy_type=STRATEGY_TYPE_DAY,
+        stop_price=98.5, take_profit_price=103.0, oca_group="OCA_2",
+    )
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=100.5)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch("main.is_day_trade_flatten_time", return_value=True), \
+        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order, \
+        patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()) as mock_cancel:
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    mock_cancel.assert_awaited_once_with(ib, "AAPL", "OCA_2")
+    mock_order.assert_awaited_once_with(ib, contract, action="SELL", quantity=2)
+    assert trade_journal.load_trades()[0].reason == "EOD_FLATTEN"
+
+
+def test_broker_synced_position_without_resting_orders_still_exits_on_signal(trade_journal) -> None:
+    """待機注文を持たない（ブローカー同期で取り込んだ）ポジションも決済できること。"""
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    # stop_price / take_profit_price は 0.0 のまま
+    position_manager.open_position("AAPL", entry_price=100.0, quantity=3)
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    mock_order.assert_awaited_once_with(ib, contract, action="SELL", quantity=3)
+    assert trade_journal.load_trades()[0].reason == "STOP_LOSS"
+
+
+# --- 当日中の再エントリー禁止（クールダウン） -----------------------------------------
+
+
+def test_entry_is_skipped_for_a_symbol_already_closed_today(trade_journal) -> None:
+    """同じ日に決済済みの銘柄は、買いシグナルが出ていても買い直さないこと。"""
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position("AAPL", entry_price=100.0, quantity=3)
+    position_manager.close_position("AAPL")
+
+    daily_df = _make_df([100.0] * 19 + [80.0])  # 大きく下落 -> 買いシグナルは出ている
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)) as mock_qualify, \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.place_dry_run_bracket_order_async", new=AsyncMock()) as mock_order:
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    # クールダウン判定はIBKRへの問い合わせより前に短絡すること（無駄なリクエストを出さない）。
+    mock_qualify.assert_not_awaited()
+    mock_order.assert_not_awaited()
+    assert position_manager.has_position("AAPL") is False
+
+
+def test_cooldown_does_not_block_other_symbols(trade_journal) -> None:
+    contract = MagicMock(symbol="MSFT")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position("AAPL", entry_price=100.0, quantity=3)
+    position_manager.close_position("AAPL")
+
+    daily_df = _make_df([100.0] * 19 + [80.0])
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch(
+            "main.place_dry_run_bracket_order_async",
+            new=AsyncMock(return_value=_bracket_result(quantity=250, symbol="MSFT")),
+        ) as mock_order:
+
+        asyncio.run(process_symbol_async(ib, "MSFT", position_manager, trade_journal))
+
+    mock_order.assert_awaited_once()
+    assert position_manager.has_position("MSFT") is True

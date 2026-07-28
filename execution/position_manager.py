@@ -13,10 +13,12 @@ import json
 import logging
 import os
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
 
 from ib_insync import IB
+
+from core.market_hours import US_EASTERN
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,18 @@ STRATEGY_TYPE_DAY: str = "day"
 STRATEGY_TYPE_UNKNOWN: str = "unknown"
 
 
+def _current_trading_day(now: Optional[datetime] = None) -> date:
+    """取引日の区切りを米国東部時間で判定する。
+
+    クールダウン（当日中の再エントリー禁止）の「当日」は、市場時間
+    (core.market_hours)や日次サーキットブレーカー(TradeJournal.compute_daily_pnl)と
+    同じ区切りでなければならない。ローカル時間で判定すると、日本時間の
+    深夜0時をまたいだ瞬間に同じ取引日の中でクールダウンが解除される。
+    """
+    reference = now or datetime.now(US_EASTERN)
+    return reference.astimezone(US_EASTERN).date()
+
+
 @dataclass
 class Position:
     symbol: str
@@ -55,6 +69,14 @@ class Position:
     # ブローカー側で発見した未追跡ポジション(このBotが建てたものではない)は
     # 実際の建玉日が分からないためNoneのままとする。
     entry_date: Optional[str] = None
+    # ブローカー側に置いた待機注文の値段。ボットのプロセスが落ちていても
+    # 効き続ける唯一の防御なので、再起動後も引き継げるよう永続化する。
+    # ブローカー同期で取り込んだ未追跡ポジションは待機注文を持たないため0.0。
+    stop_price: float = 0.0
+    take_profit_price: float = 0.0
+    # 待機注文を結んでいるOCAグループ名。ボット側の判断で成行決済した際に、
+    # 残っている待機注文を取り消すために使う。
+    oca_group: Optional[str] = None
 
 
 class PositionManager:
@@ -71,6 +93,9 @@ class PositionManager:
 
     def __init__(self, state_path: Optional[str] = None) -> None:
         self._positions: Dict[str, Position] = {}
+        # 銘柄 -> 最後に決済した取引日(米国東部時間, ISO形式の日付文字列)。
+        # 「決済した当日は同じ銘柄へ再エントリーしない」判定に使う。
+        self._last_exit_days: Dict[str, str] = {}
         self.state_path = state_path
         if state_path:
             self._load()
@@ -85,6 +110,8 @@ class PositionManager:
             with open(self.state_path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             positions = [Position(**item) for item in payload["positions"]]
+            # クールダウンは後から追加した項目なので、無い状態ファイルも読める。
+            last_exit_days = dict(payload.get("last_exit_days") or {})
         except (OSError, ValueError, KeyError, TypeError):
             # 状態ファイルが壊れていてもボットの起動自体は止めない。
             # 破棄せずリネームして残し、後から中身を確認できるようにする。
@@ -97,10 +124,21 @@ class PositionManager:
             return
 
         self._positions = {position.symbol: position for position in positions}
+        # 当日分だけ残す。過去日のクールダウンはもう効かないため、
+        # 保持し続けると状態ファイルが際限なく膨らむ。
+        today = _current_trading_day().isoformat()
+        self._last_exit_days = {
+            symbol: day for symbol, day in last_exit_days.items() if day == today
+        }
         if self._positions:
             logger.info(
                 "ポジション状態を復元しました: %d件 %s",
                 len(self._positions), list(self._positions),
+            )
+        if self._last_exit_days:
+            logger.info(
+                "本日決済済みでクールダウン中の銘柄を復元しました: %s",
+                list(self._last_exit_days),
             )
 
     def _quarantine_state_file(self) -> None:
@@ -120,6 +158,7 @@ class PositionManager:
         payload = {
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "positions": [asdict(position) for position in self._positions.values()],
+            "last_exit_days": dict(self._last_exit_days),
         }
 
         # 書き込み中にプロセスが落ちても状態ファイルを壊さないよう、
@@ -154,9 +193,24 @@ class PositionManager:
         """
         return list(self._positions.keys())
 
+    def is_in_cooldown(self, symbol: str, now: Optional[datetime] = None) -> bool:
+        """その銘柄が「本日決済済み」でクールダウン中か判定する。
+
+        決済した当日は同じ銘柄へ再エントリーしない。これが無いと、日足の
+        乖離率はその日の間ほぼ変わらないため、損切りした直後のサイクルで
+        同じ買いシグナルが再び成立し、「買う→損切り→また買う」を
+        1日に何度も繰り返して損失を刻む。
+        """
+        last_exit_day = self._last_exit_days.get(symbol)
+        if last_exit_day is None:
+            return False
+        return last_exit_day == _current_trading_day(now).isoformat()
+
     def open_position(
         self, symbol: str, entry_price: float, quantity: int, risk_per_share: float = 0.0,
         strategy_type: str = STRATEGY_TYPE_UNKNOWN,
+        stop_price: float = 0.0, take_profit_price: float = 0.0,
+        oca_group: Optional[str] = None,
     ) -> Position:
         if entry_price <= 0:
             raise ValueError("entry_price は正の値である必要があります。")
@@ -177,11 +231,15 @@ class PositionManager:
             risk_per_share=risk_per_share,
             strategy_type=strategy_type,
             entry_date=datetime.now(timezone.utc).isoformat(),
+            stop_price=stop_price,
+            take_profit_price=take_profit_price,
+            oca_group=oca_group,
         )
         self._positions[symbol] = position
         logger.info(
-            "[%s] ポジションを新規建てしました: entry=%.2f qty=%s strategy=%s",
-            symbol, entry_price, quantity, strategy_type,
+            "[%s] ポジションを新規建てしました: entry=%.2f qty=%s strategy=%s "
+            "待機注文 STP=%.2f LMT=%.2f",
+            symbol, entry_price, quantity, strategy_type, stop_price, take_profit_price,
         )
         self._save()
         return position
@@ -198,12 +256,17 @@ class PositionManager:
             self._save()
         return position
 
-    def close_position(self, symbol: str) -> Position:
+    def close_position(self, symbol: str, now: Optional[datetime] = None) -> Position:
         position = self._positions.pop(symbol, None)
         if position is None:
             raise KeyError(f"{symbol} のポジションが存在しません。")
 
-        logger.info("[%s] ポジションを決済しました。", symbol)
+        # 決済と同時にクールダウンを開始する（当日中の再エントリー禁止）。
+        self._last_exit_days[symbol] = _current_trading_day(now).isoformat()
+
+        logger.info(
+            "[%s] ポジションを決済しました。本日中は再エントリーしません。", symbol,
+        )
         self._save()
         return position
 

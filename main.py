@@ -17,7 +17,11 @@ from data.market_data import (
     get_usd_jpy_rate_async,
 )
 from execution.account import get_account_equity_async
-from execution.order_manager import place_dry_run_order_async
+from execution.order_manager import (
+    cancel_dry_run_bracket_orders_async,
+    place_dry_run_bracket_order_async,
+    place_dry_run_order_async,
+)
 from execution.position_manager import (
     DEFAULT_STATE_PATH,
     Position,
@@ -27,7 +31,13 @@ from execution.position_manager import (
 )
 from execution.position_sizing import calculate_position_size
 from execution.trade_journal import TradeJournal
-from strategy.exit_signal import REASON_EOD_FLATTEN, detect_exit_signal
+from strategy.exit_signal import (
+    REASON_EOD_FLATTEN,
+    detect_exit_signal,
+    detect_resting_order_exit,
+    resolve_stop_price,
+    resolve_take_profit_price,
+)
 from strategy.pullback import SignalResult, detect_pullback_signal
 from strategy.screener import ScreenerConfig, screen_value_stocks_async
 
@@ -190,6 +200,17 @@ async def _process_entry_async(
         )
         return
 
+    # 決済した当日は同じ銘柄を買い直さない。日足の乖離率はその日の間ほぼ
+    # 変わらないため、この判定が無いと損切り直後のサイクルで同じシグナルが
+    # 再び成立し、下落トレンド中に損失を刻み続ける。
+    if position_manager.is_in_cooldown(symbol):
+        logger.info(
+            "[%s] 本日すでに決済済みのため、新規エントリーをスキップします"
+            "（当日中の再エントリー禁止）。",
+            symbol,
+        )
+        return
+
     contract = await caches.contracts.get_async(ib, symbol)
 
     signal_result = await _detect_buy_signal_async(ib, contract, symbol, caches)
@@ -231,10 +252,21 @@ async def _process_entry_async(
         return
 
     risk_per_share = price * exit_params.stop_loss_pct / 100.0
-    order_result = await place_dry_run_order_async(ib, contract, action="BUY", quantity=quantity)
+
+    # 損切りと利確はブローカー側に置く（ブラケット注文）。ボットのプロセスが
+    # 落ちていても、TWSとの接続が切れていても、ポーリングを待たずに約定する。
+    stop_price = resolve_stop_price(price, exit_params.stop_loss_pct)
+    take_profit_price = resolve_take_profit_price(price, exit_params.take_profit_pct)
+
+    order_result = await place_dry_run_bracket_order_async(
+        ib, contract, quantity=quantity,
+        stop_price=stop_price, take_profit_price=take_profit_price,
+    )
     position_manager.open_position(
         symbol, entry_price=price, quantity=order_result.quantity, risk_per_share=risk_per_share,
         strategy_type=strategy_type,
+        stop_price=stop_price, take_profit_price=take_profit_price,
+        oca_group=order_result.oca_group,
     )
 
 
@@ -290,11 +322,40 @@ async def _process_exit_async(
 
     position_manager.update_highest_price(symbol, price)
 
+    # 1. ブローカー側に置いた待機注文（損切りの逆指値・利確の指値）が約定していないか。
+    #    こちらはポーリングを待たずに市場で約定しているため、他の判定より先に確認する。
+    #    ブローカー同期で取り込んだ未追跡ポジションは待機注文を持たない(値段が0)ため対象外。
+    if position.stop_price > 0 and position.take_profit_price > 0:
+        resting_exit = detect_resting_order_exit(
+            stop_price=position.stop_price,
+            take_profit_price=position.take_profit_price,
+            # ポーリングではバー内の値動きが分からないため、観測した現在値だけで判定する。
+            bar_low=price,
+            bar_high=price,
+        )
+        if resting_exit is not None:
+            logger.info(
+                "[%s] ブローカー側の待機注文が約定しました: reason=%s fill=%.2f",
+                symbol, resting_exit.reason, resting_exit.fill_price,
+            )
+            fill_price = resting_exit.fill_price
+            pnl_pct = (fill_price - position.entry_price) / position.entry_price * 100.0
+            # OCAグループの相方はIBKR側が自動で取り消すため、ここでの取り消しは不要。
+            closed_position = position_manager.close_position(symbol)
+            await _record_closed_trade(
+                ib, trade_journal, closed_position, fill_price, resting_exit.reason, pnl_pct,
+            )
+            return
+
+    # 2. ボット側で判定するもの（大引け前の強制決済・トレーリングストップ）。
+    #    どちらも成行で出すため、先に待機注文を取り消さないと、決済済みの銘柄に
+    #    売り注文だけが残る。
     if position.strategy_type == STRATEGY_TYPE_DAY and is_day_trade_flatten_time():
         logger.info(
             "[%s] デイトレードポジションが大引け前の強制決済時刻に達したため決済します。", symbol,
         )
         pnl_pct = (price - position.entry_price) / position.entry_price * 100.0
+        await cancel_dry_run_bracket_orders_async(ib, symbol, position.oca_group)
         await place_dry_run_order_async(ib, contract, action="SELL", quantity=position.quantity)
         closed_position = position_manager.close_position(symbol)
         await _record_closed_trade(ib, trade_journal, closed_position, price, REASON_EOD_FLATTEN, pnl_pct)
@@ -316,6 +377,7 @@ async def _process_exit_async(
     if not result.should_sell:
         return
 
+    await cancel_dry_run_bracket_orders_async(ib, symbol, position.oca_group)
     await place_dry_run_order_async(ib, contract, action="SELL", quantity=position.quantity)
     closed_position = position_manager.close_position(symbol)
     await _record_closed_trade(ib, trade_journal, closed_position, price, result.reason, result.pnl_pct)
