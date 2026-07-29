@@ -17,7 +17,11 @@ from data.market_data import (
     get_usd_jpy_rate_async,
 )
 from execution.account import get_account_equity_async
-from execution.order_manager import place_dry_run_order_async
+from execution.order_manager import (
+    cancel_dry_run_bracket_orders_async,
+    place_dry_run_bracket_order_async,
+    place_dry_run_order_async,
+)
 from execution.position_manager import (
     DEFAULT_STATE_PATH,
     Position,
@@ -27,8 +31,19 @@ from execution.position_manager import (
 )
 from execution.position_sizing import calculate_position_size
 from execution.trade_journal import TradeJournal
-from strategy.exit_signal import REASON_EOD_FLATTEN, detect_exit_signal
-from strategy.pullback import SignalResult, detect_pullback_signal
+from strategy.exit_signal import (
+    REASON_EOD_FLATTEN,
+    detect_exit_signal,
+    detect_resting_order_exit,
+    resolve_stop_price,
+    resolve_take_profit_price,
+)
+from strategy.pullback import (
+    MarketFilterConfig,
+    SignalResult,
+    compute_deviation_pct,
+    detect_pullback_signal,
+)
 from strategy.screener import ScreenerConfig, screen_value_stocks_async
 
 logging.basicConfig(
@@ -73,9 +88,30 @@ SCREENER_TREND_LOOKBACK_DURATION: str = "300 D"
 POLL_INTERVAL_SECONDS: float = 180.0
 CLOSED_MARKET_POLL_INTERVAL_SECONDS: float = 300.0
 
-# スイングトレード判定用（日足）のプルバックパラメータ
-SWING_MA_WINDOW: int = 20
+# スイングトレード判定用（日足）のプルバックパラメータ。
+# 移動平均30本は、42銘柄・10年の日足で移動平均期間だけを固定した
+# ウォークフォワード検証（out-of-sample・コスト込み）で選んだ値。
+# MA10/20/25/30/40/50/60 の比較では30が逆U字のピークで、profit_factorの
+# 中央値1.42・プラスで終えた銘柄36/42(85.7%)といずれも最良だった
+# （20は1.18・69.0%）。60まで伸ばすと中央値0.89まで崩れるため、
+# 「長いほど良い」という単調な傾向を拾ったものではない。
+SWING_MA_WINDOW: int = 30
 SWING_THRESHOLD_PCT: float = 5.0
+
+# 市場全体（指数）の状況によるエントリーの追加条件。日足＝スイング判定にのみ掛かる。
+#
+# **既定は無効（すべてNone）。** 有効化してよいのは、
+#     python -m backtest.run --csv-dir bars --market-csv bars/SPY.csv \
+#         --relative-threshold 2 3 4 --keep-unfiltered
+# のような銘柄横断のウォークフォワードで、フィルター有りが選ばれ、かつ
+# 合算PFだけでなくPFの中央値・プラスで終えた銘柄の割合まで改善したときだけ。
+#
+# デイトレード（5分足）分岐には掛けていない。5分足は外部データで数十日分しか
+# 遡れず（CLAUDE.md「バックテストのデータ源」）、検証を経ていない条件を
+# ライブにだけ入れることになるため。
+MARKET_INDEX_SYMBOL: str = "SPY"
+MARKET_INDEX_MA_WINDOW: int = 30
+SWING_MARKET_FILTER: MarketFilterConfig = MarketFilterConfig()
 
 # デイトレード判定用（短期足）のプルバックパラメータ
 INTRADAY_BAR_SIZE: str = "5 mins"
@@ -143,6 +179,36 @@ MAX_CONCURRENT_POSITIONS: int = 5
 MAX_DAILY_LOSS_PCT: float = 3.0
 
 
+async def _get_market_deviation_pct_async(
+    ib: IB, caches: MarketDataCaches,
+) -> Optional[float]:
+    """指数の乖離率を返す。フィルターが無効なら取得もしない（=リクエスト0件）。
+
+    指数の日足も `DailyBarCache` を通すため、追加のリクエストは
+    「1取引日あたり1件」で済み、ペーシング制限(CLAUDE.md 6.1)には実質響かない。
+    """
+    if not SWING_MARKET_FILTER.is_enabled:
+        return None
+
+    try:
+        contract = await caches.contracts.get_async(ib, MARKET_INDEX_SYMBOL)
+        bars = await caches.daily_bars.get_async(ib, contract)
+    except Exception:
+        # 指数が取れないことで監視ループ全体を落とさない。Noneを返すと
+        # フィルターは「条件を満たさない」＝エントリー見送りに倒れる。
+        logger.exception("%s の日足を取得できませんでした。", MARKET_INDEX_SYMBOL)
+        return None
+
+    if len(bars) < MARKET_INDEX_MA_WINDOW:
+        logger.warning(
+            "%s の日足が%d本しかなく、移動平均(%d本)を計算できません。",
+            MARKET_INDEX_SYMBOL, len(bars), MARKET_INDEX_MA_WINDOW,
+        )
+        return None
+
+    return compute_deviation_pct(bars["close"], MARKET_INDEX_MA_WINDOW)
+
+
 async def _detect_buy_signal_async(
     ib: IB, contract: Stock, symbol: str, caches: MarketDataCaches,
 ) -> Optional[Tuple[SignalResult, str]]:
@@ -158,8 +224,10 @@ async def _detect_buy_signal_async(
         return None
 
     if len(daily_df) >= SWING_MA_WINDOW:
+        market_deviation_pct = await _get_market_deviation_pct_async(ib, caches)
         swing_signal = detect_pullback_signal(
             symbol, daily_df, ma_window=SWING_MA_WINDOW, threshold_pct=SWING_THRESHOLD_PCT,
+            market_deviation_pct=market_deviation_pct, market_filter=SWING_MARKET_FILTER,
         )
         if swing_signal.should_buy:
             logger.info("[%s] スイング(日足)のプルバックシグナルで買い判定しました。", symbol)
@@ -187,6 +255,17 @@ async def _process_entry_async(
         logger.info(
             "[%s] 同時保有ポジション数の上限(%d)に達しているため新規エントリーをスキップします。",
             symbol, MAX_CONCURRENT_POSITIONS,
+        )
+        return
+
+    # 決済した当日は同じ銘柄を買い直さない。日足の乖離率はその日の間ほぼ
+    # 変わらないため、この判定が無いと損切り直後のサイクルで同じシグナルが
+    # 再び成立し、下落トレンド中に損失を刻み続ける。
+    if position_manager.is_in_cooldown(symbol):
+        logger.info(
+            "[%s] 本日すでに決済済みのため、新規エントリーをスキップします"
+            "（当日中の再エントリー禁止）。",
+            symbol,
         )
         return
 
@@ -231,10 +310,21 @@ async def _process_entry_async(
         return
 
     risk_per_share = price * exit_params.stop_loss_pct / 100.0
-    order_result = await place_dry_run_order_async(ib, contract, action="BUY", quantity=quantity)
+
+    # 損切りと利確はブローカー側に置く（ブラケット注文）。ボットのプロセスが
+    # 落ちていても、TWSとの接続が切れていても、ポーリングを待たずに約定する。
+    stop_price = resolve_stop_price(price, exit_params.stop_loss_pct)
+    take_profit_price = resolve_take_profit_price(price, exit_params.take_profit_pct)
+
+    order_result = await place_dry_run_bracket_order_async(
+        ib, contract, quantity=quantity,
+        stop_price=stop_price, take_profit_price=take_profit_price,
+    )
     position_manager.open_position(
         symbol, entry_price=price, quantity=order_result.quantity, risk_per_share=risk_per_share,
         strategy_type=strategy_type,
+        stop_price=stop_price, take_profit_price=take_profit_price,
+        oca_group=order_result.oca_group,
     )
 
 
@@ -290,11 +380,40 @@ async def _process_exit_async(
 
     position_manager.update_highest_price(symbol, price)
 
+    # 1. ブローカー側に置いた待機注文（損切りの逆指値・利確の指値）が約定していないか。
+    #    こちらはポーリングを待たずに市場で約定しているため、他の判定より先に確認する。
+    #    ブローカー同期で取り込んだ未追跡ポジションは待機注文を持たない(値段が0)ため対象外。
+    if position.stop_price > 0 and position.take_profit_price > 0:
+        resting_exit = detect_resting_order_exit(
+            stop_price=position.stop_price,
+            take_profit_price=position.take_profit_price,
+            # ポーリングではバー内の値動きが分からないため、観測した現在値だけで判定する。
+            bar_low=price,
+            bar_high=price,
+        )
+        if resting_exit is not None:
+            logger.info(
+                "[%s] ブローカー側の待機注文が約定しました: reason=%s fill=%.2f",
+                symbol, resting_exit.reason, resting_exit.fill_price,
+            )
+            fill_price = resting_exit.fill_price
+            pnl_pct = (fill_price - position.entry_price) / position.entry_price * 100.0
+            # OCAグループの相方はIBKR側が自動で取り消すため、ここでの取り消しは不要。
+            closed_position = position_manager.close_position(symbol)
+            await _record_closed_trade(
+                ib, trade_journal, closed_position, fill_price, resting_exit.reason, pnl_pct,
+            )
+            return
+
+    # 2. ボット側で判定するもの（大引け前の強制決済・トレーリングストップ）。
+    #    どちらも成行で出すため、先に待機注文を取り消さないと、決済済みの銘柄に
+    #    売り注文だけが残る。
     if position.strategy_type == STRATEGY_TYPE_DAY and is_day_trade_flatten_time():
         logger.info(
             "[%s] デイトレードポジションが大引け前の強制決済時刻に達したため決済します。", symbol,
         )
         pnl_pct = (price - position.entry_price) / position.entry_price * 100.0
+        await cancel_dry_run_bracket_orders_async(ib, symbol, position.oca_group)
         await place_dry_run_order_async(ib, contract, action="SELL", quantity=position.quantity)
         closed_position = position_manager.close_position(symbol)
         await _record_closed_trade(ib, trade_journal, closed_position, price, REASON_EOD_FLATTEN, pnl_pct)
@@ -316,6 +435,7 @@ async def _process_exit_async(
     if not result.should_sell:
         return
 
+    await cancel_dry_run_bracket_orders_async(ib, symbol, position.oca_group)
     await place_dry_run_order_async(ib, contract, action="SELL", quantity=position.quantity)
     closed_position = position_manager.close_position(symbol)
     await _record_closed_trade(ib, trade_journal, closed_position, price, result.reason, result.pnl_pct)
