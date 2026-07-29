@@ -22,7 +22,8 @@ from strategy.exit_signal import (
     resolve_stop_price,
     resolve_take_profit_price,
 )
-from strategy.pullback import detect_pullback_signal
+from backtest.market_reference import MARKET_DEVIATION_COLUMN
+from strategy.pullback import MarketFilterConfig, detect_pullback_signal
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,13 @@ class BacktestConfig:
     # 手数料・スリッページ。既定でコストを織り込む（backtest/costs.py参照）。
     # ZERO_COSTへ差し替えられるのはシグナル判定の単体テストとコスト影響の比較のみ。
     costs: CostModel = field(default_factory=CostModel)
+    # 市場全体（指数）によるエントリーの追加条件。既定はすべてNone（無効）で、
+    # 有効化の可否はウォークフォワードに決めさせる（strategy/pullback.py参照）。
+    # 使うには事前に backtest.market_reference.attach_market_deviation で
+    # 指数の乖離率の列を付与しておく必要がある。
+    market_min_deviation_pct: Optional[float] = None
+    market_max_deviation_pct: Optional[float] = None
+    relative_threshold_pct: Optional[float] = None
     # 決済した当日は同じ銘柄へ再エントリーしない（ライブ側と揃えるための既定True）。
     # これが無いと、下落トレンド中に「買う→損切り→また買う」を1日に何度も
     # 繰り返す。日足のように1バー=1日のデータでは元々起こらないため無影響だが、
@@ -123,6 +131,22 @@ def run_backtest(symbol: str, df: pd.DataFrame, config: Optional[BacktestConfig]
 
     dates = df["date"] if "date" in df.columns else pd.Series(range(len(df)))
 
+    market_filter = MarketFilterConfig(
+        min_deviation_pct=config.market_min_deviation_pct,
+        max_deviation_pct=config.market_max_deviation_pct,
+        relative_threshold_pct=config.relative_threshold_pct,
+    )
+    if market_filter.is_enabled and MARKET_DEVIATION_COLUMN not in df.columns:
+        # 黙って無効化するとフィルター無しの成績を「フィルター有り」と
+        # 取り違えるため、ここで落とす。
+        raise ValueError(
+            f"市場フィルターを有効にするには '{MARKET_DEVIATION_COLUMN}' 列が必要です。"
+            "backtest.market_reference.attach_market_deviation で付与してください。"
+        )
+    market_deviations = (
+        df[MARKET_DEVIATION_COLUMN] if MARKET_DEVIATION_COLUMN in df.columns else None
+    )
+
     costs = config.costs
 
     equity: float = config.initial_equity
@@ -148,8 +172,15 @@ def run_backtest(symbol: str, df: pd.DataFrame, config: Optional[BacktestConfig]
             in_cooldown = config.block_same_day_reentry and current_day == last_exit_day
             if not in_cooldown and i + 1 >= config.ma_window:
                 window_df = df.iloc[max(0, i + 1 - config.ma_window): i + 1]
+                market_deviation = None
+                if market_deviations is not None:
+                    value = float(market_deviations.iloc[i])
+                    # 突き合わない日（NaN）はNoneとして渡し、フィルター側で
+                    # 「条件を満たさない」扱いにする。
+                    market_deviation = None if math.isnan(value) else value
                 signal = detect_pullback_signal(
                     symbol, window_df, ma_window=config.ma_window, threshold_pct=config.threshold_pct,
+                    market_deviation_pct=market_deviation, market_filter=market_filter,
                 )
                 if signal.should_buy:
                     # 判定はバーの終値で行い、約定はスリッページ分だけ不利な価格で行う。

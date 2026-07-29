@@ -40,7 +40,13 @@ class DailyBarCache:
     ペーシング違反で空が返ったとき、その日いっぱい空を返し続けてしまうため。
     """
 
-    def __init__(self, duration: str = "60 D") -> None:
+    # 既定の取得期間。暦日90日はおよそ62営業日で、スイング判定の移動平均
+    # (main.SWING_MA_WINDOW = 30本) に対して倍程度の余裕がある。
+    # 本数が足りないとmain側の `len(daily_df) >= SWING_MA_WINDOW` で
+    # 日足分岐が例外も警告も出さずにスキップされるため、余裕を持たせている。
+    # 取得は取引日ごとに銘柄あたり1回だけなので、期間を延ばしても
+    # ペーシング制限(§6.1)上のリクエスト数は増えない。
+    def __init__(self, duration: str = "90 D") -> None:
         self.duration = duration
         self._entries: Dict[str, _DailyBarEntry] = {}
 
