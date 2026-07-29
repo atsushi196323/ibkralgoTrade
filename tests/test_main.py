@@ -9,10 +9,13 @@ import pytest
 from execution.order_manager import DryRunBracketResult, DryRunOrderResult
 from execution.position_manager import PositionManager, STRATEGY_TYPE_DAY, STRATEGY_TYPE_SWING
 from execution.trade_journal import TradeJournal
+from strategy.pullback import MarketFilterConfig
 from main import (
     DAY_STOP_LOSS_PCT,
+    MARKET_INDEX_SYMBOL,
     MAX_WATCHLIST_SIZE,
     POLL_INTERVAL_SECONDS,
+    SWING_MA_WINDOW,
     SWING_STOP_LOSS_PCT,
     MarketDataCaches,
     _refresh_watchlist_async,
@@ -24,6 +27,18 @@ from main import (
 
 def _make_df(closes: list) -> pd.DataFrame:
     return pd.DataFrame({"close": closes})
+
+
+def _make_daily_df(*, drop: bool = False) -> pd.DataFrame:
+    """スイング（日足）判定用のバー。drop=Trueで買いシグナルが出る形にする。
+
+    本数をSWING_MA_WINDOWから導出しているのは、移動平均期間を変更したときに
+    「本数不足で日足分岐が丸ごとスキップされ、テストは通るがシグナル判定を
+    一度も通っていない」状態に陥るのを防ぐため。
+    """
+    if drop:
+        return _make_df([100.0] * (SWING_MA_WINDOW - 1) + [80.0])
+    return _make_df([100.0] * SWING_MA_WINDOW)
 
 
 def _bracket_result(quantity: int, symbol: str = "AAPL") -> DryRunBracketResult:
@@ -47,7 +62,7 @@ def test_process_symbol_opens_position_on_swing_daily_buy_signal(trade_journal) 
     ib = MagicMock()
     position_manager = PositionManager()
 
-    daily_df = _make_df([100.0] * 19 + [80.0])  # 大きく下落 -> 日足で買いシグナル
+    daily_df = _make_daily_df(drop=True)  # 大きく下落 -> 日足で買いシグナル
     intraday_df = _make_df([100.0] * 20)  # 横ばい -> 短期足はシグナルなし
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
@@ -87,7 +102,7 @@ def test_process_symbol_opens_position_on_intraday_buy_signal_when_daily_flat(tr
     ib = MagicMock()
     position_manager = PositionManager()
 
-    daily_df = _make_df([100.0] * 20)  # 日足は横ばい -> シグナルなし
+    daily_df = _make_daily_df()  # 日足は横ばい -> シグナルなし
     intraday_df = _make_df([100.0] * 19 + [90.0])  # 短期足は下落 -> 買いシグナル
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
@@ -112,7 +127,7 @@ def test_process_symbol_skips_entry_when_risk_based_quantity_is_zero(trade_journ
     ib = MagicMock()
     position_manager = PositionManager()
 
-    daily_df = _make_df([100.0] * 19 + [80.0])  # 大きく下落 -> 買いシグナル
+    daily_df = _make_daily_df(drop=True)  # 大きく下落 -> 買いシグナル
     intraday_df = _make_df([100.0] * 20)
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
@@ -133,7 +148,7 @@ def test_process_symbol_does_not_open_position_when_no_buy_signal_on_either_time
     ib = MagicMock()
     position_manager = PositionManager()
 
-    daily_df = _make_df([100.0] * 20)  # 横ばい -> シグナルなし
+    daily_df = _make_daily_df()  # 横ばい -> シグナルなし
     intraday_df = _make_df([100.0] * 20)  # 横ばい -> シグナルなし
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
@@ -173,7 +188,7 @@ def test_process_symbol_skips_entry_when_max_concurrent_positions_reached(trade_
     for i in range(5):
         position_manager.open_position(f"SYM{i}", entry_price=10.0, quantity=1)
 
-    daily_df = _make_df([100.0] * 19 + [80.0])  # 大きく下落 -> 買いシグナル
+    daily_df = _make_daily_df(drop=True)  # 大きく下落 -> 買いシグナル
     intraday_df = _make_df([100.0] * 20)
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)) as mock_qualify, \
@@ -202,7 +217,7 @@ def test_process_symbol_skips_entry_when_daily_loss_circuit_breaker_tripped(trad
         reason="STOP_LOSS", pnl=-4_000.0, pnl_pct=-4.0, r_multiple=-1.0,
     )
 
-    daily_df = _make_df([100.0] * 19 + [80.0])  # 大きく下落 -> 買いシグナル
+    daily_df = _make_daily_df(drop=True)  # 大きく下落 -> 買いシグナル
     intraday_df = _make_df([100.0] * 20)
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
@@ -440,7 +455,7 @@ def test_process_symbol_opens_day_position_with_day_specific_risk_per_share(trad
     ib = MagicMock()
     position_manager = PositionManager()
 
-    daily_df = _make_df([100.0] * 20)  # 日足は横ばい -> シグナルなし
+    daily_df = _make_daily_df()  # 日足は横ばい -> シグナルなし
     intraday_df = _make_df([100.0] * 19 + [90.0])  # 短期足は下落 -> 買いシグナル(day)
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
@@ -684,7 +699,7 @@ def test_daily_bars_are_fetched_once_per_symbol_across_cycles(trade_journal) -> 
     position_manager = PositionManager()
     caches = MarketDataCaches()
 
-    daily_df = _make_df([100.0] * 20)      # 横ばい -> シグナルなし
+    daily_df = _make_daily_df()      # 横ばい -> シグナルなし
     intraday_df = _make_df([100.0] * 20)
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
@@ -716,7 +731,7 @@ def test_contracts_are_qualified_once_per_symbol_across_cycles(trade_journal) ->
     with patch(
         "data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))
     ) as mock_qualify, \
-        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=_make_daily_df())), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))):
 
         async def run():
@@ -873,7 +888,7 @@ def test_entry_is_skipped_for_a_symbol_already_closed_today(trade_journal) -> No
     position_manager.open_position("AAPL", entry_price=100.0, quantity=3)
     position_manager.close_position("AAPL")
 
-    daily_df = _make_df([100.0] * 19 + [80.0])  # 大きく下落 -> 買いシグナルは出ている
+    daily_df = _make_daily_df(drop=True)  # 大きく下落 -> 買いシグナルは出ている
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)) as mock_qualify, \
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
@@ -897,7 +912,7 @@ def test_cooldown_does_not_block_other_symbols(trade_journal) -> None:
     position_manager.open_position("AAPL", entry_price=100.0, quantity=3)
     position_manager.close_position("AAPL")
 
-    daily_df = _make_df([100.0] * 19 + [80.0])
+    daily_df = _make_daily_df(drop=True)
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
@@ -913,3 +928,56 @@ def test_cooldown_does_not_block_other_symbols(trade_journal) -> None:
 
     mock_order.assert_awaited_once()
     assert position_manager.has_position("MSFT") is True
+
+
+# --- 市場フィルター（既定は無効） -----------------------------------------------
+
+
+def test_market_filter_blocks_entry_when_drop_is_market_wide(trade_journal) -> None:
+    """指数も同じだけ下げているときは、相対乖離のフィルターで見送ること。"""
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+
+    # 指数(SPY)の日足も同じモックから返るため、個別と指数が同じだけ下げた形になる。
+    daily_df = _make_daily_df(drop=True)
+
+    with patch("main.SWING_MARKET_FILTER", MarketFilterConfig(relative_threshold_pct=3.0)), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.place_dry_run_bracket_order_async", new=AsyncMock()) as mock_order:
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    mock_order.assert_not_awaited()
+    assert position_manager.has_position("AAPL") is False
+
+
+def test_market_index_is_not_fetched_while_filter_is_disabled(trade_journal) -> None:
+    """既定（フィルター無効）では指数のリクエストを一切出さないこと。
+
+    ペーシング制限(CLAUDE.md 6.1)に効くため、使っていない機能で
+    リクエストが増えていないことを固定する。
+    """
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)) as mock_qualify, \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=_make_daily_df(drop=True))), \
+        patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch(
+            "main.place_dry_run_bracket_order_async",
+            new=AsyncMock(return_value=_bracket_result(quantity=250)),
+        ):
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    qualified_symbols = [call.args[1] for call in mock_qualify.await_args_list]
+    assert MARKET_INDEX_SYMBOL not in qualified_symbols
+    assert position_manager.has_position("AAPL") is True

@@ -36,17 +36,28 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ParameterGrid:
-    ma_window: Sequence[int] = (10, 20, 30)
+    # 移動平均期間の探索範囲。42銘柄・10年の検証で有効域が30近辺
+    # （10や60では成績が明確に落ちる）と分かったため、そこへ寄せている。
+    ma_window: Sequence[int] = (20, 30, 40)
     threshold_pct: Sequence[float] = (3.0, 5.0, 7.0)
     take_profit_pct: Sequence[float] = (8.0, 10.0, 15.0)
     stop_loss_pct: Sequence[float] = (3.0, 5.0, 7.0)
     trailing_stop_pct: Sequence[float] = (5.0,)
     risk_per_trade_pct: Sequence[float] = (1.0,)
+    # 市場フィルター（strategy/pullback.py参照）。既定は「無効」のみを含む。
+    # Noneと閾値を並べて渡せば「フィルターを掛けない設定」も候補に残るため、
+    # 効かないフィルターは学習期間で自然に脱落する。事前にどちらが正しいかを
+    # 決め打ちせず、ウォークフォワードに選ばせるための持たせ方。
+    market_min_deviation_pct: Sequence[Optional[float]] = (None,)
+    market_max_deviation_pct: Sequence[Optional[float]] = (None,)
+    relative_threshold_pct: Sequence[Optional[float]] = (None,)
 
     def combinations(self) -> List[BacktestConfig]:
         fields = [
             "ma_window", "threshold_pct", "take_profit_pct",
             "stop_loss_pct", "trailing_stop_pct", "risk_per_trade_pct",
+            "market_min_deviation_pct", "market_max_deviation_pct",
+            "relative_threshold_pct",
         ]
         value_lists = [getattr(self, name) for name in fields]
         return [BacktestConfig(**dict(zip(fields, combo))) for combo in product(*value_lists)]

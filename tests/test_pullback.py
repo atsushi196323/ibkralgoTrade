@@ -3,7 +3,12 @@
 import pandas as pd
 import pytest
 
-from strategy.pullback import SignalResult, detect_pullback_signal
+from strategy.pullback import (
+    MarketFilterConfig,
+    SignalResult,
+    compute_deviation_pct,
+    detect_pullback_signal,
+)
 
 
 def _make_df(closes: list) -> pd.DataFrame:
@@ -102,3 +107,87 @@ def test_custom_threshold_pct() -> None:
 
     assert loose.should_buy is True
     assert strict.should_buy is False
+
+
+# --- 市場フィルター（指数の乖離率による追加条件） -------------------------------
+
+
+def _drop_df() -> pd.DataFrame:
+    """絶対乖離だけなら買いシグナルが出る形（-19.5%）。"""
+    return _make_df([100.0] * 19 + [80.0])
+
+
+def test_market_filter_disabled_by_default_keeps_signal() -> None:
+    result = detect_pullback_signal(
+        "TEST", _drop_df(), ma_window=20, threshold_pct=5.0,
+        market_deviation_pct=-10.0, market_filter=MarketFilterConfig(),
+    )
+
+    assert result.should_buy is True
+    # フィルターを課さなくても、指数の乖離率と相対乖離は観測値として残す。
+    assert result.market_deviation_pct == pytest.approx(-10.0)
+    assert result.relative_deviation_pct == pytest.approx(result.deviation_pct + 10.0)
+
+
+def test_regime_filter_blocks_entry_when_market_falls_too_far() -> None:
+    config = MarketFilterConfig(min_deviation_pct=-3.0)
+
+    assert detect_pullback_signal(
+        "TEST", _drop_df(), market_deviation_pct=-5.0, market_filter=config,
+    ).should_buy is False
+    assert detect_pullback_signal(
+        "TEST", _drop_df(), market_deviation_pct=-1.0, market_filter=config,
+    ).should_buy is True
+
+
+def test_panic_filter_requires_market_to_be_down() -> None:
+    config = MarketFilterConfig(max_deviation_pct=-1.0)
+
+    assert detect_pullback_signal(
+        "TEST", _drop_df(), market_deviation_pct=0.5, market_filter=config,
+    ).should_buy is False
+    assert detect_pullback_signal(
+        "TEST", _drop_df(), market_deviation_pct=-2.0, market_filter=config,
+    ).should_buy is True
+
+
+def test_relative_threshold_requires_idiosyncratic_drop() -> None:
+    config = MarketFilterConfig(relative_threshold_pct=3.0)
+
+    # 個別-19.5% に対し指数-18%: 差は-1.5%しかなく、市場全体の下げで説明できる。
+    assert detect_pullback_signal(
+        "TEST", _drop_df(), market_deviation_pct=-18.0, market_filter=config,
+    ).should_buy is False
+    # 指数-1%: 差は-18.5%で、その銘柄固有の下げ。
+    assert detect_pullback_signal(
+        "TEST", _drop_df(), market_deviation_pct=-1.0, market_filter=config,
+    ).should_buy is True
+
+
+def test_missing_market_deviation_blocks_entry_when_filter_enabled() -> None:
+    """指数の乖離率が無いときは見送る（分からないものを有利側に倒さない）。"""
+    result = detect_pullback_signal(
+        "TEST", _drop_df(),
+        market_deviation_pct=None, market_filter=MarketFilterConfig(min_deviation_pct=-3.0),
+    )
+
+    assert result.should_buy is False
+    assert result.relative_deviation_pct is None
+
+
+def test_market_filter_does_not_create_signal_without_absolute_pullback() -> None:
+    """フィルターは条件を絞るだけで、乖離が浅い銘柄を買いに変えてはならない。"""
+    result = detect_pullback_signal(
+        "TEST", _make_df([100.0] * 20), market_deviation_pct=-20.0,
+        market_filter=MarketFilterConfig(max_deviation_pct=-1.0),
+    )
+
+    assert result.should_buy is False
+
+
+def test_compute_deviation_pct_matches_signal_deviation() -> None:
+    df = _drop_df()
+
+    assert compute_deviation_pct(df["close"], 20) == pytest.approx(
+        detect_pullback_signal("TEST", df, ma_window=20).deviation_pct
+    )

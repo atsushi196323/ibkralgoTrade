@@ -38,7 +38,12 @@ from strategy.exit_signal import (
     resolve_stop_price,
     resolve_take_profit_price,
 )
-from strategy.pullback import SignalResult, detect_pullback_signal
+from strategy.pullback import (
+    MarketFilterConfig,
+    SignalResult,
+    compute_deviation_pct,
+    detect_pullback_signal,
+)
 from strategy.screener import ScreenerConfig, screen_value_stocks_async
 
 logging.basicConfig(
@@ -83,9 +88,30 @@ SCREENER_TREND_LOOKBACK_DURATION: str = "300 D"
 POLL_INTERVAL_SECONDS: float = 180.0
 CLOSED_MARKET_POLL_INTERVAL_SECONDS: float = 300.0
 
-# スイングトレード判定用（日足）のプルバックパラメータ
-SWING_MA_WINDOW: int = 20
+# スイングトレード判定用（日足）のプルバックパラメータ。
+# 移動平均30本は、42銘柄・10年の日足で移動平均期間だけを固定した
+# ウォークフォワード検証（out-of-sample・コスト込み）で選んだ値。
+# MA10/20/25/30/40/50/60 の比較では30が逆U字のピークで、profit_factorの
+# 中央値1.42・プラスで終えた銘柄36/42(85.7%)といずれも最良だった
+# （20は1.18・69.0%）。60まで伸ばすと中央値0.89まで崩れるため、
+# 「長いほど良い」という単調な傾向を拾ったものではない。
+SWING_MA_WINDOW: int = 30
 SWING_THRESHOLD_PCT: float = 5.0
+
+# 市場全体（指数）の状況によるエントリーの追加条件。日足＝スイング判定にのみ掛かる。
+#
+# **既定は無効（すべてNone）。** 有効化してよいのは、
+#     python -m backtest.run --csv-dir bars --market-csv bars/SPY.csv \
+#         --relative-threshold 2 3 4 --keep-unfiltered
+# のような銘柄横断のウォークフォワードで、フィルター有りが選ばれ、かつ
+# 合算PFだけでなくPFの中央値・プラスで終えた銘柄の割合まで改善したときだけ。
+#
+# デイトレード（5分足）分岐には掛けていない。5分足は外部データで数十日分しか
+# 遡れず（CLAUDE.md「バックテストのデータ源」）、検証を経ていない条件を
+# ライブにだけ入れることになるため。
+MARKET_INDEX_SYMBOL: str = "SPY"
+MARKET_INDEX_MA_WINDOW: int = 30
+SWING_MARKET_FILTER: MarketFilterConfig = MarketFilterConfig()
 
 # デイトレード判定用（短期足）のプルバックパラメータ
 INTRADAY_BAR_SIZE: str = "5 mins"
@@ -153,6 +179,36 @@ MAX_CONCURRENT_POSITIONS: int = 5
 MAX_DAILY_LOSS_PCT: float = 3.0
 
 
+async def _get_market_deviation_pct_async(
+    ib: IB, caches: MarketDataCaches,
+) -> Optional[float]:
+    """指数の乖離率を返す。フィルターが無効なら取得もしない（=リクエスト0件）。
+
+    指数の日足も `DailyBarCache` を通すため、追加のリクエストは
+    「1取引日あたり1件」で済み、ペーシング制限(CLAUDE.md 6.1)には実質響かない。
+    """
+    if not SWING_MARKET_FILTER.is_enabled:
+        return None
+
+    try:
+        contract = await caches.contracts.get_async(ib, MARKET_INDEX_SYMBOL)
+        bars = await caches.daily_bars.get_async(ib, contract)
+    except Exception:
+        # 指数が取れないことで監視ループ全体を落とさない。Noneを返すと
+        # フィルターは「条件を満たさない」＝エントリー見送りに倒れる。
+        logger.exception("%s の日足を取得できませんでした。", MARKET_INDEX_SYMBOL)
+        return None
+
+    if len(bars) < MARKET_INDEX_MA_WINDOW:
+        logger.warning(
+            "%s の日足が%d本しかなく、移動平均(%d本)を計算できません。",
+            MARKET_INDEX_SYMBOL, len(bars), MARKET_INDEX_MA_WINDOW,
+        )
+        return None
+
+    return compute_deviation_pct(bars["close"], MARKET_INDEX_MA_WINDOW)
+
+
 async def _detect_buy_signal_async(
     ib: IB, contract: Stock, symbol: str, caches: MarketDataCaches,
 ) -> Optional[Tuple[SignalResult, str]]:
@@ -168,8 +224,10 @@ async def _detect_buy_signal_async(
         return None
 
     if len(daily_df) >= SWING_MA_WINDOW:
+        market_deviation_pct = await _get_market_deviation_pct_async(ib, caches)
         swing_signal = detect_pullback_signal(
             symbol, daily_df, ma_window=SWING_MA_WINDOW, threshold_pct=SWING_THRESHOLD_PCT,
+            market_deviation_pct=market_deviation_pct, market_filter=SWING_MARKET_FILTER,
         )
         if swing_signal.should_buy:
             logger.info("[%s] スイング(日足)のプルバックシグナルで買い判定しました。", symbol)

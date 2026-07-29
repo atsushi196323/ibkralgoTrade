@@ -20,13 +20,14 @@ import glob
 import logging
 import os
 from dataclasses import replace
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 
 from backtest.costs import ZERO_COST, CostModel
 from backtest.csv_source import load_bars_from_csv
 from backtest.engine import BacktestConfig, run_backtest
+from backtest.market_reference import DEFAULT_MARKET_MA_WINDOW, attach_market_deviation
 from backtest.metrics import PerformanceMetrics, compute_metrics
 from backtest.multi_symbol import format_report, run_multi_symbol_walk_forward
 from backtest.walk_forward import (
@@ -99,6 +100,37 @@ def _parse_args() -> argparse.Namespace:
         help="1バーごとのシグナル判定ログも出す（デバッグ用。大量の出力になる）。",
     )
 
+    market = parser.add_argument_group(
+        "市場フィルター（指数の乖離率による追加条件。--market-csv が必須）"
+    )
+    market.add_argument(
+        "--market-csv",
+        help="指数（SPY等）の日足CSV。銘柄のバーへ日付で突き合わせて乖離率を付与する。",
+    )
+    market.add_argument(
+        "--market-ma-window", type=int, default=DEFAULT_MARKET_MA_WINDOW,
+        help="指数の乖離率を測る移動平均の本数。パラメータグリッドの軸にはしない"
+             "（レジームの物差しまで学習期間に合わせると過剰最適化の余地が広がるため）。",
+    )
+    market.add_argument(
+        "--market-min-deviation", type=float, nargs="*", default=None,
+        help="指数の乖離率がこの値以上のときだけ買う（下降レジームを避ける向き）。"
+             "複数指定するとグリッドの候補になる。",
+    )
+    market.add_argument(
+        "--market-max-deviation", type=float, nargs="*", default=None,
+        help="指数の乖離率がこの値以下のときだけ買う（市場のパニックを待つ向き）。",
+    )
+    market.add_argument(
+        "--relative-threshold", type=float, nargs="*", default=None,
+        help="個別銘柄の乖離率が指数をこの幅以上下回るときだけ買う（相対乖離）。",
+    )
+    market.add_argument(
+        "--keep-unfiltered", action="store_true",
+        help="上の閾値に加えて『フィルター無し』も候補に残す"
+             "（ウォークフォワードにフィルターの要否そのものを選ばせる）。",
+    )
+
     costs = parser.add_argument_group("取引コスト（既定値はIBKR Tiered・米国株相当）")
     costs.add_argument("--commission-per-share", type=float, default=CostModel.commission_per_share)
     costs.add_argument("--min-commission", type=float, default=CostModel.min_commission_per_order)
@@ -124,7 +156,50 @@ def _parse_args() -> argparse.Namespace:
     if args.csv_dir and args.mode != "walk-forward":
         parser.error("--csv-dir は --mode walk-forward でのみ使えます。")
 
+    uses_market_filter = any(
+        value for value in (
+            args.market_min_deviation, args.market_max_deviation, args.relative_threshold,
+        )
+    )
+    if uses_market_filter and not args.market_csv:
+        parser.error("市場フィルターの閾値を指定する場合は --market-csv も必要です。")
+    if args.keep_unfiltered and not uses_market_filter:
+        parser.error("--keep-unfiltered は市場フィルターの閾値と併せて指定してください。")
+
     return args
+
+
+def _market_axis(values: Optional[List[float]], keep_unfiltered: bool) -> Sequence[Optional[float]]:
+    """CLIで受け取った閾値を、グリッドの1軸（Noneを含みうる並び）に変換する。"""
+    if not values:
+        return (None,)
+    if keep_unfiltered:
+        # 「フィルター無し」も候補に残し、要否そのものを学習期間に選ばせる。
+        return (None, *values)
+    return tuple(values)
+
+
+def _build_grid(args: argparse.Namespace) -> ParameterGrid:
+    return ParameterGrid(
+        market_min_deviation_pct=_market_axis(args.market_min_deviation, args.keep_unfiltered),
+        market_max_deviation_pct=_market_axis(args.market_max_deviation, args.keep_unfiltered),
+        relative_threshold_pct=_market_axis(args.relative_threshold, args.keep_unfiltered),
+    )
+
+
+def _load_market_df(args: argparse.Namespace) -> Optional[pd.DataFrame]:
+    if not args.market_csv:
+        return None
+    return load_bars_from_csv(args.market_csv)
+
+
+def _with_market_deviation(
+    df: pd.DataFrame, market_df: Optional[pd.DataFrame], args: argparse.Namespace,
+    symbol: Optional[str] = None,
+) -> pd.DataFrame:
+    if market_df is None:
+        return df
+    return attach_market_deviation(df, market_df, args.market_ma_window, symbol=symbol)
 
 
 def _build_cost_model(args: argparse.Namespace) -> CostModel:
@@ -199,10 +274,21 @@ def _load_csv_directory(directory: str, price_column: Optional[str]) -> Dict[str
 
 def _run_multi_symbol(args: argparse.Namespace, cost_model: CostModel) -> None:
     frames = _load_csv_directory(args.csv_dir, args.price_column)
+    market_df = _load_market_df(args)
+    if market_df is not None:
+        # 指数そのものが --csv-dir に含まれていると、指数を1銘柄として検証して
+        # しまい銘柄横断の集計を汚す。読み込み側では区別できないためここで除く。
+        market_symbol = os.path.splitext(os.path.basename(args.market_csv))[0].upper()
+        if frames.pop(market_symbol, None) is not None:
+            logger.info("%s は指数として使うため検証対象から除外しました。", market_symbol)
+        frames = {
+            symbol: _with_market_deviation(df, market_df, args, symbol)
+            for symbol, df in frames.items()
+        }
     logger.info("%d銘柄を読み込みました: %s", len(frames), list(frames))
 
     report = run_multi_symbol_walk_forward(
-        frames, ParameterGrid(),
+        frames, _build_grid(args),
         train_bars=args.train_bars, test_bars=args.test_bars,
         costs=cost_model, step_bars=args.step_bars,
         min_trades_for_selection=args.min_trades,
@@ -233,13 +319,22 @@ async def main() -> None:
         logger.error("%s のヒストリカルデータを取得できませんでした。", symbol)
         return
 
+    df = _with_market_deviation(df, _load_market_df(args), args, symbol)
+
     if args.mode == "backtest":
-        config = replace(BacktestConfig(), costs=cost_model)
+        # 単発のバックテストはグリッド探索をしないので、各軸の先頭の値を使う。
+        grid = _build_grid(args)
+        config = replace(
+            BacktestConfig(), costs=cost_model,
+            market_min_deviation_pct=grid.market_min_deviation_pct[-1],
+            market_max_deviation_pct=grid.market_max_deviation_pct[-1],
+            relative_threshold_pct=grid.relative_threshold_pct[-1],
+        )
         result = run_backtest(symbol, df, config)
         _log_metrics(compute_metrics(result), sum(t.commission for t in result.trades))
         return
 
-    grid = ParameterGrid()
+    grid = _build_grid(args)
     wf_result = run_walk_forward(
         symbol, df, grid, train_bars=args.train_bars, test_bars=args.test_bars,
         costs=cost_model, step_bars=args.step_bars,
