@@ -96,6 +96,13 @@ class PositionManager:
         # 銘柄 -> 最後に決済した取引日(米国東部時間, ISO形式の日付文字列)。
         # 「決済した当日は同じ銘柄へ再エントリーしない」判定に使う。
         self._last_exit_days: Dict[str, str] = {}
+        # 当日の新規建て発注回数と、それを数えている取引日。
+        # 想定外のシグナル連発（データ異常やロジックのバグ）で1日に何十回も
+        # 建てにいくのを止めるための上限判定に使う。同時保有数の上限
+        # (main.MAX_CONCURRENT_POSITIONS)は「同時に何銘柄持つか」の制限であって、
+        # 建てては決済を繰り返す回数は抑えないため、別に数える必要がある。
+        self._entry_order_day: Optional[str] = None
+        self._entry_orders_today: int = 0
         self.state_path = state_path
         if state_path:
             self._load()
@@ -110,8 +117,10 @@ class PositionManager:
             with open(self.state_path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             positions = [Position(**item) for item in payload["positions"]]
-            # クールダウンは後から追加した項目なので、無い状態ファイルも読める。
+            # クールダウンと発注回数は後から追加した項目なので、無い状態ファイルも読める。
             last_exit_days = dict(payload.get("last_exit_days") or {})
+            entry_order_day = payload.get("entry_order_day")
+            entry_orders_today = int(payload.get("entry_orders_today") or 0)
         except (OSError, ValueError, KeyError, TypeError):
             # 状態ファイルが壊れていてもボットの起動自体は止めない。
             # 破棄せずリネームして残し、後から中身を確認できるようにする。
@@ -130,6 +139,12 @@ class PositionManager:
         self._last_exit_days = {
             symbol: day for symbol, day in last_exit_days.items() if day == today
         }
+        # 発注回数も同様に当日分のみ引き継ぐ。引き継がないと、再起動するたびに
+        # カウンタが0に戻り、上限がいくらでも回避できてしまう。
+        if entry_order_day == today:
+            self._entry_order_day = entry_order_day
+            self._entry_orders_today = entry_orders_today
+            logger.info("本日の新規建て発注回数を復元しました: %d回", entry_orders_today)
         if self._positions:
             logger.info(
                 "ポジション状態を復元しました: %d件 %s",
@@ -159,6 +174,8 @@ class PositionManager:
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "positions": [asdict(position) for position in self._positions.values()],
             "last_exit_days": dict(self._last_exit_days),
+            "entry_order_day": self._entry_order_day,
+            "entry_orders_today": self._entry_orders_today,
         }
 
         # 書き込み中にプロセスが落ちても状態ファイルを壊さないよう、
@@ -206,11 +223,23 @@ class PositionManager:
             return False
         return last_exit_day == _current_trading_day(now).isoformat()
 
+    def count_entry_orders_today(self, now: Optional[datetime] = None) -> int:
+        """当日（米国東部時間）にこのBotが出した新規建ての回数を返す。
+
+        ブローカー同期(sync_with_broker_async)で取り込んだ既存ポジションは
+        このBotが発注したものではないため数えない。
+        """
+        today = _current_trading_day(now).isoformat()
+        if self._entry_order_day != today:
+            return 0
+        return self._entry_orders_today
+
     def open_position(
         self, symbol: str, entry_price: float, quantity: int, risk_per_share: float = 0.0,
         strategy_type: str = STRATEGY_TYPE_UNKNOWN,
         stop_price: float = 0.0, take_profit_price: float = 0.0,
         oca_group: Optional[str] = None,
+        now: Optional[datetime] = None,
     ) -> Position:
         if entry_price <= 0:
             raise ValueError("entry_price は正の値である必要があります。")
@@ -236,10 +265,19 @@ class PositionManager:
             oca_group=oca_group,
         )
         self._positions[symbol] = position
+
+        # 日をまたいだらカウンタを0から数え直す。
+        today = _current_trading_day(now).isoformat()
+        if self._entry_order_day != today:
+            self._entry_order_day = today
+            self._entry_orders_today = 0
+        self._entry_orders_today += 1
+
         logger.info(
             "[%s] ポジションを新規建てしました: entry=%.2f qty=%s strategy=%s "
-            "待機注文 STP=%.2f LMT=%.2f",
+            "待機注文 STP=%.2f LMT=%.2f (本日%d回目の新規建て)",
             symbol, entry_price, quantity, strategy_type, stop_price, take_profit_price,
+            self._entry_orders_today,
         )
         self._save()
         return position

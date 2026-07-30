@@ -572,6 +572,107 @@ def test_state_file_without_cooldown_key_still_loads(tmp_path) -> None:
     assert manager.is_in_cooldown("AAPL") is False
 
 
+# --- 1日の新規建て回数 ---------------------------------------------------------------
+
+
+def test_entry_order_count_starts_at_zero() -> None:
+    manager = PositionManager()
+
+    assert manager.count_entry_orders_today() == 0
+
+
+def test_open_position_increments_the_daily_entry_order_count() -> None:
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    manager.open_position("MSFT", entry_price=100.0, quantity=1)
+
+    assert manager.count_entry_orders_today() == 2
+
+
+def test_entry_order_count_is_not_reset_by_closing_positions() -> None:
+    """建てては決済を繰り返しても回数は積み上がること。
+
+    同時保有数の上限とは別に回数を数える意味がここにある。
+    """
+    manager = PositionManager()
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    manager.close_position("AAPL")
+    manager.open_position("MSFT", entry_price=100.0, quantity=1)
+    manager.close_position("MSFT")
+
+    assert manager.count_entry_orders_today() == 2
+
+
+def test_entry_order_count_resets_on_the_next_trading_day() -> None:
+    manager = PositionManager()
+    manager.open_position(
+        "AAPL", entry_price=100.0, quantity=1,
+        now=datetime(2026, 3, 10, 15, 0, tzinfo=US_EASTERN),
+    )
+
+    next_day = datetime(2026, 3, 11, 9, 35, tzinfo=US_EASTERN)
+
+    assert manager.count_entry_orders_today(now=datetime(2026, 3, 10, 15, 30, tzinfo=US_EASTERN)) == 1
+    assert manager.count_entry_orders_today(now=next_day) == 0
+
+
+def test_entry_order_count_uses_us_eastern_trading_day() -> None:
+    """クールダウンと同じ区切り（米国東部時間）で数えること。"""
+    manager = PositionManager()
+    # 東部時間 3/10 14:00 = 日本時間 3/11 03:00
+    manager.open_position(
+        "AAPL", entry_price=100.0, quantity=1,
+        now=datetime(2026, 3, 10, 14, 0, tzinfo=US_EASTERN),
+    )
+
+    japan_next_day = datetime(2026, 3, 11, 4, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+
+    assert manager.count_entry_orders_today(now=japan_next_day) == 1
+
+
+def test_entry_order_count_survives_restart(tmp_path) -> None:
+    """再起動でカウンタが0に戻ると、上限がいくらでも回避できてしまう。"""
+    state_path = str(tmp_path / "positions.json")
+    manager = PositionManager(state_path=state_path)
+    manager.open_position("AAPL", entry_price=100.0, quantity=1)
+    manager.open_position("MSFT", entry_price=100.0, quantity=1)
+
+    restored = PositionManager(state_path=state_path)
+
+    assert restored.count_entry_orders_today() == 2
+
+
+def test_stale_entry_order_count_is_dropped_on_load(tmp_path) -> None:
+    """過去日のカウンタは復元しない（翌日は0から数え直す）。"""
+    state_path = tmp_path / "positions.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "saved_at": "2020-01-01T00:00:00+00:00",
+                "positions": [],
+                "entry_order_day": "2020-01-01",
+                "entry_orders_today": 9,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manager = PositionManager(state_path=str(state_path))
+
+    assert manager.count_entry_orders_today() == 0
+
+
+def test_broker_synced_positions_do_not_count_as_entry_orders(tmp_path) -> None:
+    """ブローカー同期で取り込んだ建玉は、このBotの発注ではないため数えない。"""
+    manager = PositionManager()
+    ib = _make_mock_ib([_make_broker_position("AAPL", position=5, avg_cost=100.0)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    assert manager.has_position("AAPL") is True
+    assert manager.count_entry_orders_today() == 0
+
+
 # --- ブローカー側に置いた待機注文 ------------------------------------------------------
 
 

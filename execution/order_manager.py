@@ -12,6 +12,7 @@ TWSとの接続が切れていても、市場が動けば約定する。ポー�
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -24,9 +25,81 @@ logger = logging.getLogger(__name__)
 # place_dry_run_order_asyncのdocstringを参照。
 MAX_POSITION_SIZE: int = 10
 
+# 1注文あたりの名目金額の上限(USD)。MAX_POSITION_SIZEは「株数」の上限なので、
+# 株価によって実際に晒す金額が2桁変わる（10株でも株価5ドルなら50ドル、
+# 株価800ドルなら8000ドル）。ドライラン検証中の安全弁としては、株数と金額の
+# 両方に蓋をしておかないと意味が薄い。MAX_POSITION_SIZE と同様、
+# 適用するのは新規建て(BUY)のみ。
+MAX_ORDER_NOTIONAL_USD: float = 5_000.0
+
+# 待機注文(損切りの逆指値・利確の指値)が参照価格から離れることを許す上限(%)。
+# 正常系ではこの値には届かない（値段は main 側で参照価格の -5%/+10% 等として
+# 算出されるため）。これはあくまで層の境界に置く不変条件で、パーセントと
+# 小数の取り違え・決済パラメータの設定ミス・参照価格の桁違いといった
+# 「値段が壊れた注文」がブローカーへ出て行くのを、注文組み立ての時点で止める。
+# なお参照価格そのものが古い（ギャップ後に前日終値を掴む等）ケースは、
+# 参照価格を基準に測っている以上ここでは検出できない。
+MAX_ORDER_PRICE_DEVIATION_PCT: float = 25.0
+
 ACTION_BUY: str = "BUY"
 ACTION_SELL: str = "SELL"
 _VALID_ACTIONS = frozenset({ACTION_BUY, ACTION_SELL})
+
+
+def clamp_buy_quantity(symbol: str, quantity: int, reference_price: Optional[float] = None) -> int:
+    """新規建て(BUY)の数量に、株数と名目金額の両方の上限を適用する。
+
+    `reference_price` を省略した場合は株数の上限のみ適用する。
+    金額上限によって0株になる場合（1株の値段が MAX_ORDER_NOTIONAL_USD を
+    超える銘柄）は0を返す。発注できないことを呼び出し側が判断できるよう、
+    ここでは例外にしない。
+    """
+    if quantity > MAX_POSITION_SIZE:
+        logger.warning(
+            "[%s] 要求数量 %s が最大ロット数制限 (%s) を超えたため、制限値に丸めます。",
+            symbol, quantity, MAX_POSITION_SIZE,
+        )
+        quantity = MAX_POSITION_SIZE
+
+    if reference_price is None:
+        return quantity
+
+    if reference_price <= 0:
+        raise ValueError(f"reference_price は正の値である必要があります: {reference_price}")
+
+    max_quantity_by_notional = math.floor(MAX_ORDER_NOTIONAL_USD / reference_price)
+    if quantity > max_quantity_by_notional:
+        logger.warning(
+            "[%s] 数量 %s (@%.2f = %.2f USD) が1注文あたりの金額上限 (%.2f USD) を"
+            "超えたため、%s株に丸めます。",
+            symbol, quantity, reference_price, quantity * reference_price,
+            MAX_ORDER_NOTIONAL_USD, max_quantity_by_notional,
+        )
+        quantity = max_quantity_by_notional
+
+    return quantity
+
+
+def validate_resting_order_prices(
+    symbol: str, reference_price: float, stop_price: float, take_profit_price: float,
+) -> None:
+    """待機注文の値段が参照価格から乖離しすぎていないか検証する。
+
+    超えていた場合は ValueError を投げる。呼び出し元（main の銘柄ループ）は
+    銘柄単位の例外を握り潰して次の銘柄へ進むため、壊れた値段の注文が出るより
+    その銘柄のエントリーを見送る方が安全である。
+    """
+    if reference_price <= 0:
+        raise ValueError(f"reference_price は正の値である必要があります: {reference_price}")
+
+    for label, price in (("stop_price", stop_price), ("take_profit_price", take_profit_price)):
+        deviation_pct = abs(price - reference_price) / reference_price * 100.0
+        if deviation_pct > MAX_ORDER_PRICE_DEVIATION_PCT:
+            raise ValueError(
+                f"[{symbol}] {label}({price:.2f}) が参照価格({reference_price:.2f})から"
+                f"{deviation_pct:.1f}%乖離しており、許容範囲"
+                f"({MAX_ORDER_PRICE_DEVIATION_PCT:.1f}%)を超えています。"
+            )
 
 
 @dataclass
@@ -44,27 +117,30 @@ async def place_dry_run_order_async(
     action: str,
     quantity: int,
     order_type: str = "MKT",
+    reference_price: Optional[float] = None,
 ) -> DryRunOrderResult:
     """注文をシミュレートする（placeOrderは呼ばない）。
 
-    MAX_POSITION_SIZEによる数量制限は新規建て(BUY)にのみ適用する。
-    決済(SELL)に適用してはならない: 呼び出し側は決済成立を前提に
+    数量制限（MAX_POSITION_SIZE / MAX_ORDER_NOTIONAL_USD）は新規建て(BUY)にのみ
+    適用する。決済(SELL)に適用してはならない: 呼び出し側は決済成立を前提に
     ローカルのポジションを閉じるため、SELLの数量を丸めるとブローカー側に
     建玉が残ったままローカルの追跡だけが消え、損切りもトレーリングストップも
     効かない未追跡ポジションが生まれる。ブローカー同期(sync_with_broker_async)で
     取り込んだMAX_POSITION_SIZEより大きい既存ポジションで実際に起きる。
+    そのため `reference_price`（金額上限の判定に使う）もSELLでは参照しない。
     """
     if action not in _VALID_ACTIONS:
         raise ValueError(f"action は {sorted(_VALID_ACTIONS)} のいずれかである必要があります: {action}")
     if quantity <= 0:
         raise ValueError("数量は正の整数である必要があります。")
 
-    if action == ACTION_BUY and quantity > MAX_POSITION_SIZE:
-        logger.warning(
-            "要求数量 %s が最大ロット数制限 (%s) を超えたため、制限値に丸めます。",
-            quantity, MAX_POSITION_SIZE,
-        )
-        quantity = MAX_POSITION_SIZE
+    if action == ACTION_BUY:
+        quantity = clamp_buy_quantity(contract.symbol, quantity, reference_price)
+        if quantity <= 0:
+            raise ValueError(
+                f"[{contract.symbol}] 1株の金額が1注文あたりの上限"
+                f"({MAX_ORDER_NOTIONAL_USD:.2f} USD)を超えるため発注できません。"
+            )
 
     order = MarketOrder(action, quantity)
 
@@ -121,8 +197,14 @@ def build_bracket_orders(
     quantity: int,
     stop_price: float,
     take_profit_price: float,
+    reference_price: float,
 ) -> BracketOrders:
     """成行買いの親注文と、損切り・利確の子注文を組み立てる。
+
+    `reference_price` は待機注文の値段の妥当性検証（参照価格からの乖離が
+    MAX_ORDER_PRICE_DEVIATION_PCT 以内か）に使う。省略可能にしていないのは、
+    省略できると呼び出し側が検証を素通りさせられてしまい、注文の値段を
+    最後に検査する層が無くなるため。
 
     `transmit` の扱い: 親と最初の子は False にし、最後の子だけ True にする。
     IBKRは transmit=True を受け取った時点でその注文グループを市場へ送るため、
@@ -143,6 +225,7 @@ def build_bracket_orders(
             f"stop_price({stop_price}) は take_profit_price({take_profit_price}) より"
             "小さい必要があります。"
         )
+    validate_resting_order_prices(symbol, reference_price, stop_price, take_profit_price)
 
     parent = MarketOrder(ACTION_BUY, quantity)
     parent.transmit = False
@@ -171,28 +254,30 @@ async def place_dry_run_bracket_order_async(
     quantity: int,
     stop_price: float,
     take_profit_price: float,
+    reference_price: float,
 ) -> DryRunBracketResult:
     """新規建てのブラケット注文をシミュレートする（placeOrderは呼ばない）。
 
-    数量制限(MAX_POSITION_SIZE)は新規建てなので適用する。丸めた数量は
-    子注文にもそのまま反映する必要がある（親より子が多いと、決済後に
+    数量制限(MAX_POSITION_SIZE / MAX_ORDER_NOTIONAL_USD)は新規建てなので適用する。
+    丸めた数量は子注文にもそのまま反映する必要がある（親より子が多いと、決済後に
     余った売り注文が残る）ため、丸めてから組み立てる。
     """
     if quantity <= 0:
         raise ValueError("数量は正の整数である必要があります。")
 
-    if quantity > MAX_POSITION_SIZE:
-        logger.warning(
-            "要求数量 %s が最大ロット数制限 (%s) を超えたため、制限値に丸めます。",
-            quantity, MAX_POSITION_SIZE,
+    quantity = clamp_buy_quantity(contract.symbol, quantity, reference_price)
+    if quantity <= 0:
+        raise ValueError(
+            f"[{contract.symbol}] 1株の金額が1注文あたりの上限"
+            f"({MAX_ORDER_NOTIONAL_USD:.2f} USD)を超えるため発注できません。"
         )
-        quantity = MAX_POSITION_SIZE
 
     orders = build_bracket_orders(
         symbol=contract.symbol,
         quantity=quantity,
         stop_price=stop_price,
         take_profit_price=take_profit_price,
+        reference_price=reference_price,
     )
 
     logger.info(

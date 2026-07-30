@@ -13,6 +13,7 @@ from strategy.pullback import MarketFilterConfig
 from main import (
     DAY_STOP_LOSS_PCT,
     MARKET_INDEX_SYMBOL,
+    MAX_DAILY_ENTRY_ORDERS,
     MAX_WATCHLIST_SIZE,
     POLL_INTERVAL_SECONDS,
     SWING_MA_WINDOW,
@@ -83,6 +84,8 @@ def test_process_symbol_opens_position_on_swing_daily_buy_signal(trade_journal) 
         ib, contract, quantity=250,
         stop_price=pytest.approx(80.0 * 0.95),
         take_profit_price=pytest.approx(80.0 * 1.10),
+        # 待機注文の値段の妥当性検証に使う参照価格（現在値）。
+        reference_price=pytest.approx(80.0),
     )
     assert position_manager.has_position("AAPL") is True
     position = position_manager.get_position("AAPL")
@@ -928,6 +931,103 @@ def test_cooldown_does_not_block_other_symbols(trade_journal) -> None:
 
     mock_order.assert_awaited_once()
     assert position_manager.has_position("MSFT") is True
+
+
+# --- 1日の新規建て回数の上限 -----------------------------------------------------
+
+
+def test_entry_is_blocked_after_the_daily_order_limit(trade_journal) -> None:
+    """上限に達したら、買いシグナルが出ていても新規エントリーしないこと。
+
+    同時保有数の上限やクールダウンが壊れたときに、損失の垂れ流しを
+    有限回で止めるための独立した歯止め。
+    """
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    # 上限に達した状態を作る（建てては決済を繰り返した後を想定）。
+    for i in range(MAX_DAILY_ENTRY_ORDERS):
+        symbol = f"SYM{i}"
+        position_manager.open_position(symbol, entry_price=100.0, quantity=1)
+        position_manager.close_position(symbol)
+
+    daily_df = _make_daily_df(drop=True)  # 買いシグナルは出ている
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)) as mock_qualify, \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.place_dry_run_bracket_order_async", new=AsyncMock()) as mock_order:
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    # 回数判定はIBKRへの問い合わせより前に短絡すること（無駄なリクエストを出さない）。
+    mock_qualify.assert_not_awaited()
+    mock_order.assert_not_awaited()
+    assert position_manager.has_position("AAPL") is False
+
+
+def test_entry_is_allowed_just_below_the_daily_order_limit(trade_journal) -> None:
+    """上限の1つ手前までは通常どおりエントリーできること。"""
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    for i in range(MAX_DAILY_ENTRY_ORDERS - 1):
+        symbol = f"SYM{i}"
+        position_manager.open_position(symbol, entry_price=100.0, quantity=1)
+        position_manager.close_position(symbol)
+
+    daily_df = _make_daily_df(drop=True)
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch(
+            "main.place_dry_run_bracket_order_async",
+            new=AsyncMock(return_value=_bracket_result(quantity=250)),
+        ) as mock_order:
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    mock_order.assert_awaited_once()
+    assert position_manager.count_entry_orders_today() == MAX_DAILY_ENTRY_ORDERS
+
+
+def test_daily_order_limit_does_not_block_exits(trade_journal) -> None:
+    """発注回数の上限は新規建てのみに掛かり、決済は止めないこと。
+
+    止めると、上限に達した瞬間に保有中のポジションが損切りもトレーリングも
+    効かない状態で放置される。
+    """
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    for i in range(MAX_DAILY_ENTRY_ORDERS):
+        symbol = f"SYM{i}"
+        position_manager.open_position(symbol, entry_price=100.0, quantity=1)
+        position_manager.close_position(symbol)
+    # 上限に達した後も保有中のポジションが残っている状況
+    position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=3, strategy_type=STRATEGY_TYPE_SWING,
+    )
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()), \
+        patch(
+            "main.place_dry_run_order_async",
+            new=AsyncMock(return_value=DryRunOrderResult("AAPL", "SELL", 3, "MKT")),
+        ) as mock_order:
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    # -20%で損切り水準に達しているため決済されること。
+    mock_order.assert_awaited_once()
+    assert position_manager.has_position("AAPL") is False
 
 
 # --- 市場フィルター（既定は無効） -----------------------------------------------

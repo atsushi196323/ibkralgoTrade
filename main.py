@@ -177,6 +177,14 @@ MAX_CONCURRENT_POSITIONS: int = 5
 # 口座資金に対する1日の最大許容損失（%）。これを超えたら新規エントリーを停止する
 # サーキットブレーカー。既存ポジションの決済判定（損切り等）は引き続き有効。
 MAX_DAILY_LOSS_PCT: float = 3.0
+# 1日に出してよい新規建ての回数。MAX_CONCURRENT_POSITIONSは「同時に何銘柄持つか」
+# の制限であって、建てては決済を繰り返す回数は抑えない。同日中の再エントリー禁止
+# (PositionManager.is_in_cooldown)により通常はウォッチリストの銘柄数(10)が事実上の
+# 上限になるが、それはクールダウンが正しく効いている前提の話である。この上限は
+# その前提が壊れたとき（状態ファイルの消失、日付判定のバグ等）に、損失の垂れ流しを
+# 有限回で止めるための独立した歯止め。損失額ベースのサーキットブレーカーとは違い、
+# 実現損益が確定する前の発注ラッシュにも効く。
+MAX_DAILY_ENTRY_ORDERS: int = 10
 
 
 async def _get_market_deviation_pct_async(
@@ -258,6 +266,16 @@ async def _process_entry_async(
         )
         return
 
+    # 発注回数の上限。データ取得より前に判定するのは、上限に達した後の
+    # サイクルで無駄なヒストリカルリクエストを撃たないため（ペーシング制限）。
+    entry_orders_today = position_manager.count_entry_orders_today()
+    if entry_orders_today >= MAX_DAILY_ENTRY_ORDERS:
+        logger.warning(
+            "[%s] 本日の新規建て回数(%d)が上限(%d)に達したため、新規エントリーを停止します。",
+            symbol, entry_orders_today, MAX_DAILY_ENTRY_ORDERS,
+        )
+        return
+
     # 決済した当日は同じ銘柄を買い直さない。日足の乖離率はその日の間ほぼ
     # 変わらないため、この判定が無いと損切り直後のサイクルで同じシグナルが
     # 再び成立し、下落トレンド中に損失を刻み続ける。
@@ -319,6 +337,7 @@ async def _process_entry_async(
     order_result = await place_dry_run_bracket_order_async(
         ib, contract, quantity=quantity,
         stop_price=stop_price, take_profit_price=take_profit_price,
+        reference_price=price,
     )
     position_manager.open_position(
         symbol, entry_price=price, quantity=order_result.quantity, risk_per_share=risk_per_share,

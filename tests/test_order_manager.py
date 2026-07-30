@@ -6,6 +6,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from execution.order_manager import (
+    MAX_ORDER_NOTIONAL_USD,
+    MAX_ORDER_PRICE_DEVIATION_PCT,
     MAX_POSITION_SIZE,
     build_bracket_orders,
     cancel_dry_run_bracket_orders_async,
@@ -95,7 +97,8 @@ def test_place_order_is_never_called() -> None:
 
 
 def test_bracket_has_market_parent_and_stop_and_limit_children() -> None:
-    orders = build_bracket_orders("AAPL", quantity=10, stop_price=95.0, take_profit_price=110.0)
+    orders = build_bracket_orders("AAPL", quantity=10, stop_price=95.0, take_profit_price=110.0,
+                                  reference_price=100.0)
 
     assert orders.parent.orderType == "MKT"
     assert orders.parent.action == "BUY"
@@ -113,7 +116,8 @@ def test_only_the_last_child_transmits() -> None:
     その僅かな隙間が「損切りの無い裸のポジション」であり、
     ブローカー側へ損切りを置く目的そのものを損なう。
     """
-    orders = build_bracket_orders("AAPL", quantity=10, stop_price=95.0, take_profit_price=110.0)
+    orders = build_bracket_orders("AAPL", quantity=10, stop_price=95.0, take_profit_price=110.0,
+                                  reference_price=100.0)
 
     assert orders.parent.transmit is False
     assert orders.stop_loss.transmit is False
@@ -123,7 +127,8 @@ def test_only_the_last_child_transmits() -> None:
 
 
 def test_children_share_one_oca_group_so_one_fill_cancels_the_other() -> None:
-    orders = build_bracket_orders("AAPL", quantity=10, stop_price=95.0, take_profit_price=110.0)
+    orders = build_bracket_orders("AAPL", quantity=10, stop_price=95.0, take_profit_price=110.0,
+                                  reference_price=100.0)
 
     assert orders.stop_loss.ocaGroup == orders.oca_group
     assert orders.take_profit.ocaGroup == orders.oca_group
@@ -132,7 +137,8 @@ def test_children_share_one_oca_group_so_one_fill_cancels_the_other() -> None:
 
 def test_all_bracket_orders_share_the_same_quantity() -> None:
     """子の数量が親とずれると、決済後に売り注文が残る/建玉が残る。"""
-    orders = build_bracket_orders("AAPL", quantity=7, stop_price=95.0, take_profit_price=110.0)
+    orders = build_bracket_orders("AAPL", quantity=7, stop_price=95.0, take_profit_price=110.0,
+                                  reference_price=100.0)
 
     assert orders.parent.totalQuantity == 7
     assert orders.stop_loss.totalQuantity == 7
@@ -154,7 +160,10 @@ def test_build_bracket_orders_rejects_invalid_inputs(
     quantity: int, stop: float, take_profit: float
 ) -> None:
     with pytest.raises(ValueError):
-        build_bracket_orders("AAPL", quantity=quantity, stop_price=stop, take_profit_price=take_profit)
+        build_bracket_orders(
+            "AAPL", quantity=quantity, stop_price=stop, take_profit_price=take_profit,
+            reference_price=100.0,
+        )
 
 
 def test_dry_run_bracket_clamps_quantity_including_children() -> None:
@@ -167,7 +176,7 @@ def test_dry_run_bracket_clamps_quantity_including_children() -> None:
     result = asyncio.run(
         place_dry_run_bracket_order_async(
             MagicMock(), contract, quantity=MAX_POSITION_SIZE + 500,
-            stop_price=95.0, take_profit_price=110.0,
+            stop_price=95.0, take_profit_price=110.0, reference_price=100.0,
         )
     )
 
@@ -184,10 +193,129 @@ def test_dry_run_bracket_does_not_call_place_order() -> None:
     asyncio.run(
         place_dry_run_bracket_order_async(
             ib, contract, quantity=5, stop_price=95.0, take_profit_price=110.0,
+            reference_price=100.0,
         )
     )
 
     ib.placeOrder.assert_not_called()
+
+
+# --- 1注文あたりの名目金額の上限 -------------------------------------------------
+
+
+def test_buy_is_clamped_by_notional_when_share_price_is_high() -> None:
+    """株数の上限内でも、金額の上限を超える数量は丸めること。
+
+    MAX_POSITION_SIZEは株数の制限なので、高価格帯の銘柄では
+    実際に晒す金額が桁違いになる。
+    """
+    # 1株800ドル: 上限5,000ドルなら6株まで（10株なら8,000ドルで超過）
+    price = MAX_ORDER_NOTIONAL_USD / 6.25
+    contract = MagicMock(symbol="AAPL")
+
+    result = asyncio.run(
+        place_dry_run_order_async(
+            MagicMock(), contract, action="BUY", quantity=MAX_POSITION_SIZE,
+            reference_price=price,
+        )
+    )
+
+    assert result.quantity == 6
+    assert result.quantity * price <= MAX_ORDER_NOTIONAL_USD
+
+
+def test_sell_is_not_clamped_by_notional() -> None:
+    """決済(SELL)には金額上限も適用してはならない（株数上限と同じ理由）。"""
+    contract = MagicMock(symbol="AAPL")
+
+    result = asyncio.run(
+        place_dry_run_order_async(
+            MagicMock(), contract, action="SELL", quantity=100,
+            reference_price=MAX_ORDER_NOTIONAL_USD,  # 1株で上限に達する値段
+        )
+    )
+
+    assert result.quantity == 100
+
+
+def test_bracket_notional_clamp_applies_to_children_too() -> None:
+    """金額上限で丸めた数量も、親子で一致していること。"""
+    price = MAX_ORDER_NOTIONAL_USD / 6.25
+    contract = MagicMock(symbol="AAPL")
+
+    result = asyncio.run(
+        place_dry_run_bracket_order_async(
+            MagicMock(), contract, quantity=MAX_POSITION_SIZE,
+            stop_price=price * 0.95, take_profit_price=price * 1.10,
+            reference_price=price,
+        )
+    )
+
+    assert result.quantity == 6
+    assert result.orders.parent.totalQuantity == 6
+    assert result.orders.stop_loss.totalQuantity == 6
+    assert result.orders.take_profit.totalQuantity == 6
+
+
+def test_bracket_rejected_when_one_share_exceeds_notional_limit() -> None:
+    """1株すら金額上限を超える銘柄は、丸めて0株にせず発注を拒否すること。
+
+    0株の注文を作ると、呼び出し側は建玉ができた前提でローカルに
+    ポジションを記録してしまう。
+    """
+    contract = MagicMock(symbol="BRK A")
+    price = MAX_ORDER_NOTIONAL_USD * 100
+
+    with pytest.raises(ValueError):
+        asyncio.run(
+            place_dry_run_bracket_order_async(
+                MagicMock(), contract, quantity=1,
+                stop_price=price * 0.95, take_profit_price=price * 1.10,
+                reference_price=price,
+            )
+        )
+
+
+# --- 待機注文の値段の妥当性 -------------------------------------------------------
+
+
+@pytest.mark.parametrize("stop_price,take_profit_price", [
+    # 損切りが現在値から遠すぎる（パーセントと小数を取り違えた等）
+    (10.0, 110.0),
+    # 利確が現在値から遠すぎる
+    (95.0, 1_000.0),
+])
+def test_bracket_rejects_prices_far_from_reference(stop_price, take_profit_price) -> None:
+    """壊れた値段の注文をブローカーへ出す前に止めること。"""
+    with pytest.raises(ValueError, match="乖離"):
+        build_bracket_orders(
+            "AAPL", quantity=10,
+            stop_price=stop_price, take_profit_price=take_profit_price,
+            reference_price=100.0,
+        )
+
+
+def test_bracket_accepts_prices_at_the_deviation_boundary() -> None:
+    """許容範囲ちょうどの値段は通ること（正常系を巻き込んで弾かない）。"""
+    reference_price = 100.0
+    edge = reference_price * MAX_ORDER_PRICE_DEVIATION_PCT / 100.0
+
+    orders = build_bracket_orders(
+        "AAPL", quantity=10,
+        stop_price=reference_price - edge, take_profit_price=reference_price + edge,
+        reference_price=reference_price,
+    )
+
+    assert orders.parent.totalQuantity == 10
+
+
+@pytest.mark.parametrize("reference_price", [0.0, -1.0])
+def test_bracket_rejects_non_positive_reference_price(reference_price) -> None:
+    with pytest.raises(ValueError):
+        build_bracket_orders(
+            "AAPL", quantity=10, stop_price=95.0, take_profit_price=110.0,
+            reference_price=reference_price,
+        )
 
 
 def test_dry_run_cancel_does_not_call_cancel_order() -> None:
