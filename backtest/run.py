@@ -99,6 +99,13 @@ def _parse_args() -> argparse.Namespace:
         "--verbose", action="store_true",
         help="1バーごとのシグナル判定ログも出す（デバッグ用。大量の出力になる）。",
     )
+    parser.add_argument(
+        "--initial-equity", type=float, default=BacktestConfig.initial_equity,
+        help="検証の初期資金(USD)。ポジションサイジングの基準になるため、"
+             "**実際に運用する資金額を指定すること**。既定の100,000ドルのままだと、"
+             "1注文あたりの最低手数料(--min-commission)が約定代金に対して相対的に"
+             "小さくなり、小口座の成績を大幅に楽観視する。",
+    )
 
     market = parser.add_argument_group(
         "市場フィルター（指数の乖離率による追加条件。--market-csv が必須）"
@@ -290,6 +297,7 @@ def _run_multi_symbol(args: argparse.Namespace, cost_model: CostModel) -> None:
     report = run_multi_symbol_walk_forward(
         frames, _build_grid(args),
         train_bars=args.train_bars, test_bars=args.test_bars,
+        initial_equity=args.initial_equity,
         costs=cost_model, step_bars=args.step_bars,
         min_trades_for_selection=args.min_trades,
     )
@@ -325,7 +333,7 @@ async def main() -> None:
         # 単発のバックテストはグリッド探索をしないので、各軸の先頭の値を使う。
         grid = _build_grid(args)
         config = replace(
-            BacktestConfig(), costs=cost_model,
+            BacktestConfig(), costs=cost_model, initial_equity=args.initial_equity,
             market_min_deviation_pct=grid.market_min_deviation_pct[-1],
             market_max_deviation_pct=grid.market_max_deviation_pct[-1],
             relative_threshold_pct=grid.relative_threshold_pct[-1],
@@ -337,6 +345,7 @@ async def main() -> None:
     grid = _build_grid(args)
     wf_result = run_walk_forward(
         symbol, df, grid, train_bars=args.train_bars, test_bars=args.test_bars,
+        initial_equity=args.initial_equity,
         costs=cost_model, step_bars=args.step_bars,
         min_trades_for_selection=args.min_trades,
     )
