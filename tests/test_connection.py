@@ -143,6 +143,43 @@ def test_connect_async_retries_with_exponential_backoff_then_succeeds(
     ]
 
 
+def test_connect_async_caps_the_backoff_delay(mock_ib_class) -> None:
+    """1回あたりの待ち時間は上限で頭打ちにすること。
+
+    上限が無いと待ち時間が青天井に伸び、Gatewayが復帰済みでも
+    次の試行まで延々と待つことになる。
+    """
+    _, mock_instance = mock_ib_class
+    mock_instance.connectAsync = AsyncMock(
+        side_effect=[ConnectionRefusedError("fail")] * 5 + [None]
+    )
+    connection = IBKRConnection(max_retries=10, base_delay_seconds=1.0, max_delay_seconds=8.0)
+
+    with patch("core.connection.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+        asyncio.run(connection.connect_async())
+
+    # 1, 2, 4, 8, 8 — 上限の8秒を超えない。
+    assert [call.args[0] for call in mock_sleep.await_args_list] == [1.0, 2.0, 4.0, 8.0, 8.0]
+
+
+def test_default_retry_window_covers_a_gateway_restart(mock_ib_class) -> None:
+    """既定のリトライ設定で、Gatewayの再起動（数分）を待ち切れること。
+
+    Gatewayは Auto restart で1日1回再起動し、その間ソケットは接続不能になる。
+    リトライを使い切るのが早すぎると、復帰しているのに接続を諦めることになる。
+    """
+    _, mock_instance = mock_ib_class
+    mock_instance.connectAsync = AsyncMock(side_effect=ConnectionRefusedError("always fails"))
+    connection = IBKRConnection()
+
+    with patch("core.connection.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+        with pytest.raises(ConnectionError):
+            asyncio.run(connection.connect_async())
+
+    total_wait = sum(call.args[0] for call in mock_sleep.await_args_list)
+    assert total_wait >= 180.0, f"リトライの総待ち時間が短すぎます: {total_wait}秒"
+
+
 def test_connect_async_raises_after_exhausting_retries(mock_ib_class) -> None:
     _, mock_instance = mock_ib_class
     mock_instance.connectAsync = AsyncMock(side_effect=ConnectionRefusedError("always fails"))
