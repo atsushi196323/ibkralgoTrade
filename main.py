@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 
+import pandas as pd
 from ib_insync import IB, Stock
 
 from core.connection import IBKRConnection
@@ -112,6 +113,31 @@ SWING_THRESHOLD_PCT: float = 5.0
 MARKET_INDEX_SYMBOL: str = "SPY"
 MARKET_INDEX_MA_WINDOW: int = 30
 SWING_MARKET_FILTER: MarketFilterConfig = MarketFilterConfig()
+
+# デイトレード（短期足）でのエントリーを行うか。**既定は無効。**
+#
+# 無効にしている理由は3つあり、それぞれ独立している:
+#
+# 1. **検証実績がゼロ。** 5分足のバックテストは1件も行っていない（外部データでは
+#    60日程度しか遡れないため。CLAUDE.md「バックテストのデータ源」）。MA30の選定も
+#    市場フィルターの不採用も小口座での成績も、すべて日足＝スイングの検証であり、
+#    下のデイトレード用パラメータは誰も検証していない初期値のまま残っている。
+# 2. **資金設計が成立しない。** 建玉金額 = 資金 × (リスク% ÷ 損切り%) なので、
+#    損切り1.5%では1銘柄で資金の67%を使う。MAX_CONCURRENT_POSITIONS=2 でも
+#    2銘柄目が入らない。現状これが表面化しないのはMAX_POSITION_SIZEの株数クランプが
+#    効いているからで、それは検証用の安全弁であって資金設計ではない。
+# 3. **キャッシュ口座の受渡し(T+1)。** デイトレードは定義上「同日中に買って売る」
+#    ロジックで、未受渡しの売却代金で建てて同日に決済するとGood Faith Violationに
+#    なりうる。
+#
+# 再有効化するときは、(1) IBKR接続で5分足を取得しスイングと同じ基準（銘柄横断・
+# コスト込み・ウォークフォワード）で検証してPFが1を超えること、(2) 建玉サイズの
+# 問題を解決すること、(3) マージン口座にするかGFVの制約が無いと確認できること、
+# の3つを揃えること。
+#
+# 無効でも、既存のデイトレードポジション（状態ファイルからの復元など）の決済判定と
+# 大引け前の強制決済は動く。エントリーだけを止めている。
+ENABLE_DAY_TRADING: bool = False
 
 # デイトレード判定用（短期足）のプルバックパラメータ
 INTRADAY_BAR_SIZE: str = "5 mins"
@@ -237,9 +263,14 @@ async def _detect_buy_signal_async(
 ) -> Optional[Tuple[SignalResult, str]]:
     # 日足は1取引日に1本しか増えないためキャッシュから引く。日中足は
     # デイトレードのシグナルそのものなので毎回取得する。
+    # デイトレードが無効なら日中足は使わないので、取得自体を行わない
+    # （銘柄あたり毎サイクル1リクエストを丸ごと節約でき、ペーシング制限に効く）。
     daily_df = await caches.daily_bars.get_async(ib, contract)
-    intraday_df = await get_intraday_bars_async(
-        ib, contract, duration=INTRADAY_DURATION, bar_size=INTRADAY_BAR_SIZE,
+    intraday_df = (
+        await get_intraday_bars_async(
+            ib, contract, duration=INTRADAY_DURATION, bar_size=INTRADAY_BAR_SIZE,
+        )
+        if ENABLE_DAY_TRADING else pd.DataFrame()
     )
 
     if daily_df.empty and intraday_df.empty:
@@ -256,7 +287,7 @@ async def _detect_buy_signal_async(
             logger.info("[%s] スイング(日足)のプルバックシグナルで買い判定しました。", symbol)
             return swing_signal, STRATEGY_TYPE_SWING
 
-    if len(intraday_df) >= INTRADAY_MA_WINDOW:
+    if ENABLE_DAY_TRADING and len(intraday_df) >= INTRADAY_MA_WINDOW:
         intraday_signal = detect_pullback_signal(
             symbol, intraday_df, ma_window=INTRADAY_MA_WINDOW, threshold_pct=INTRADAY_THRESHOLD_PCT,
         )

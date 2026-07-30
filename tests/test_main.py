@@ -104,7 +104,12 @@ def test_process_symbol_opens_position_on_swing_daily_buy_signal(trade_journal) 
     assert position.oca_group == "OCA_TEST"
 
 
-def test_process_symbol_opens_position_on_intraday_buy_signal_when_daily_flat(trade_journal) -> None:
+def test_process_symbol_skips_intraday_buy_signal_while_day_trading_is_disabled(trade_journal) -> None:
+    """ENABLE_DAY_TRADING=False（既定）なら、短期足に買いシグナルが出ても建てないこと。
+
+    日中足の取得自体を行わないことまで確認する。銘柄あたり毎サイクル1リクエストを
+    丸ごと節約できるかどうかが、ペーシング制限の余裕に直結するため。
+    """
     contract = MagicMock(symbol="AAPL")
     ib = MagicMock()
     position_manager = PositionManager()
@@ -112,7 +117,41 @@ def test_process_symbol_opens_position_on_intraday_buy_signal_when_daily_flat(tr
     daily_df = _make_daily_df()  # 日足は横ばい -> シグナルなし
     intraday_df = _make_df([100.0] * 19 + [90.0])  # 短期足は下落 -> 買いシグナル
 
-    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+    with patch("main.ENABLE_DAY_TRADING", False), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch(
+            "main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)
+        ) as mock_intraday, \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch(
+            "main.place_dry_run_bracket_order_async",
+            new=AsyncMock(return_value=_bracket_result(quantity=222)),
+        ) as mock_order:
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    mock_order.assert_not_awaited()
+    mock_intraday.assert_not_awaited()
+    assert position_manager.has_position("AAPL") is False
+
+
+def test_process_symbol_opens_position_on_intraday_buy_signal_when_daily_flat(trade_journal) -> None:
+    """ENABLE_DAY_TRADINGを有効にしたときのデイトレード分岐。
+
+    既定は無効だが、再有効化したときに壊れていることに気付けるよう、
+    フラグを立てた状態でのエントリー経路を残してある。
+    """
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+
+    daily_df = _make_daily_df()  # 日足は横ばい -> シグナルなし
+    intraday_df = _make_df([100.0] * 19 + [90.0])  # 短期足は下落 -> 買いシグナル
+
+    with patch("main.ENABLE_DAY_TRADING", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
@@ -467,7 +506,10 @@ def test_process_symbol_opens_day_position_with_day_specific_risk_per_share(trad
     daily_df = _make_daily_df()  # 日足は横ばい -> シグナルなし
     intraday_df = _make_df([100.0] * 19 + [90.0])  # 短期足は下落 -> 買いシグナル(day)
 
-    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+    # 既定では無効な分岐だが、再有効化したときにデイトレード固有の損切り幅が
+    # 使われなくなっていることに気付けるよう、フラグを立てて検証する。
+    with patch("main.ENABLE_DAY_TRADING", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
@@ -728,7 +770,39 @@ def test_daily_bars_are_fetched_once_per_symbol_across_cycles(trade_journal) -> 
 
     # 日足は1取引日に1本しか増えないため1回だけ
     mock_daily.assert_awaited_once()
-    # 日中足はデイトレードのシグナルそのものなので毎サイクル取得する
+    # 日中足はENABLE_DAY_TRADING=False（既定）では使わないため一度も取得しない。
+    # 有効時は「デイトレードのシグナルそのもの」なので毎サイクル取得する
+    # （そちらは test_intraday_bars_are_fetched_every_cycle_when_day_trading_is_enabled）。
+    assert mock_intraday.await_count == 0
+
+
+def test_intraday_bars_are_fetched_every_cycle_when_day_trading_is_enabled(trade_journal) -> None:
+    """日中足はキャッシュしてはならない（デイトレードのシグナルそのものであるため）。
+
+    ENABLE_DAY_TRADINGを再有効化したときに、日足と同じくキャッシュに載せて
+    しまう改変が入っても気付けるようにするための番人。
+    """
+    ib = MagicMock()
+    ib.reqPositionsAsync = AsyncMock(return_value=[])
+    position_manager = PositionManager()
+    caches = MarketDataCaches()
+
+    daily_df = _make_daily_df()      # 横ばい -> シグナルなし
+    intraday_df = _make_df([100.0] * 20)
+
+    with patch("main.ENABLE_DAY_TRADING", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)) as mock_intraday:
+
+        async def run():
+            for _ in range(3):
+                await run_watchlist_cycle_async(
+                    ib, ["AAPL"], position_manager, trade_journal, caches,
+                )
+
+        asyncio.run(run())
+
     assert mock_intraday.await_count == 3
 
 
