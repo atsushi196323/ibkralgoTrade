@@ -10,6 +10,7 @@ from execution.order_manager import DryRunBracketResult, DryRunOrderResult
 from execution.position_manager import PositionManager, STRATEGY_TYPE_DAY, STRATEGY_TYPE_SWING
 from execution.trade_journal import TradeJournal
 from strategy.pullback import MarketFilterConfig
+from execution.position_sizing import calculate_position_size
 from main import (
     DAY_STOP_LOSS_PCT,
     MARKET_INDEX_SYMBOL,
@@ -24,6 +25,7 @@ from main import (
     _refresh_watchlist_async,
     main,
     process_symbol_async,
+    resolve_max_affordable_price,
     run_watchlist_cycle_async,
 )
 
@@ -561,7 +563,7 @@ def test_refresh_watchlist_uses_screening_result_when_available() -> None:
     ib = MagicMock()
 
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=["CHEAP1", "CHEAP2"])):
-        result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"]))
+        result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"], account_equity=100_000.0))
 
     assert result == ["CHEAP1", "CHEAP2"]
 
@@ -570,7 +572,7 @@ def test_refresh_watchlist_falls_back_when_screening_returns_empty() -> None:
     ib = MagicMock()
 
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])):
-        result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"]))
+        result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"], account_equity=100_000.0))
 
     assert result == ["FALLBACK"]
 
@@ -579,7 +581,7 @@ def test_refresh_watchlist_falls_back_when_screening_raises() -> None:
     ib = MagicMock()
 
     with patch("main.screen_value_stocks_async", new=AsyncMock(side_effect=RuntimeError("boom"))):
-        result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"]))
+        result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"], account_equity=100_000.0))
 
     assert result == ["FALLBACK"]
 
@@ -633,6 +635,7 @@ def test_main_continues_after_unexpected_exception_in_cycle() -> None:
     with patch("main.IBKRConnection", return_value=connection), \
         patch("main.is_regular_trading_hours", return_value=True), \
         patch("main._refresh_watchlist_async", new=AsyncMock(return_value=["AAPL"])), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
             "main.run_watchlist_cycle_async", new=AsyncMock(side_effect=RuntimeError("boom")),
         ) as mock_cycle, \
@@ -672,7 +675,7 @@ def test_watchlist_is_capped_to_limit_screening_request_volume() -> None:
     screened = [f"SYM{i}" for i in range(MAX_WATCHLIST_SIZE + 15)]
 
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=screened)):
-        result = asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"]))
+        result = asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"], account_equity=100_000.0))
 
     assert len(result) == MAX_WATCHLIST_SIZE
     assert result == screened[:MAX_WATCHLIST_SIZE]
@@ -682,7 +685,7 @@ def test_watchlist_below_cap_is_kept_intact() -> None:
     screened = ["CHEAP1", "CHEAP2"]
 
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=screened)):
-        result = asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"]))
+        result = asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"], account_equity=100_000.0))
 
     assert result == screened
 
@@ -1103,3 +1106,41 @@ def test_market_index_is_not_fetched_while_filter_is_disabled(trade_journal) -> 
     qualified_symbols = [call.args[1] for call in mock_qualify.await_args_list]
     assert MARKET_INDEX_SYMBOL not in qualified_symbols
     assert position_manager.has_position("AAPL") is True
+
+
+# --- 買える上限株価（スクリーナーへ渡す） -------------------------------------------
+
+
+def test_max_affordable_price_is_derived_from_equity_and_swing_stop() -> None:
+    """株価がこの値を超えると数量が0株になる、という境界であること。"""
+    equity = 1330.0
+
+    max_price = resolve_max_affordable_price(equity)
+
+    assert max_price == pytest.approx(equity * RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT)
+    # 上限ちょうどなら1株買え、少しでも超えると0株になる。
+    assert calculate_position_size(
+        equity, entry_price=max_price, stop_loss_pct=SWING_STOP_LOSS_PCT,
+        risk_per_trade_pct=RISK_PER_TRADE_PCT,
+    ) == 1
+    assert calculate_position_size(
+        equity, entry_price=max_price * 1.01, stop_loss_pct=SWING_STOP_LOSS_PCT,
+        risk_per_trade_pct=RISK_PER_TRADE_PCT,
+    ) == 0
+
+
+def test_max_affordable_price_is_disabled_when_equity_is_unavailable() -> None:
+    """資金が取れないときにフィルターを掛けないこと。
+
+    ここで0を返すと全銘柄が除外され、ウォッチリストが空のまま稼働し続ける。
+    """
+    assert resolve_max_affordable_price(0.0) is None
+    assert resolve_max_affordable_price(-1.0) is None
+
+
+def test_refresh_watchlist_passes_the_price_cap_to_the_screener() -> None:
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=["AAPL"])) as mock_screen:
+        asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"], account_equity=1330.0))
+
+    config = mock_screen.await_args.args[1]
+    assert config.max_price == pytest.approx(1330.0 * RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT)

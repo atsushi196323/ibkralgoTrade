@@ -507,8 +507,46 @@ async def run_watchlist_cycle_async(
             logger.exception("%s の処理中にエラーが発生しました。", symbol)
 
 
-async def _refresh_watchlist_async(ib: IB, fallback_watchlist: List[str]) -> List[str]:
+def resolve_max_affordable_price(account_equity: float) -> Optional[float]:
+    """現在の口座資金で1株でも買える上限株価を返す。
+
+    リスクベースのサイジングは
+        数量 = floor((資金 × RISK_PER_TRADE_PCT%) ÷ (株価 × 損切り%))
+    なので、数量が1株以上になる条件は
+        株価 ≦ 資金 × (RISK_PER_TRADE_PCT% ÷ 損切り%)
+    となる。
+
+    損切り幅にはスイングの値(SWING_STOP_LOSS_PCT)を使う。損切りが広いほど
+    上限株価は低くなるため、スイング・デイトレードのどちらの基準でも
+    買える銘柄だけが残る。デイトレードの狭い損切り(1.5%)で計算すると、
+    スイングでは数量0になる銘柄まで通してしまう。
+
+    資金が取得できない場合(0以下)はNoneを返して**フィルターを掛けない**。
+    ここで0を返すと全銘柄が除外され、ウォッチリストが空になったまま
+    稼働し続けることになる。
+    """
+    if account_equity <= 0:
+        logger.warning(
+            "口座資金が取得できなかったため(%.2f)、株価上限フィルターを無効にします。",
+            account_equity,
+        )
+        return None
+    return account_equity * (RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT)
+
+
+async def _refresh_watchlist_async(
+    ib: IB, fallback_watchlist: List[str], account_equity: float,
+) -> List[str]:
+    max_price = resolve_max_affordable_price(account_equity)
+    if max_price is not None:
+        logger.info(
+            "口座資金 %.2f USD で買える上限株価は %.2f USD です（これを超える銘柄は"
+            "数量が0株になるため、監視対象から除外します）。",
+            account_equity, max_price,
+        )
+
     config = ScreenerConfig(
+        max_price=max_price,
         market_cap_above=SCREENER_MIN_MARKET_CAP,
         market_cap_below=SCREENER_MAX_MARKET_CAP,
         max_pe_ratio=SCREENER_MAX_PE_RATIO,
@@ -570,7 +608,10 @@ async def main() -> None:
                 if is_regular_trading_hours():
                     today = datetime.now(US_EASTERN).date()
                     if today != last_screened_date:
-                        watchlist = await _refresh_watchlist_async(ib, watchlist)
+                        # 銘柄選定は口座資金に依存する（買えない株価の銘柄を除外する）。
+                        # スクリーニングは1日1回なので、資金の取得もこのタイミングだけで足りる。
+                        account_equity = await get_account_equity_async(ib)
+                        watchlist = await _refresh_watchlist_async(ib, watchlist, account_equity)
                         last_screened_date = today
 
                     await run_watchlist_cycle_async(

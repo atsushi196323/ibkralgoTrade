@@ -57,6 +57,14 @@ class ScreenerConfig:
     # 個別銘柄がたまたまPERデータを持たないだけの単発ケースと区別するため、
     # 1件ではなく複数件の連続失敗を条件にしている。
     max_consecutive_pe_failures: int = 5
+    # 買える上限株価(USD)。Noneなら無効。
+    # リスクベースのサイジングでは 数量 = floor((資金×リスク%) ÷ (株価×損切り%))
+    # なので、株価が「資金 × (リスク% ÷ 損切り%)」を超えると数量が0株になり、
+    # シグナルが出ても永久に発注できない。この銘柄がウォッチリストに残ると、
+    # 毎サイクルの日中足リクエスト（＝ペーシング制限の枠）を消費したうえで
+    # 必ずスキップされる。監視できる銘柄数は10件しかないため、
+    # 買えない銘柄に枠を割く余裕は無い。
+    max_price: Optional[float] = None
 
 
 def _is_in_long_term_uptrend(df: pd.DataFrame, ma_window: int) -> Optional[bool]:
@@ -72,18 +80,69 @@ def _is_in_long_term_uptrend(df: pd.DataFrame, ma_window: int) -> Optional[bool]
     return latest_close > moving_average
 
 
-async def _passes_trend_filter_async(ib: IB, contract: Stock, config: ScreenerConfig) -> bool:
-    trend_df = await get_historical_bars_async(
+def _is_affordable(df: pd.DataFrame, max_price: float) -> Optional[bool]:
+    """直近の終値が max_price 以下か判定する。
+
+    株価が取れない場合はNoneを返す（判定不能）。
+    """
+    if df.empty or "close" not in df.columns:
+        return None
+
+    latest_close = float(df["close"].iloc[-1])
+    if latest_close <= 0:
+        return None
+    return latest_close <= max_price
+
+
+async def _passes_bar_based_filters_async(
+    ib: IB, contract: Stock, config: ScreenerConfig,
+) -> bool:
+    """日足バーを1回だけ取得し、株価上限と長期トレンドの両方を判定する。
+
+    2つの条件で別々にバーを取得するとIBKRへのリクエストが倍になるため、
+    同じバーを使い回す。どちらも無効なら取得自体を行わない。
+    """
+    if not config.enable_trend_filter and config.max_price is None:
+        return True
+
+    daily_df = await get_historical_bars_async(
         ib, contract, duration=config.trend_lookback_duration, bar_size="1 day",
     )
-    in_uptrend = _is_in_long_term_uptrend(trend_df, config.trend_ma_window)
-    if in_uptrend is None:
-        logger.info(
-            "[%s] 長期トレンド判定に必要なデータが不足しているため、フィルターを素通りさせます。",
-            contract.symbol,
-        )
-        return True
-    return in_uptrend
+
+    if config.max_price is not None:
+        affordable = _is_affordable(daily_df, config.max_price)
+        if affordable is None:
+            # 株価が分からない銘柄は除外に倒す。素通しすると、買えない銘柄が
+            # ウォッチリストの枠とペーシング枠を占め続けても気付けない。
+            logger.info(
+                "[%s] 株価が取得できなかったため、買える銘柄か判定できず除外します。",
+                contract.symbol,
+            )
+            return False
+        if not affordable:
+            logger.info(
+                "[%s] 株価が上限(%.2f USD)を超えるため除外しました"
+                "（現在の口座資金では数量が0株になる）。",
+                contract.symbol, config.max_price,
+            )
+            return False
+
+    if config.enable_trend_filter:
+        in_uptrend = _is_in_long_term_uptrend(daily_df, config.trend_ma_window)
+        if in_uptrend is None:
+            logger.info(
+                "[%s] 長期トレンド判定に必要なデータが不足しているため、フィルターを素通りさせます。",
+                contract.symbol,
+            )
+            return True
+        if not in_uptrend:
+            logger.info(
+                "[%s] 長期トレンドフィルターで除外しました(%d日移動平均割れ)。",
+                contract.symbol, config.trend_ma_window,
+            )
+            return False
+
+    return True
 
 
 async def screen_value_stocks_async(ib: IB, config: ScreenerConfig) -> List[str]:
@@ -127,18 +186,12 @@ async def screen_value_stocks_async(ib: IB, config: ScreenerConfig) -> List[str]
                 pe_fetch_failed = True
             elif not (0 < pe_ratio <= config.max_pe_ratio):
                 pass  # 赤字・割高による通常の除外。購読権限の問題ではない。
-            else:
-                if config.enable_trend_filter:
-                    await _pace()
-                    if not await _passes_trend_filter_async(ib, contract, config):
-                        logger.info(
-                            "[%s] 長期トレンドフィルターで除外しました(%d日移動平均割れ)。",
-                            contract.symbol, config.trend_ma_window,
-                        )
-                    else:
-                        selected.append(contract.symbol)
-                else:
+            elif config.enable_trend_filter or config.max_price is not None:
+                await _pace()
+                if await _passes_bar_based_filters_async(ib, contract, config):
                     selected.append(contract.symbol)
+            else:
+                selected.append(contract.symbol)
         except Exception:
             pe_fetch_failed = True
             logger.exception(

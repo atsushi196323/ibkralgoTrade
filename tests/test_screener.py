@@ -347,3 +347,92 @@ def test_screen_value_stocks_raises_on_non_positive_max_pe_ratio() -> None:
 
     with pytest.raises(ValueError):
         asyncio.run(screen_value_stocks_async(ib, ScreenerConfig(max_pe_ratio=0.0)))
+
+
+# --- 株価上限フィルター -------------------------------------------------------------
+
+
+def _run_with_bars(config: ScreenerConfig, candidates: list, bars: dict) -> list:
+    ib = MagicMock()
+
+    async def _fake_historical_bars(_ib, contract, duration, bar_size, what_to_show="TRADES"):
+        return bars[contract.symbol]
+
+    with patch("strategy.screener.run_market_cap_scan_async", new=AsyncMock(return_value=candidates)), \
+        patch("strategy.screener.get_pe_ratio_async", new=AsyncMock(return_value=10.0)), \
+        patch("strategy.screener.get_historical_bars_async", new=AsyncMock(side_effect=_fake_historical_bars)), \
+        patch("strategy.screener.asyncio.sleep", new=AsyncMock()):
+        return asyncio.run(screen_value_stocks_async(ib, config))
+
+
+def test_screen_value_stocks_excludes_symbols_above_max_price() -> None:
+    """買えない株価の銘柄を監視対象に残さないこと。
+
+    残すと毎サイクルの日中足リクエスト（ペーシング枠）を消費したうえで、
+    数量0株になって必ずスキップされる。監視枠は10件しかない。
+    """
+    candidates = [_make_contract("CHEAP"), _make_contract("PRICEY")]
+    bars = {
+        "CHEAP": _make_price_df([100.0] * 200),
+        "PRICEY": _make_price_df([500.0] * 200),
+    }
+
+    result = _run_with_bars(
+        ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=False, max_price=266.0),
+        candidates, bars,
+    )
+
+    assert result == ["CHEAP"]
+
+
+def test_screen_value_stocks_excludes_symbols_with_unknown_price() -> None:
+    """株価が取れない銘柄は除外に倒すこと（素通しすると気付けない）。"""
+    candidates = [_make_contract("CHEAP"), _make_contract("NOBARS")]
+    bars = {
+        "CHEAP": _make_price_df([100.0] * 200),
+        "NOBARS": pd.DataFrame(),
+    }
+
+    result = _run_with_bars(
+        ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=False, max_price=266.0),
+        candidates, bars,
+    )
+
+    assert result == ["CHEAP"]
+
+
+def test_max_price_and_trend_filter_share_one_bar_request() -> None:
+    """両方有効でも日足の取得は1銘柄1回で済ませること（ペーシング制限対策）。"""
+    ib = MagicMock()
+    candidates = [_make_contract("CHEAP")]
+    # 終値が移動平均を上回る形（＝トレンドフィルターも通る）にする。
+    mock_bars = AsyncMock(return_value=_make_price_df([100.0] * 199 + [150.0]))
+
+    with patch("strategy.screener.run_market_cap_scan_async", new=AsyncMock(return_value=candidates)), \
+        patch("strategy.screener.get_pe_ratio_async", new=AsyncMock(return_value=10.0)), \
+        patch("strategy.screener.get_historical_bars_async", new=mock_bars), \
+        patch("strategy.screener.asyncio.sleep", new=AsyncMock()):
+        result = asyncio.run(screen_value_stocks_async(
+            ib, ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=True, max_price=266.0),
+        ))
+
+    assert result == ["CHEAP"]
+    assert mock_bars.await_count == 1
+
+
+def test_no_bars_are_fetched_when_both_bar_based_filters_are_off() -> None:
+    """株価上限もトレンドも無効なら、日足を取得しないこと。"""
+    ib = MagicMock()
+    candidates = [_make_contract("CHEAP")]
+    mock_bars = AsyncMock()
+
+    with patch("strategy.screener.run_market_cap_scan_async", new=AsyncMock(return_value=candidates)), \
+        patch("strategy.screener.get_pe_ratio_async", new=AsyncMock(return_value=10.0)), \
+        patch("strategy.screener.get_historical_bars_async", new=mock_bars), \
+        patch("strategy.screener.asyncio.sleep", new=AsyncMock()):
+        result = asyncio.run(screen_value_stocks_async(
+            ib, ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=False, max_price=None),
+        ))
+
+    assert result == ["CHEAP"]
+    mock_bars.assert_not_awaited()
