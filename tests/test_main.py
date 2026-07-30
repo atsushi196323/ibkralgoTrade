@@ -1113,7 +1113,7 @@ def test_market_index_is_not_fetched_while_filter_is_disabled(trade_journal) -> 
 
 def test_max_affordable_price_is_derived_from_equity_and_swing_stop() -> None:
     """株価がこの値を超えると数量が0株になる、という境界であること。"""
-    equity = 1330.0
+    equity = 1220.0
 
     max_price = resolve_max_affordable_price(equity)
 
@@ -1140,7 +1140,7 @@ def test_max_affordable_price_is_disabled_when_equity_is_unavailable() -> None:
 
 def test_refresh_watchlist_passes_the_price_cap_to_the_screener() -> None:
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=["AAPL"])) as mock_screen:
-        asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"], account_equity=1330.0))
+        asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"], account_equity=1220.0))
 
     config = mock_screen.await_args.args[1]
-    assert config.max_price == pytest.approx(1330.0 * RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT)
+    assert config.max_price == pytest.approx(1220.0 * RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT)

@@ -26,9 +26,9 @@ def test_initial_equity_defaults_to_the_backtest_config_value() -> None:
 
 
 def test_initial_equity_is_parsed() -> None:
-    args = _parse(["--csv", "bars/AAPL.csv", "--initial-equity", "1330"])
+    args = _parse(["--csv", "bars/AAPL.csv", "--initial-equity", "1220"])
 
-    assert args.initial_equity == pytest.approx(1330.0)
+    assert args.initial_equity == pytest.approx(1220.0)
 
 
 def test_initial_equity_reaches_the_multi_symbol_run() -> None:
@@ -38,7 +38,7 @@ def test_initial_equity_reaches_the_multi_symbol_run() -> None:
     成績を見ることになる。1注文あたりの最低手数料は約定代金に対する比率が
     口座サイズで大きく変わるため、取り違えると成績を大幅に楽観視する。
     """
-    args = _parse(["--csv-dir", "bars", "--initial-equity", "1330"])
+    args = _parse(["--csv-dir", "bars", "--initial-equity", "1220"])
     frames = {"AAPL": pd.DataFrame({"close": [1.0, 2.0]})}
 
     with patch("backtest.run._load_csv_directory", return_value=frames), \
@@ -48,4 +48,4 @@ def test_initial_equity_reaches_the_multi_symbol_run() -> None:
 
         _run_multi_symbol(args, cost_model=None)
 
-    assert mock_run.call_args.kwargs["initial_equity"] == pytest.approx(1330.0)
+    assert mock_run.call_args.kwargs["initial_equity"] == pytest.approx(1220.0)

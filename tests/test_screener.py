@@ -378,7 +378,7 @@ def test_screen_value_stocks_excludes_symbols_above_max_price() -> None:
     }
 
     result = _run_with_bars(
-        ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=False, max_price=266.0),
+        ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=False, max_price=244.0),
         candidates, bars,
     )
 
@@ -394,7 +394,7 @@ def test_screen_value_stocks_excludes_symbols_with_unknown_price() -> None:
     }
 
     result = _run_with_bars(
-        ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=False, max_price=266.0),
+        ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=False, max_price=244.0),
         candidates, bars,
     )
 
@@ -413,7 +413,7 @@ def test_max_price_and_trend_filter_share_one_bar_request() -> None:
         patch("strategy.screener.get_historical_bars_async", new=mock_bars), \
         patch("strategy.screener.asyncio.sleep", new=AsyncMock()):
         result = asyncio.run(screen_value_stocks_async(
-            ib, ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=True, max_price=266.0),
+            ib, ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=True, max_price=244.0),
         ))
 
     assert result == ["CHEAP"]
