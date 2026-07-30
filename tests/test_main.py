@@ -13,9 +13,11 @@ from strategy.pullback import MarketFilterConfig
 from main import (
     DAY_STOP_LOSS_PCT,
     MARKET_INDEX_SYMBOL,
+    MAX_CONCURRENT_POSITIONS,
     MAX_DAILY_ENTRY_ORDERS,
     MAX_WATCHLIST_SIZE,
     POLL_INTERVAL_SECONDS,
+    RISK_PER_TRADE_PCT,
     SWING_MA_WINDOW,
     SWING_STOP_LOSS_PCT,
     MarketDataCaches,
@@ -187,8 +189,10 @@ def test_process_symbol_skips_entry_when_max_concurrent_positions_reached(trade_
     contract = MagicMock(symbol="AAPL")
     ib = MagicMock()
     position_manager = PositionManager()
-    # main.MAX_CONCURRENT_POSITIONS(5)分のダミーポジションで上限に到達させる
-    for i in range(5):
+    # 上限ちょうどまでダミーポジションで埋める。定数から導出しているのは、
+    # 上限値を変えたときにテストが「上限に達していない状態」を検証する
+    # 別物にすり替わらないようにするため。
+    for i in range(MAX_CONCURRENT_POSITIONS):
         position_manager.open_position(f"SYM{i}", entry_price=10.0, quantity=1)
 
     daily_df = _make_daily_df(drop=True)  # 大きく下落 -> 買いシグナル
@@ -931,6 +935,24 @@ def test_cooldown_does_not_block_other_symbols(trade_journal) -> None:
 
     mock_order.assert_awaited_once()
     assert position_manager.has_position("MSFT") is True
+
+
+def test_concurrent_position_limit_fits_within_the_account() -> None:
+    """同時保有の上限まで建てても、スイングの建玉合計が資金を超えないこと。
+
+    リスクベースのサイジングでは、1ポジションが占める資金の割合が株価に
+    よらず一定になる:
+        建玉金額 = 数量 × 株価 = 資金 × (RISK_PER_TRADE_PCT% ÷ 損切り%)
+    したがって同時保有数を増やすと、株価と無関係に資金を使い切る。
+    小口座では既定値がそのまま資金の上限に当たるため、番人として固定する。
+    """
+    equity_fraction_per_position = RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT
+    total = MAX_CONCURRENT_POSITIONS * equity_fraction_per_position
+
+    assert total <= 1.0, (
+        f"同時保有{MAX_CONCURRENT_POSITIONS}銘柄で資金の{total * 100:.0f}%を"
+        "建玉に使うことになります。"
+    )
 
 
 # --- 1日の新規建て回数の上限 -----------------------------------------------------
