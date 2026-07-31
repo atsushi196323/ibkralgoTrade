@@ -1282,9 +1282,16 @@ def test_refresh_watchlist_passes_the_price_cap_to_the_screener() -> None:
 
 
 def _entry_patches(*, price: float, equity: float, settled_cash):
-    """新規エントリーが成立する最小構成のパッチ一式を返す。"""
+    """新規エントリーが成立する最小構成のパッチ一式を返す。
+
+    ENFORCE_SETTLED_CASH_FUNDINGを明示的に立てるのは、既定値が
+    「検証用ペーパー口座にSettledCashが無い」という運用上の都合で
+    Falseになっているため。ガード自体は実口座で使うロジックなので、
+    既定値に関係なく挙動を固定する。
+    """
     contract = MagicMock(symbol="AAPL")
     return contract, [
+        patch("main.ENFORCE_SETTLED_CASH_FUNDING", True),
         patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)),
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=_make_daily_df(drop=True))),
         patch("main.get_current_price_async", new=AsyncMock(return_value=price)),

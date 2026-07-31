@@ -8,36 +8,83 @@ import pytest
 from execution.account import get_account_equity_async, get_settled_cash_async
 
 
-def _make_account_value(tag: str, value: str):
-    return MagicMock(tag=tag, value=value)
+def _make_account_value(tag: str, value: str, currency: str = "USD"):
+    return MagicMock(tag=tag, value=value, currency=currency)
 
 
-def test_returns_net_liquidation_by_default() -> None:
+def _make_jpy_based_summary():
+    """基準通貨が円の口座のアカウントサマリー（実測値に合わせた形）。
+
+    NetLiquidationは円建ての行しか持たず、USD建ての額は
+    NetLiquidationByCurrencyの方にある。
+    """
+    return [
+        _make_account_value("NetLiquidation", "196059.62", currency="JPY"),
+        _make_account_value("NetLiquidationByCurrency", "0.00", currency="JPY"),
+        _make_account_value("NetLiquidationByCurrency", "1220.00", currency="USD"),
+        _make_account_value("NetLiquidationByCurrency", "196059.6182", currency="BASE"),
+        _make_account_value("AvailableFunds", "196059.62", currency="JPY"),
+    ]
+
+
+def test_returns_usd_equity_from_a_jpy_based_account() -> None:
+    """基準通貨が円でも、USD建ての純資産を返すこと。
+
+    円の数値をドルとして扱うと、資金を為替レート倍（約160倍）に見積もり、
+    ポジションサイジングの数量が2桁狂う。
+    """
     ib = MagicMock()
-    ib.accountSummaryAsync = AsyncMock(
-        return_value=[
-            _make_account_value("AvailableFunds", "50000.0"),
-            _make_account_value("NetLiquidation", "123456.78"),
-        ]
-    )
+    ib.accountSummaryAsync = AsyncMock(return_value=_make_jpy_based_summary())
 
     equity = asyncio.run(get_account_equity_async(ib))
 
-    assert equity == pytest.approx(123456.78)
+    assert equity == pytest.approx(1220.0)
 
 
-def test_returns_requested_tag() -> None:
+def test_does_not_fall_back_to_the_base_currency_amount() -> None:
+    """USD建ての行が無いときに基準通貨の額を返さないこと。
+
+    黙ってフォールバックすると、通貨の取り違えが例外もログも出さずに
+    数量だけを桁違いにする。
+    """
     ib = MagicMock()
     ib.accountSummaryAsync = AsyncMock(
         return_value=[
-            _make_account_value("NetLiquidation", "123456.78"),
-            _make_account_value("AvailableFunds", "50000.0"),
+            _make_account_value("NetLiquidation", "196059.62", currency="JPY"),
+            _make_account_value("NetLiquidationByCurrency", "196059.6182", currency="BASE"),
+        ]
+    )
+
+    with pytest.raises(ValueError):
+        asyncio.run(get_account_equity_async(ib))
+
+
+def test_returns_requested_tag_and_currency() -> None:
+    ib = MagicMock()
+    ib.accountSummaryAsync = AsyncMock(
+        return_value=[
+            _make_account_value("AvailableFunds", "196059.62", currency="JPY"),
+            _make_account_value("AvailableFunds", "1220.0", currency="USD"),
         ]
     )
 
     equity = asyncio.run(get_account_equity_async(ib, tag="AvailableFunds"))
 
-    assert equity == pytest.approx(50000.0)
+    assert equity == pytest.approx(1220.0)
+
+
+def test_currency_can_be_ignored_for_tags_without_a_breakdown() -> None:
+    """通貨別の内訳を持たないタグは currency=None で引けること。"""
+    ib = MagicMock()
+    ib.accountSummaryAsync = AsyncMock(
+        return_value=[_make_account_value("NetLiquidation", "196059.62", currency="JPY")]
+    )
+
+    equity = asyncio.run(
+        get_account_equity_async(ib, tag="NetLiquidation", currency=None)
+    )
+
+    assert equity == pytest.approx(196059.62)
 
 
 def test_raises_when_tag_not_found() -> None:
