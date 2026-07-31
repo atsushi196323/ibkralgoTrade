@@ -49,7 +49,6 @@ MARKET_DATA_TYPE_LABELS = {
     4: "DELAYED_FROZEN(遅延+引け値)",
 }
 
-# 収集したIBKRエラー: (errorCode, errorString)
 _errors: List[Tuple[int, str]] = []
 
 

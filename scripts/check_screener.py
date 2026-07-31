@@ -53,7 +53,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 収集したIBKRエラー: (errorCode, errorString)
 _errors: List[Tuple[int, str]] = []
 
 

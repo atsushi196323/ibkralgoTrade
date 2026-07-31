@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
@@ -14,10 +15,11 @@ from core.market_hours import US_EASTERN, is_day_trade_flatten_time, is_regular_
 from data.cache import ContractCache, DailyBarCache
 from data.market_data import (
     get_current_price_async,
+    get_current_price_quote_async,
     get_intraday_bars_async,
     get_usd_jpy_rate_async,
 )
-from execution.account import get_account_equity_async
+from execution.account import get_account_equity_async, get_settled_cash_async
 from execution.order_manager import (
     cancel_dry_run_bracket_orders_async,
     place_dry_run_bracket_order_async,
@@ -139,7 +141,6 @@ SWING_MARKET_FILTER: MarketFilterConfig = MarketFilterConfig()
 # 大引け前の強制決済は動く。エントリーだけを止めている。
 ENABLE_DAY_TRADING: bool = False
 
-# デイトレード判定用（短期足）のプルバックパラメータ
 INTRADAY_BAR_SIZE: str = "5 mins"
 INTRADAY_DURATION: str = "2 D"
 INTRADAY_MA_WINDOW: int = 20
@@ -196,7 +197,6 @@ EXIT_PARAMS_BY_STRATEGY_TYPE: Dict[str, ExitParams] = {
 # 1トレードあたり口座資金の何%をリスクに晒すか（ポジションサイジングの基準）
 RISK_PER_TRADE_PCT: float = 1.0
 
-# ポートフォリオ全体のリスク管理
 # 銘柄ごとの1%リスクは同時保有数が増えるほど積み上がるため、
 # ウォッチリストが拡張されても青天井にならないよう独立して上限を設ける。
 #
@@ -226,6 +226,34 @@ MAX_DAILY_LOSS_PCT: float = 3.0
 # 有限回で止めるための独立した歯止め。損失額ベースのサーキットブレーカーとは違い、
 # 実現損益が確定する前の発注ラッシュにも効く。
 MAX_DAILY_ENTRY_ORDERS: int = 10
+# 新規建ての数量を「決済済み現金で買える株数」に制限するか。
+#
+# キャッシュ口座では、未受渡しの売却代金で買った建玉を受渡し(T+1)より前に売ると
+# Good Faith Violationになる。この経路はデイトレード固有ではない:
+#   1. ある銘柄を決済する → 代金は翌営業日まで未受渡し
+#   2. 同じ日に別銘柄のシグナルが出て、その未受渡し代金で建てる
+#   3. ブラケットの利確指値/損切り逆指値に当日中に触れて決済 → GFV
+# 同日中の再エントリー禁止は同一銘柄しか止めないため2は素通りし、3は
+# 待機注文が板に乗っている以上ボット側では選べない。よってステップ2、すなわち
+# 「入口で未受渡しの資金を使わせない」ことが唯一の止めどころになる。
+#
+# 同日決済そのものを禁止する対処を採らないのは、利確・損切りをブローカー側に
+# 置いている意味（プロセスが落ちても約定する）を失うため。GFVを避けるために
+# 損切りを外すのは本末転倒である。
+ENFORCE_SETTLED_CASH_FUNDING: bool = True
+# 当日のものでない価格を掴んだまま新規建てするのを止めるか。
+#
+# get_current_price_async のフォールバック連鎖は、下位の経路
+# （ティッカーのclose・ヒストリカル最終終値）で**前営業日の終値**を返しうる。
+# 購読権限の無い口座ほど下位に落ちやすいため、休場明けやギャップ後には
+# 現実に起こる。この値は発注の参照価格になり、損切り・利確の指値もここから
+# 算出されるので、古い値を掴むとブラケット一式が実勢からずれた値段で並ぶ。
+# order_manager の値段の妥当性検証は参照価格を基準に測っている以上、
+# 参照価格そのものがずれているケースは検出できない（CLAUDE.md該当節）。
+#
+# 決済側には掛けていない。古い価格で決済を見送ると、損切りが必要な場面で
+# 何もしないことになり、新規建てを見送るのとは危険の向きが逆になる。
+REJECT_STALE_ENTRY_PRICE: bool = True
 
 
 async def _get_market_deviation_pct_async(
@@ -340,10 +368,21 @@ async def _process_entry_async(
         return
     _signal, strategy_type = signal_result
 
-    price = await get_current_price_async(ib, contract)
-    if price is None:
+    quote = await get_current_price_quote_async(ib, contract)
+    if quote is None:
         logger.warning("%s の現在価格が取得できなかったため発注をスキップします。", symbol)
         return
+
+    if quote.is_stale and REJECT_STALE_ENTRY_PRICE:
+        logger.warning(
+            "[%s] 現在価格 %.2f が当日のものではない可能性があるため（経路: %s）、"
+            "新規エントリーを見送ります。この価格を参照価格にすると、"
+            "損切り・利確の値段まで実勢からずれたブラケットが並ぶため。",
+            symbol, quote.price, quote.source,
+        )
+        return
+
+    price = quote.price
 
     account_equity = await get_account_equity_async(ib)
 
@@ -373,6 +412,10 @@ async def _process_entry_async(
         )
         return
 
+    quantity = await _clamp_quantity_to_settled_cash_async(ib, symbol, quantity, price)
+    if quantity <= 0:
+        return
+
     risk_per_share = price * exit_params.stop_loss_pct / 100.0
 
     # 損切りと利確はブローカー側に置く（ブラケット注文）。ボットのプロセスが
@@ -391,6 +434,53 @@ async def _process_entry_async(
         stop_price=stop_price, take_profit_price=take_profit_price,
         oca_group=order_result.oca_group,
     )
+
+
+async def _clamp_quantity_to_settled_cash_async(
+    ib: IB, symbol: str, quantity: int, price: float,
+) -> int:
+    """新規建ての数量を、決済済み現金で実際に支払える株数まで切り下げる。
+
+    リスクベースのサイジングはNetLiquidation（未受渡しの代金を含む評価額）を
+    基準にしているため、キャッシュ口座では「まだ手元に無い現金」を当てにした
+    数量が出うる。それで建てるとGFVの経路に乗るので、ここで現金の裏付けまで
+    数量を落とす（ENFORCE_SETTLED_CASH_FUNDINGの説明を参照）。
+
+    決済済み現金が取得できない場合は0を返して**建てない**。ここを素通しすると、
+    資金の裏付けを確認できないままGFVを踏みうる注文を出すことになる。
+    エントリーだけが止まり決済判定は動き続けるため、既存ポジションが
+    損切りも無く放置されることはない。
+    """
+    if not ENFORCE_SETTLED_CASH_FUNDING:
+        return quantity
+
+    settled_cash = await get_settled_cash_async(ib)
+    if settled_cash is None:
+        logger.error(
+            "[%s] 決済済み現金が取得できなかったため、新規エントリーを見送ります"
+            "（未受渡し資金での建玉はGood Faith Violationにつながるため）。",
+            symbol,
+        )
+        return 0
+
+    affordable_quantity = max(math.floor(settled_cash / price), 0)
+    if affordable_quantity <= 0:
+        logger.warning(
+            "[%s] 決済済み現金 %.2f USD では1株(%.2f USD)も買えないため、"
+            "新規エントリーを見送ります。",
+            symbol, settled_cash, price,
+        )
+        return 0
+
+    if affordable_quantity < quantity:
+        logger.info(
+            "[%s] 決済済み現金 %.2f USD の範囲に数量を切り下げます: %d株 -> %d株"
+            "（残りは未受渡しの代金であり、これで建てるとGFVの対象になりうる）。",
+            symbol, settled_cash, quantity, affordable_quantity,
+        )
+        return affordable_quantity
+
+    return quantity
 
 
 async def _record_closed_trade(
@@ -538,7 +628,9 @@ async def run_watchlist_cycle_async(
             logger.exception("%s の処理中にエラーが発生しました。", symbol)
 
 
-def resolve_max_affordable_price(account_equity: float) -> Optional[float]:
+def resolve_max_affordable_price(
+    account_equity: float, settled_cash: Optional[float] = None,
+) -> Optional[float]:
     """現在の口座資金で1株でも買える上限株価を返す。
 
     リスクベースのサイジングは
@@ -552,9 +644,16 @@ def resolve_max_affordable_price(account_equity: float) -> Optional[float]:
     買える銘柄だけが残る。デイトレードの狭い損切り(1.5%)で計算すると、
     スイングでは数量0になる銘柄まで通してしまう。
 
+    キャッシュ口座では、1株の値段が決済済み現金を超える銘柄も買えない
+    （_clamp_quantity_to_settled_cash_asyncが数量0に切り下げる）。そのため
+    settled_cashが渡された場合は、上式との**小さい方**を上限とする。
+    これを無視すると、買えない銘柄が監視枠を占め続ける。
+
     資金が取得できない場合(0以下)はNoneを返して**フィルターを掛けない**。
     ここで0を返すと全銘柄が除外され、ウォッチリストが空になったまま
-    稼働し続けることになる。
+    稼働し続けることになる。決済済み現金が取れなかった場合(None)も同じ理由で
+    上限を狭めない。実際に建てられるかどうかはエントリー時に必ず再判定するため、
+    ここで絞り込みを外しても未受渡し資金で建ててしまうことはない。
     """
     if account_equity <= 0:
         logger.warning(
@@ -562,13 +661,25 @@ def resolve_max_affordable_price(account_equity: float) -> Optional[float]:
             account_equity,
         )
         return None
-    return account_equity * (RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT)
+
+    max_price = account_equity * (RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT)
+
+    if settled_cash is not None and 0 < settled_cash < max_price:
+        logger.info(
+            "決済済み現金 %.2f USD の方が小さいため、上限株価をこちらに合わせます"
+            "（%.2f USD -> %.2f USD）。",
+            settled_cash, max_price, settled_cash,
+        )
+        return settled_cash
+
+    return max_price
 
 
 async def _refresh_watchlist_async(
     ib: IB, fallback_watchlist: List[str], account_equity: float,
+    settled_cash: Optional[float] = None,
 ) -> List[str]:
-    max_price = resolve_max_affordable_price(account_equity)
+    max_price = resolve_max_affordable_price(account_equity, settled_cash)
     if max_price is not None:
         logger.info(
             "口座資金 %.2f USD で買える上限株価は %.2f USD です（これを超える銘柄は"
@@ -642,7 +753,15 @@ async def main() -> None:
                         # 銘柄選定は口座資金に依存する（買えない株価の銘柄を除外する）。
                         # スクリーニングは1日1回なので、資金の取得もこのタイミングだけで足りる。
                         account_equity = await get_account_equity_async(ib)
-                        watchlist = await _refresh_watchlist_async(ib, watchlist, account_equity)
+                        # キャッシュ口座では1株の値段が決済済み現金を超える銘柄も
+                        # 買えないため、株価上限の判定に併せて渡す。
+                        settled_cash = (
+                            await get_settled_cash_async(ib)
+                            if ENFORCE_SETTLED_CASH_FUNDING else None
+                        )
+                        watchlist = await _refresh_watchlist_async(
+                            ib, watchlist, account_equity, settled_cash,
+                        )
                         last_screened_date = today
 
                     await run_watchlist_cycle_async(

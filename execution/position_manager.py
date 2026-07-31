@@ -266,7 +266,6 @@ class PositionManager:
         )
         self._positions[symbol] = position
 
-        # 日をまたいだらカウンタを0から数え直す。
         today = _current_trading_day(now).isoformat()
         if self._entry_order_day != today:
             self._entry_order_day = today

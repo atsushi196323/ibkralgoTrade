@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pandas as pd
 import pytest
 
+from data.market_data import PRICE_SOURCE_HISTORICAL, PRICE_SOURCE_STREAMING, PriceQuote
 from execution.order_manager import DryRunBracketResult, DryRunOrderResult
 from execution.position_manager import PositionManager, STRATEGY_TYPE_DAY, STRATEGY_TYPE_SWING
 from execution.trade_journal import TradeJournal
@@ -28,6 +29,15 @@ from main import (
     resolve_max_affordable_price,
     run_watchlist_cycle_async,
 )
+
+
+def _fresh_quote(price: float) -> PriceQuote:
+    """当日のストリーミング価格として扱えるPriceQuoteを返す。
+
+    鮮度そのものを検証するテスト以外は「価格は新しい」前提で書きたいため、
+    エントリー経路のモックはこれを既定にする。
+    """
+    return PriceQuote(price=price, source=PRICE_SOURCE_STREAMING, is_stale=False)
 
 
 def _make_df(closes: list) -> pd.DataFrame:
@@ -74,7 +84,9 @@ def test_process_symbol_opens_position_on_swing_daily_buy_signal(trade_journal) 
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
             "main.place_dry_run_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=250)),
@@ -124,7 +136,9 @@ def test_process_symbol_skips_intraday_buy_signal_while_day_trading_is_disabled(
             "main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)
         ) as mock_intraday, \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
             "main.place_dry_run_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=222)),
@@ -155,7 +169,9 @@ def test_process_symbol_opens_position_on_intraday_buy_signal_when_daily_flat(tr
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
             "main.place_dry_run_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=222)),
@@ -180,6 +196,7 @@ def test_process_symbol_skips_entry_when_risk_based_quantity_is_zero(trade_journ
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=1.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
@@ -201,12 +218,14 @@ def test_process_symbol_does_not_open_position_when_no_buy_signal_on_either_time
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock()) as mock_price, \
+        patch("main.get_current_price_quote_async", new=AsyncMock()) as mock_quote, \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
     mock_order.assert_not_awaited()
     mock_price.assert_not_awaited()
+    mock_quote.assert_not_awaited()
     assert position_manager.has_position("AAPL") is False
 
 
@@ -243,7 +262,9 @@ def test_process_symbol_skips_entry_when_max_concurrent_positions_reached(trade_
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
@@ -272,7 +293,9 @@ def test_process_symbol_skips_entry_when_daily_loss_circuit_breaker_tripped(trad
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
@@ -296,6 +319,7 @@ def test_daily_loss_circuit_breaker_does_not_block_exits(trade_journal) -> None:
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
@@ -318,6 +342,7 @@ def test_process_symbol_closes_position_on_exit_signal(trade_journal) -> None:
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
@@ -362,6 +387,7 @@ def test_process_symbol_records_none_r_multiple_when_risk_per_share_unknown(trad
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()):
 
@@ -380,6 +406,7 @@ def test_process_symbol_keeps_position_when_no_exit_signal(trade_journal) -> Non
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=101.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(101.0))), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
@@ -399,6 +426,7 @@ def test_process_symbol_updates_highest_price_for_trailing_stop(trade_journal) -
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=108.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(108.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
@@ -424,6 +452,7 @@ def test_day_position_uses_tighter_stop_loss_than_swing_position(trade_journal) 
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=97.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(97.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.is_day_trade_flatten_time", return_value=False), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
@@ -446,6 +475,7 @@ def test_swing_position_keeps_open_at_move_that_would_stop_out_a_day_position(tr
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=97.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(97.0))), \
         patch("main.is_day_trade_flatten_time", return_value=False), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
@@ -466,6 +496,7 @@ def test_day_position_force_closed_at_eod_flatten_time_even_without_exit_signal(
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=100.5)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.5))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.is_day_trade_flatten_time", return_value=True), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
@@ -489,6 +520,7 @@ def test_swing_position_not_force_closed_at_eod_flatten_time(trade_journal) -> N
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=100.5)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.5))), \
         patch("main.is_day_trade_flatten_time", return_value=True), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
@@ -513,7 +545,9 @@ def test_process_symbol_opens_day_position_with_day_specific_risk_per_share(trad
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
             "main.place_dry_run_order_async",
             new=AsyncMock(
@@ -678,6 +712,7 @@ def test_main_continues_after_unexpected_exception_in_cycle() -> None:
         patch("main.is_regular_trading_hours", return_value=True), \
         patch("main._refresh_watchlist_async", new=AsyncMock(return_value=["AAPL"])), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
             "main.run_watchlist_cycle_async", new=AsyncMock(side_effect=RuntimeError("boom")),
         ) as mock_cycle, \
@@ -849,6 +884,7 @@ def test_resting_stop_order_closes_the_position_without_a_market_order(trade_jou
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=85.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(85.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order, \
         patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()) as mock_cancel:
@@ -878,6 +914,7 @@ def test_resting_limit_order_closes_position_at_the_take_profit_price(trade_jour
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=115.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(115.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
@@ -908,6 +945,7 @@ def test_trailing_stop_cancels_resting_orders_before_selling_at_market(trade_jou
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=102.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(102.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order, \
         patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()) as mock_cancel:
@@ -930,6 +968,7 @@ def test_eod_flatten_cancels_resting_orders_before_selling_at_market(trade_journ
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=100.5)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.5))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.is_day_trade_flatten_time", return_value=True), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order, \
@@ -952,6 +991,7 @@ def test_broker_synced_position_without_resting_orders_still_exits_on_signal(tra
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
 
@@ -978,7 +1018,9 @@ def test_entry_is_skipped_for_a_symbol_already_closed_today(trade_journal) -> No
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.place_dry_run_bracket_order_async", new=AsyncMock()) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
@@ -1002,7 +1044,9 @@ def test_cooldown_does_not_block_other_symbols(trade_journal) -> None:
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
             "main.place_dry_run_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=250, symbol="MSFT")),
@@ -1056,7 +1100,9 @@ def test_entry_is_blocked_after_the_daily_order_limit(trade_journal) -> None:
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.place_dry_run_bracket_order_async", new=AsyncMock()) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
@@ -1083,7 +1129,9 @@ def test_entry_is_allowed_just_below_the_daily_order_limit(trade_journal) -> Non
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
             "main.place_dry_run_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=250)),
@@ -1115,6 +1163,7 @@ def test_daily_order_limit_does_not_block_exits(trade_journal) -> None:
 
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()), \
         patch(
@@ -1146,7 +1195,9 @@ def test_market_filter_blocks_entry_when_drop_is_market_wide(trade_journal) -> N
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.place_dry_run_bracket_order_async", new=AsyncMock()) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
@@ -1169,7 +1220,9 @@ def test_market_index_is_not_fetched_while_filter_is_disabled(trade_journal) -> 
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=_make_daily_df(drop=True))), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
             "main.place_dry_run_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=250)),
@@ -1218,3 +1271,222 @@ def test_refresh_watchlist_passes_the_price_cap_to_the_screener() -> None:
 
     config = mock_screen.await_args.args[1]
     assert config.max_price == pytest.approx(1220.0 * RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT)
+
+
+# --- 決済済み現金による新規建ての制限（GFV回避） -------------------------------------
+#
+# キャッシュ口座では、未受渡しの売却代金で建てた建玉を受渡し(T+1)前に売ると
+# Good Faith Violationになる。利確・損切りはブローカー側の待機注文なので
+# 「当日中に決済されるかどうか」はボット側で選べない。よって唯一の止めどころは
+# 「未受渡しの資金で建てさせない」ことであり、以下はその入口を固定するテスト。
+
+
+def _entry_patches(*, price: float, equity: float, settled_cash):
+    """新規エントリーが成立する最小構成のパッチ一式を返す。"""
+    contract = MagicMock(symbol="AAPL")
+    return contract, [
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)),
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=_make_daily_df(drop=True))),
+        patch("main.get_current_price_async", new=AsyncMock(return_value=price)),
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(price))),
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=equity)),
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=settled_cash)),
+    ]
+
+
+def _run_entry(trade_journal, *, price: float, equity: float, settled_cash):
+    """エントリー処理を1回流し、発注モックとPositionManagerを返す。"""
+    contract, patches = _entry_patches(price=price, equity=equity, settled_cash=settled_cash)
+    position_manager = PositionManager()
+    ib = MagicMock()
+
+    with patch(
+        "main.place_dry_run_bracket_order_async",
+        new=AsyncMock(return_value=_bracket_result(quantity=1)),
+    ) as mock_order:
+        for p in patches:
+            p.start()
+        try:
+            asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+        finally:
+            for p in patches:
+                p.stop()
+
+    return mock_order, position_manager
+
+
+def test_entry_quantity_is_capped_by_settled_cash(trade_journal) -> None:
+    """リスク計算上の数量より決済済み現金が少なければ、買える株数まで切り下げること。
+
+    サイジングの基準であるNetLiquidationは未受渡しの代金を含むため、
+    そのまま使うと「まだ手元に無い現金」を当てにした数量になる。
+    """
+    # equity=100,000 / price=80 -> リスク計算では250株だが、
+    # 決済済み現金は800ドルしかないので10株しか買えない。
+    mock_order, _ = _run_entry(trade_journal, price=80.0, equity=100_000.0, settled_cash=800.0)
+
+    assert mock_order.await_args.kwargs["quantity"] == 10
+
+
+def test_entry_is_skipped_when_settled_cash_cannot_buy_one_share(trade_journal) -> None:
+    mock_order, position_manager = _run_entry(
+        trade_journal, price=80.0, equity=100_000.0, settled_cash=79.99,
+    )
+
+    mock_order.assert_not_awaited()
+    assert position_manager.has_position("AAPL") is False
+
+
+def test_entry_is_skipped_when_settled_cash_is_unavailable(trade_journal) -> None:
+    """決済済み現金が取得できない場合は建てないこと（安全側に倒す）。
+
+    素通しすると、資金の裏付けを確認できないままGFVを踏みうる注文を出す。
+    """
+    mock_order, position_manager = _run_entry(
+        trade_journal, price=80.0, equity=100_000.0, settled_cash=None,
+    )
+
+    mock_order.assert_not_awaited()
+    assert position_manager.has_position("AAPL") is False
+
+
+def test_entry_is_not_capped_when_settled_cash_covers_the_full_size(trade_journal) -> None:
+    """現金が足りているときにリスク計算の数量を変えないこと。"""
+    mock_order, _ = _run_entry(
+        trade_journal, price=80.0, equity=100_000.0, settled_cash=100_000.0,
+    )
+
+    # risk_amount=1,000 / per_share_risk=4.0 -> 250株のまま
+    assert mock_order.await_args.kwargs["quantity"] == 250
+
+
+def test_settled_cash_is_not_fetched_while_the_funding_check_is_disabled(trade_journal) -> None:
+    """ENFORCE_SETTLED_CASH_FUNDING=Falseなら口座への問い合わせ自体を行わないこと。"""
+    contract = MagicMock(symbol="AAPL")
+    settled_cash_mock = AsyncMock(return_value=100_000.0)
+
+    with patch("main.ENFORCE_SETTLED_CASH_FUNDING", False), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=_make_daily_df(drop=True))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=settled_cash_mock), \
+        patch(
+            "main.place_dry_run_bracket_order_async",
+            new=AsyncMock(return_value=_bracket_result(quantity=250)),
+        ) as mock_order:
+
+        asyncio.run(process_symbol_async(MagicMock(), "AAPL", PositionManager(), trade_journal))
+
+    settled_cash_mock.assert_not_awaited()
+    assert mock_order.await_args.kwargs["quantity"] == 250
+
+
+def test_max_affordable_price_is_capped_by_settled_cash() -> None:
+    """1株の値段が決済済み現金を超える銘柄は、監視枠を与えても買えないこと。"""
+    equity = 100_000.0
+    # 資金ベースの上限は 100,000 * (1% / 5%) = 20,000ドル。
+    # 決済済み現金がそれを下回るなら、そちらが実際の上限になる。
+    assert resolve_max_affordable_price(equity, 500.0) == pytest.approx(500.0)
+
+
+def test_max_affordable_price_ignores_settled_cash_when_it_is_larger() -> None:
+    equity = 1220.0
+    expected = equity * RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT
+    assert resolve_max_affordable_price(equity, 100_000.0) == pytest.approx(expected)
+
+
+def test_max_affordable_price_ignores_unavailable_settled_cash() -> None:
+    """決済済み現金が取れないときに上限を狭めないこと。
+
+    ここで絞ると全銘柄が除外されてウォッチリストが空になる。実際に建てられるかは
+    エントリー時に再判定するため、絞り込みを外しても未受渡し資金では建たない。
+    """
+    equity = 1220.0
+    expected = equity * RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT
+    assert resolve_max_affordable_price(equity, None) == pytest.approx(expected)
+    assert resolve_max_affordable_price(equity, 0.0) == pytest.approx(expected)
+
+
+# --- 古い価格での新規建ての抑止 -------------------------------------------------------
+#
+# 参照価格が古いと、そこから算出する損切り・利確の値段まで実勢からずれる。
+# order_manager の値段の妥当性検証は参照価格を基準に測っているため、
+# 参照価格そのものがずれているケースはそちらでは検出できない。
+
+
+def _stale_quote(price: float) -> PriceQuote:
+    return PriceQuote(price=price, source=PRICE_SOURCE_HISTORICAL, is_stale=True)
+
+
+def _run_entry_with_quote(trade_journal, quote, *, reject_stale: bool = True):
+    contract = MagicMock(symbol="AAPL")
+    position_manager = PositionManager()
+
+    with patch("main.REJECT_STALE_ENTRY_PRICE", reject_stale), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=_make_daily_df(drop=True))), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=quote)), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
+        patch(
+            "main.place_dry_run_bracket_order_async",
+            new=AsyncMock(return_value=_bracket_result(quantity=250)),
+        ) as mock_order:
+
+        asyncio.run(process_symbol_async(MagicMock(), "AAPL", position_manager, trade_journal))
+
+    return mock_order, position_manager
+
+
+def test_entry_is_skipped_when_the_reference_price_is_stale(trade_journal) -> None:
+    mock_order, position_manager = _run_entry_with_quote(trade_journal, _stale_quote(80.0))
+
+    mock_order.assert_not_awaited()
+    assert position_manager.has_position("AAPL") is False
+
+
+def test_entry_proceeds_when_the_reference_price_is_fresh(trade_journal) -> None:
+    mock_order, position_manager = _run_entry_with_quote(trade_journal, _fresh_quote(80.0))
+
+    mock_order.assert_awaited_once()
+    assert position_manager.has_position("AAPL") is True
+
+
+def test_stale_price_can_be_allowed_by_the_flag(trade_journal) -> None:
+    """フラグを落とせば従来どおり建てられること（取得経路の想定が外れたときの逃げ道）。"""
+    mock_order, position_manager = _run_entry_with_quote(
+        trade_journal, _stale_quote(80.0), reject_stale=False,
+    )
+
+    mock_order.assert_awaited_once()
+    assert position_manager.has_position("AAPL") is True
+
+
+def test_stale_price_does_not_block_exits(trade_journal) -> None:
+    """決済判定は古い価格でも走らせること。
+
+    見送ると損切りが必要な場面で何もしないことになり、新規建てを
+    見送るのとは危険の向きが逆になる。決済はget_current_price_asyncを使い、
+    鮮度を見ないことをここで固定する。
+    """
+    position_manager = PositionManager()
+    position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=10, risk_per_share=5.0,
+        strategy_type=STRATEGY_TYPE_SWING,
+    )
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch(
+            "main.place_dry_run_order_async",
+            new=AsyncMock(return_value=DryRunOrderResult("AAPL", "SELL", 10, "MKT")),
+        ) as mock_order:
+
+        asyncio.run(process_symbol_async(MagicMock(), "AAPL", position_manager, trade_journal))
+
+    # -10%で損切り水準に達しているため決済されること。
+    mock_order.assert_awaited_once()
+    assert position_manager.has_position("AAPL") is False

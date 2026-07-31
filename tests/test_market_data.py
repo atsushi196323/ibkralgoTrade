@@ -1,13 +1,19 @@
 """data/market_data.py の単体テスト（IB呼び出しはすべてモック化）。"""
 
 import asyncio
+from datetime import date, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
 import pytest
 
+from core.market_hours import US_EASTERN
 from data.market_data import (
+    PRICE_SOURCE_HISTORICAL,
+    PRICE_SOURCE_SNAPSHOT,
+    PRICE_SOURCE_STREAMING,
     get_current_price_async,
+    get_current_price_quote_async,
     get_historical_bars_async,
     get_historical_pacer,
     get_intraday_bars_async,
@@ -335,3 +341,148 @@ def test_every_historical_caller_shares_one_pacer() -> None:
     asyncio.run(run())
 
     assert pacer.used_in_window() == 2
+
+
+# --- 価格の鮮度 -------------------------------------------------------------------
+#
+# フォールバック連鎖の下位（ティッカーのclose・ヒストリカル最終終値）は前営業日の
+# 終値を返しうる。価格だけを返していると呼び出し側から区別できず、その値を参照価格に
+# したブラケットが実勢からずれた値段で並ぶ。PriceQuote.is_stale がその唯一の手がかり。
+
+
+def _eastern(year: int, month: int, day: int, hour: int = 12) -> datetime:
+    return datetime(year, month, day, hour, tzinfo=US_EASTERN)
+
+
+def test_streaming_price_is_marked_fresh() -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib(streaming_ticker=_make_ticker(market_price=151.0, close=149.5))
+
+    quote = asyncio.run(
+        get_current_price_quote_async(ib, contract, streaming_timeout_seconds=0.0)
+    )
+
+    assert quote.price == 151.0
+    assert quote.source == PRICE_SOURCE_STREAMING
+    assert quote.is_stale is False
+
+
+def test_ticker_close_fallback_is_marked_stale() -> None:
+    """marketPrice()が取れずcloseへ落ちた時点で、値は前営業日の終値である。"""
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib(snapshot_ticker=_make_ticker(market_price=float("nan"), close=149.5))
+
+    quote = asyncio.run(
+        get_current_price_quote_async(ib, contract, streaming_timeout_seconds=0.0)
+    )
+
+    assert quote.price == 149.5
+    assert quote.source == PRICE_SOURCE_SNAPSHOT
+    assert quote.is_stale is True
+
+
+def test_historical_fallback_is_fresh_when_the_last_bar_is_today() -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib()
+    bars = pd.DataFrame({
+        "date": [date(2026, 7, 30), date(2026, 7, 31)],
+        "close": [149.0, 152.5],
+    })
+
+    with patch("data.market_data.get_historical_bars_async", new=AsyncMock(return_value=bars)):
+        quote = asyncio.run(
+            get_current_price_quote_async(
+                ib, contract, streaming_timeout_seconds=0.0, now=_eastern(2026, 7, 31),
+            )
+        )
+
+    assert quote.price == 152.5
+    assert quote.source == PRICE_SOURCE_HISTORICAL
+    assert quote.is_stale is False
+
+
+def test_historical_fallback_is_stale_when_the_last_bar_is_an_earlier_day() -> None:
+    """休場明けやギャップ後に前営業日の終値を掴んだケース。"""
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib()
+    bars = pd.DataFrame({
+        "date": [date(2026, 7, 29), date(2026, 7, 30)],
+        "close": [149.0, 152.5],
+    })
+
+    with patch("data.market_data.get_historical_bars_async", new=AsyncMock(return_value=bars)):
+        quote = asyncio.run(
+            get_current_price_quote_async(
+                ib, contract, streaming_timeout_seconds=0.0, now=_eastern(2026, 7, 31),
+            )
+        )
+
+    assert quote.price == 152.5
+    assert quote.is_stale is True
+
+
+def test_historical_fallback_is_stale_when_the_bar_date_is_unreadable() -> None:
+    """日付が読めないときは古い側に倒すこと。
+
+    新しい側に倒すと、鮮度検証が黙って素通しになったことに気付けない。
+    """
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib()
+
+    with patch(
+        "data.market_data.get_historical_bars_async",
+        new=AsyncMock(return_value=pd.DataFrame({"close": [152.5]})),
+    ):
+        quote = asyncio.run(
+            get_current_price_quote_async(
+                ib, contract, streaming_timeout_seconds=0.0, now=_eastern(2026, 7, 31),
+            )
+        )
+
+    assert quote.price == 152.5
+    assert quote.is_stale is True
+
+
+def test_bar_date_is_normalized_from_timestamps_and_strings() -> None:
+    """ib_insyncはbarSize次第でdate/datetime/文字列のいずれも返す。"""
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib()
+
+    for value in (
+        pd.Timestamp("2026-07-31"),
+        datetime(2026, 7, 31, 16, 0),
+        "2026-07-31",
+    ):
+        bars = pd.DataFrame({"date": [value], "close": [152.5]})
+        with patch("data.market_data.get_historical_bars_async", new=AsyncMock(return_value=bars)):
+            quote = asyncio.run(
+                get_current_price_quote_async(
+                    ib, contract, streaming_timeout_seconds=0.0, now=_eastern(2026, 7, 31),
+                )
+            )
+        assert quote.is_stale is False, f"{value!r} を当日として解釈できていない"
+
+
+def test_get_current_price_async_still_returns_a_plain_price() -> None:
+    """既存の呼び出し側（決済判定・為替レート）の戻り値を変えていないこと。"""
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib(streaming_ticker=_make_ticker(market_price=151.0, close=149.5))
+
+    price = asyncio.run(get_current_price_async(ib, contract, streaming_timeout_seconds=0.0))
+
+    assert price == 151.0
+
+
+def test_quote_is_none_when_every_route_fails() -> None:
+    contract = MagicMock(symbol="AAPL")
+    ib = _make_ib()
+
+    with patch(
+        "data.market_data.get_historical_bars_async",
+        new=AsyncMock(return_value=pd.DataFrame()),
+    ):
+        quote = asyncio.run(
+            get_current_price_quote_async(ib, contract, streaming_timeout_seconds=0.0)
+        )
+
+    assert quote is None

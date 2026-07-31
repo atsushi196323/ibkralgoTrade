@@ -23,7 +23,6 @@ MARKET_DEVIATION_COLUMN: str = "market_deviation_pct"
 _DATE_COLUMN: str = "date"
 _CLOSE_COLUMN: str = "close"
 
-# 指数の乖離率を測る移動平均の既定期間。
 DEFAULT_MARKET_MA_WINDOW: int = 30
 
 

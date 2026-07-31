@@ -3,12 +3,15 @@
 import asyncio
 import logging
 import math
-from typing import Optional
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Optional, Tuple
 
 import pandas as pd
 from ib_insync import IB, Contract, Forex, Stock
 from ib_insync import util as ib_util
 
+from core.market_hours import US_EASTERN
 from core.pacing import RequestPacer
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,28 @@ _FALLBACK_BAR_SIZE: str = "1 day"
 _FOREX_SEC_TYPE: str = "CASH"
 _FOREX_WHAT_TO_SHOW: str = "MIDPOINT"
 
+PRICE_SOURCE_STREAMING: str = "streaming"
+PRICE_SOURCE_SNAPSHOT: str = "snapshot"
+PRICE_SOURCE_HISTORICAL: str = "historical"
+
+
+@dataclass(frozen=True)
+class PriceQuote:
+    """現在価格と、その値がどこから来たか・当日のものかを併せて表す。
+
+    価格だけを返していると、フォールバック連鎖の下位（ティッカーのclose、
+    ヒストリカル最終終値）が返した**前営業日の値**を「現在価格」として
+    受け取ってしまい、呼び出し側から区別できない。注文の値段はこの価格を
+    基準に算出されるため、古い値を掴んだまま発注すると、値段の妥当性検証
+    (order_manager.MAX_ORDER_PRICE_DEVIATION_PCT)も参照価格自体がずれている
+    以上すり抜ける。
+    """
+
+    price: float
+    source: str
+    # 当日の取引セッション由来でないと判定された値かどうか。
+    is_stale: bool
+
 
 async def qualify_stock_async(
     ib: IB,
@@ -68,24 +93,53 @@ def _to_usable_price(value: object) -> Optional[float]:
     return price
 
 
-def _extract_ticker_price(ticker: object) -> Optional[float]:
-    """Tickerから現在価格として使える値を取り出す（marketPrice優先、無ければclose）。
+def _extract_ticker_price(ticker: object) -> Optional[Tuple[float, bool]]:
+    """Tickerから (価格, 古い値か) を取り出す（marketPrice優先、無ければclose）。
 
     ib_insyncのmarketPrice()は「bid/askの範囲内にあるlast、無ければ仲値」を返すが、
     どちらも未取得ならNaNになるため、その場合は前日終値(close)にフォールバックする。
+
+    Tickerのcloseは名前のとおり**前営業日の終値**であり、当日の値動きを
+    まったく反映しない。marketPrice()が取れなかった＝ティックが届いていない
+    ということなので、この経路に落ちた時点で値は古いものとして扱う。
     """
     try:
         price = _to_usable_price(ticker.marketPrice())
     except Exception:  # marketPrice()自体が失敗するケース（データ未受信時等）
         price = None
     if price is not None:
-        return price
-    return _to_usable_price(getattr(ticker, "close", None))
+        return price, False
+
+    close = _to_usable_price(getattr(ticker, "close", None))
+    if close is None:
+        return None
+    return close, True
+
+
+def _to_bar_date(value: object) -> Optional[date]:
+    """バーの日付欄をdateへ正規化する。解釈できなければNone。
+
+    ib_insyncのDataFrame変換はbarSizeに応じてdate/datetime/文字列のいずれも
+    返しうるため、鮮度判定の前にここで型を吸収する。
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value).date()
+        except ValueError:
+            return None
+    try:
+        return pd.Timestamp(value).date()
+    except (TypeError, ValueError):
+        return None
 
 
 async def _get_streaming_price_async(
     ib: IB, contract: Contract, timeout_seconds: float,
-) -> Optional[float]:
+) -> Optional[Tuple[float, bool]]:
     """reqMktData(snapshot=False)のストリーミング購読から現在価格を取得する。
 
     スナップショット要求(reqTickersAsync)と違い、遅延データ
@@ -105,9 +159,9 @@ async def _get_streaming_price_async(
         for attempt in range(polls):
             if attempt > 0:
                 await asyncio.sleep(STREAMING_POLL_INTERVAL_SECONDS)
-            price = _extract_ticker_price(ticker)
-            if price is not None:
-                return price
+            extracted = _extract_ticker_price(ticker)
+            if extracted is not None:
+                return extracted
         return None
     finally:
         try:
@@ -116,7 +170,7 @@ async def _get_streaming_price_async(
             logger.debug("%s のストリーミング購読の解除に失敗しました。", contract.symbol)
 
 
-async def _get_snapshot_price_async(ib: IB, contract: Contract) -> Optional[float]:
+async def _get_snapshot_price_async(ib: IB, contract: Contract) -> Optional[Tuple[float, bool]]:
     """reqTickersAsync（内部でsnapshot=Trueを使う）から現在価格を取得する。
 
     IBKRはスナップショット要求に遅延データを適用しないため、リアルタイム
@@ -134,12 +188,21 @@ async def _get_snapshot_price_async(ib: IB, contract: Contract) -> Optional[floa
     return _extract_ticker_price(tickers[0])
 
 
-async def _get_last_close_price_async(ib: IB, contract: Contract) -> Optional[float]:
+async def _get_last_close_price_async(
+    ib: IB, contract: Contract, now: Optional[datetime] = None,
+) -> Optional[Tuple[float, bool]]:
     """ヒストリカルバーの最終終値を現在価格の代わりに使う。
 
     マーケットデータの購読権限が全く無い口座でも、ヒストリカルデータだけは
     取得できることが多いため、最後の砦として用意している。ただし値は
     リアルタイムではない（直近の営業日の終値）点に注意。
+
+    最終バーの日付が米国東部時間の今日と一致するかで鮮度を判定する。取引時間中は
+    当日の（まだ確定していない）バーが最後に並ぶため、一致しなければ当日のデータが
+    取れていない＝休場明けや連休明けに前営業日の終値を掴んだ状態を意味する。
+
+    日付が読めない場合は**古いものとして扱う**。分からないものを新しい側に
+    倒すと、鮮度検証が黙って素通しになったことに気付けない。
     """
     what_to_show = (
         _FOREX_WHAT_TO_SHOW if getattr(contract, "secType", None) == _FOREX_SEC_TYPE else "TRADES"
@@ -157,7 +220,65 @@ async def _get_last_close_price_async(ib: IB, contract: Contract) -> Optional[fl
 
     if df.empty or "close" not in df.columns:
         return None
-    return _to_usable_price(df["close"].iloc[-1])
+
+    price = _to_usable_price(df["close"].iloc[-1])
+    if price is None:
+        return None
+
+    today = (now.astimezone(US_EASTERN) if now is not None else datetime.now(US_EASTERN)).date()
+    bar_date = _to_bar_date(df["date"].iloc[-1]) if "date" in df.columns else None
+    if bar_date is None:
+        logger.warning(
+            "%s のヒストリカルバーに解釈できる日付が無いため、価格を古いものとして扱います。",
+            contract.symbol,
+        )
+        return price, True
+
+    return price, bar_date != today
+
+
+async def get_current_price_quote_async(
+    ib: IB,
+    contract: Contract,
+    streaming_timeout_seconds: float = STREAMING_TIMEOUT_SECONDS,
+    allow_historical_fallback: bool = True,
+    now: Optional[datetime] = None,
+) -> Optional[PriceQuote]:
+    """現在価格を、取得経路と鮮度の判定を添えて返す。
+
+    経路の順序と意味は get_current_price_async のdocstringを参照。
+    値段を新規に決める用途（発注の参照価格など）では、価格だけを返す
+    get_current_price_async ではなくこちらを使い、is_stale を必ず見ること。
+    """
+    extracted = await _get_streaming_price_async(ib, contract, streaming_timeout_seconds)
+    source = PRICE_SOURCE_STREAMING
+
+    if extracted is None:
+        extracted = await _get_snapshot_price_async(ib, contract)
+        source = PRICE_SOURCE_SNAPSHOT
+
+    if extracted is None and allow_historical_fallback:
+        extracted = await _get_last_close_price_async(ib, contract, now=now)
+        source = PRICE_SOURCE_HISTORICAL
+
+    if extracted is None:
+        logger.warning(
+            "%s の現在価格をどの経路でも取得できませんでした"
+            "（ストリーミング/スナップショット/ヒストリカル）。",
+            contract.symbol,
+        )
+        return None
+
+    price, is_stale = extracted
+    if is_stale:
+        logger.warning(
+            "%s の現在価格 %s は当日のものではない可能性があります（経路: %s）。",
+            contract.symbol, price, source,
+        )
+    else:
+        logger.info("%s の現在価格: %s (%s)", contract.symbol, price, source)
+
+    return PriceQuote(price=price, source=source, is_stale=is_stale)
 
 
 async def get_current_price_async(
@@ -182,31 +303,19 @@ async def get_current_price_async(
             IBKRのペーシング制限（10分あたり60件）を消費するため、多数の銘柄を
             高頻度でポーリングする場合はFalseにして呼び出し側で制御すること。
 
+    **この関数は鮮度を捨てる。** 下位の経路は前営業日の終値を返しうるが、
+    戻り値がfloatだけなので呼び出し側から区別できない。発注の参照価格のように
+    「古い値だと困る」用途では get_current_price_quote_async を使うこと。
+
     Returns:
         取得できた価格。すべての経路が失敗した場合はNone。
     """
-    price = await _get_streaming_price_async(ib, contract, streaming_timeout_seconds)
-    if price is not None:
-        logger.info("%s の現在価格: %s (ストリーミング)", contract.symbol, price)
-        return price
-
-    price = await _get_snapshot_price_async(ib, contract)
-    if price is not None:
-        logger.info("%s の現在価格: %s (スナップショット)", contract.symbol, price)
-        return price
-
-    if allow_historical_fallback:
-        price = await _get_last_close_price_async(ib, contract)
-        if price is not None:
-            logger.info("%s の現在価格: %s (ヒストリカル最終終値)", contract.symbol, price)
-            return price
-
-    logger.warning(
-        "%s の現在価格をどの経路でも取得できませんでした"
-        "（ストリーミング/スナップショット/ヒストリカル）。",
-        contract.symbol,
+    quote = await get_current_price_quote_async(
+        ib, contract,
+        streaming_timeout_seconds=streaming_timeout_seconds,
+        allow_historical_fallback=allow_historical_fallback,
     )
-    return None
+    return quote.price if quote is not None else None
 
 
 async def get_usd_jpy_rate_async(
