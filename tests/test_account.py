@@ -95,7 +95,7 @@ def test_raises_when_tag_not_found() -> None:
         asyncio.run(get_account_equity_async(ib))
 
 
-# --- 決済済み現金（GFV回避の資金判定に使う） -------------------------------------
+# --- 決済済み現金（新規建ての資金の裏付け判定に使う） -----------------------------
 
 
 def test_returns_settled_cash() -> None:

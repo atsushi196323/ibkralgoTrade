@@ -60,6 +60,26 @@ def _fmt(price: Optional[float]) -> str:
     return "取得失敗(None/NaN)" if not _is_valid(price) else f"{price:.4f}"
 
 
+def _unwrap(quote: Optional[Tuple[float, bool]]) -> Tuple[Optional[float], bool]:
+    """低レベル経路が返す (価格, is_stale) を分解する。
+
+    株の3経路は鮮度判定のためにタプルを返すが、Forexは価格だけを返す。
+    """
+    if quote is None:
+        return None, False
+    price, is_stale = quote
+    return price, is_stale
+
+
+def _fmt_quote(quote: Optional[Tuple[float, bool]]) -> str:
+    price, is_stale = _unwrap(quote)
+    if not _is_valid(price):
+        return "取得失敗(None/NaN)"
+    # 古い値（前営業日の終値）を掴んでいると、新規建ての参照価格としては
+    # REJECT_STALE_ENTRY_PRICE に弾かれるため、価格が取れたことと同列に見せない。
+    return f"{price:.4f}" + ("  ⚠️ 古い値(前営業日の終値)" if is_stale else "")
+
+
 def _on_error(reqId: int, errorCode: int, errorString: str, contract) -> None:
     # 2104/2106/2158 等の「接続OK」通知は情報レベルなので区別して表示する。
     if 2100 <= errorCode < 2200:
@@ -69,7 +89,9 @@ def _on_error(reqId: int, errorCode: int, errorString: str, contract) -> None:
     logger.error("  [IBKRエラー %s] %s", errorCode, errorString)
 
 
-async def _check_streaming(ib: IB, contract: Contract, wait_seconds: float) -> Optional[float]:
+async def _check_streaming(
+    ib: IB, contract: Contract, wait_seconds: float,
+) -> Optional[Tuple[float, bool]]:
     """A: フォールバック連鎖の1段目。snapshot=Falseのストリーミング購読。"""
     print(f"\n--- A. ストリーミング reqMktData ({wait_seconds:.0f}秒待機) ---")
 
@@ -86,25 +108,25 @@ async def _check_streaming(ib: IB, contract: Contract, wait_seconds: float) -> O
         ib.cancelMktData(contract)
 
     # 本番と同じコードパスでも判定する
-    price = await _get_streaming_price_async(ib, contract, wait_seconds)
-    print(f"  結果: {_fmt(price)}")
-    return price
+    quote = await _get_streaming_price_async(ib, contract, wait_seconds)
+    print(f"  結果: {_fmt_quote(quote)}")
+    return quote
 
 
-async def _check_snapshot(ib: IB, contract: Contract) -> Optional[float]:
+async def _check_snapshot(ib: IB, contract: Contract) -> Optional[Tuple[float, bool]]:
     """B: 2段目。reqTickersAsyncは内部でsnapshot=Trueを使う。"""
     print("\n--- B. スナップショット reqTickersAsync ---")
-    price = await _get_snapshot_price_async(ib, contract)
-    print(f"  結果: {_fmt(price)}")
-    return price
+    quote = await _get_snapshot_price_async(ib, contract)
+    print(f"  結果: {_fmt_quote(quote)}")
+    return quote
 
 
-async def _check_historical(ib: IB, contract: Contract) -> Optional[float]:
+async def _check_historical(ib: IB, contract: Contract) -> Optional[Tuple[float, bool]]:
     """C: 3段目。ヒストリカルバーの最終終値を現在値の代わりに使う。"""
     print("\n--- C. ヒストリカル日足の最終終値 ---")
-    price = await _get_last_close_price_async(ib, contract)
-    print(f"  結果: {_fmt(price)}")
-    return price
+    quote = await _get_last_close_price_async(ib, contract)
+    print(f"  結果: {_fmt_quote(quote)}")
+    return quote
 
 
 async def _check_forex(ib: IB, wait_seconds: float) -> Optional[float]:
@@ -120,15 +142,16 @@ async def _check_forex(ib: IB, wait_seconds: float) -> Optional[float]:
 
 
 def _print_verdict(
-    symbol: str, streaming: Optional[float], snapshot: Optional[float],
-    historical: Optional[float], forex: Optional[float],
+    symbol: str, streaming: Optional[Tuple[float, bool]],
+    snapshot: Optional[Tuple[float, bool]],
+    historical: Optional[Tuple[float, bool]], forex: Optional[float],
 ) -> None:
     print("\n" + "=" * 70)
     print(f"診断結果 ({symbol})")
     print("=" * 70)
-    print(f"  A. ストリーミング   : {_fmt(streaming)}")
-    print(f"  B. スナップショット : {_fmt(snapshot)}")
-    print(f"  C. ヒストリカル終値 : {_fmt(historical)}")
+    print(f"  A. ストリーミング   : {_fmt_quote(streaming)}")
+    print(f"  B. スナップショット : {_fmt_quote(snapshot)}")
+    print(f"  C. ヒストリカル終値 : {_fmt_quote(historical)}")
     print(f"  D. USD/JPY          : {_fmt(forex)}")
 
     if _errors:
@@ -138,20 +161,33 @@ def _print_verdict(
     else:
         print("\n  IBKRエラーは検出されませんでした。")
 
+    streaming_price, streaming_stale = _unwrap(streaming)
+    snapshot_price, snapshot_stale = _unwrap(snapshot)
+    historical_price, historical_stale = _unwrap(historical)
+
     print("\n  判定:")
-    if _is_valid(streaming):
+    if _is_valid(streaming_price):
         print("    ✅ 1段目のストリーミングで価格が取れています。最良の状態です。")
-    elif _is_valid(snapshot):
+        adopted_stale = streaming_stale
+    elif _is_valid(snapshot_price):
         print("    ✅ ストリーミングは失敗しましたが、スナップショットで取れています。")
         print("       → ボットは動きますが、なぜ1段目が失敗したかは上のエラーを確認のこと。")
-    elif _is_valid(historical):
+        adopted_stale = snapshot_stale
+    elif _is_valid(historical_price):
         print("    ⚠️  リアルタイム系は両方失敗、ヒストリカル終値のみ成功。")
         print("       → ボットは動きますが、価格が直近営業日の終値になるため")
         print("         デイトレードの判定は実質機能しません。マーケットデータの")
         print("         購読を追加するか、スイング検証に絞ってください。")
+        adopted_stale = historical_stale
     else:
         print("    ❌ すべて失敗。ボットは価格を取得できず何も発注しません。")
         print("       → 上のIBKRエラーコードと、市場時間内に実行したかを確認してください。")
+        adopted_stale = False
+
+    if adopted_stale:
+        print("    ⚠️  採用された価格が古い(前営業日の終値)と判定されています。")
+        print("       → main.REJECT_STALE_ENTRY_PRICE が既定(True)のままだと")
+        print("         新規建ては全件見送られます。決済判定は通常どおり動きます。")
 
     if not _is_valid(forex):
         print("    ⚠️  USD/JPYが取得できていません。円換算(usd_jpy_rate)は記録されません。")

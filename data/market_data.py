@@ -116,6 +116,17 @@ def _extract_ticker_price(ticker: object) -> Optional[Tuple[float, bool]]:
     return close, True
 
 
+def _ticker_update_time(ticker: object) -> Optional[datetime]:
+    """Tickerの最終更新時刻を返す。datetimeとして読めなければNone。
+
+    ib_insyncのTickerは更新のたびにtimeを進める。型が読めない場合
+    （モックや将来の仕様変更）にNoneを返すのは、鮮度を判定できないことを
+    呼び出し側で「判定しない」に倒すため。
+    """
+    value = getattr(ticker, "time", None)
+    return value if isinstance(value, datetime) else None
+
+
 def _to_bar_date(value: object) -> Optional[date]:
     """バーの日付欄をdateへ正規化する。解釈できなければNone。
 
@@ -137,6 +148,34 @@ def _to_bar_date(value: object) -> Optional[date]:
         return None
 
 
+def drop_unconfirmed_today_bars(
+    bars: pd.DataFrame, now: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """当日（米国東部時間）の日付を持つ末尾のバーを取り除く。
+
+    取引時間中のIBKR日足には**まだ確定していない当日のバー**が並ぶ（寄り付き
+    直後を除く。CLAUDE.md「価格の鮮度」の実測表を参照）。この行の終値は
+    現在値と一緒に動くため、シグナル判定に含めると次の2つの問題が出る:
+
+    - 日足を取引日単位でキャッシュする前提（DailyBarCache）が崩れる。その日
+      最初のサイクルで取得した中途半端な値が、確定値であるかのように1日中使われる
+    - 確定した終値で判定しているバックテストと条件が揃わない
+
+    日付が読めない行は残す。判別できないものを消すと、鮮度の判定が
+    できていないことに気付けないまま本数だけが減る。
+    """
+    if bars.empty or "date" not in bars.columns:
+        return bars
+
+    reference = now if now is not None else datetime.now(US_EASTERN)
+    today = reference.astimezone(US_EASTERN).date()
+
+    keep = [_to_bar_date(value) != today for value in bars["date"]]
+    if all(keep):
+        return bars
+    return bars.loc[keep].reset_index(drop=True)
+
+
 async def _get_streaming_price_async(
     ib: IB, contract: Contract, timeout_seconds: float,
 ) -> Optional[Tuple[float, bool]]:
@@ -152,6 +191,14 @@ async def _get_streaming_price_async(
         logger.exception("%s のストリーミング購読の開始に失敗しました。", contract.symbol)
         return None
 
+    # ib_insyncは同じコントラクトに対して**同一のTickerオブジェクト**を返し、
+    # cancelMktDataの後もそこには前回の購読で受け取った値が残る。購読直後に
+    # そのまま読むと、前のサイクルで取得した価格を「現在価格」として返してしまい、
+    # 以後どれだけ市場が動いても値が更新されない（実測: 決済判定が10分以上
+    # 同じ価格で回り続けた）。購読前の更新時刻を控えておき、**新しいティックが
+    # 届いたことを確認してから**採用する。
+    previous_update = _ticker_update_time(ticker)
+
     try:
         # ティックが既に届いていることもあるため、待機の前に1度確認する。
         # timeout_seconds=0 なら待機せず即時判定のみ行う。
@@ -159,9 +206,23 @@ async def _get_streaming_price_async(
         for attempt in range(polls):
             if attempt > 0:
                 await asyncio.sleep(STREAMING_POLL_INTERVAL_SECONDS)
+            if previous_update is not None:
+                current_update = _ticker_update_time(ticker)
+                if current_update is None or current_update <= previous_update:
+                    continue
             extracted = _extract_ticker_price(ticker)
             if extracted is not None:
                 return extracted
+
+        # 使い回しのTickerに値は残っているが更新が来ない場合、その値をそのまま
+        # 返すと古い価格を現在価格として扱うことになる。Noneを返して下位の経路
+        # （スナップショット・ヒストリカル）へ譲る方が、値の出所がはっきりする。
+        if previous_update is not None:
+            logger.warning(
+                "%s のストリーミング購読に新しいティックが %.1f 秒以内に届きませんでした。"
+                "前回取得した価格は古い可能性があるため採用しません。",
+                contract.symbol, timeout_seconds,
+            )
         return None
     finally:
         try:

@@ -1,7 +1,7 @@
 """data/cache.py の単体テスト（IB呼び出しはすべてモック化）。"""
 
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
@@ -101,6 +101,65 @@ def test_empty_daily_bars_are_not_cached() -> None:
     assert mock_fetch.await_count == 2
     assert first.empty
     assert not second.empty
+
+
+def _make_dated_bars(rows: list) -> pd.DataFrame:
+    """(日付, 終値) の並びから日足のDataFrameを作る。"""
+    return pd.DataFrame(
+        {"date": [d for d, _ in rows], "close": [c for _, c in rows]}
+    )
+
+
+def test_unconfirmed_today_bar_is_dropped() -> None:
+    """取引時間中に並ぶ当日の未確定バーを、判定に使わせないこと。
+
+    残すと「その日最初のサイクルで取得した中途半端な終値」が確定値として
+    1日中キャッシュされ、バックテスト（確定終値で判定）とも条件が揃わない。
+    """
+    ib = MagicMock()
+    contract = MagicMock(symbol="AAPL")
+    cache = DailyBarCache()
+    fetched = _make_dated_bars([
+        (date(2026, 7, 29), 10.0),
+        (date(2026, 7, 30), 11.0),
+        (date(2026, 7, 31), 12.0),   # 当日＝未確定
+    ])
+
+    with patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=fetched)):
+        bars = asyncio.run(cache.get_async(ib, contract, now=_et(2026, 7, 31)))
+
+    assert list(bars["close"]) == [10.0, 11.0]
+
+
+def test_confirmed_bars_are_kept_when_the_last_bar_is_not_today() -> None:
+    """当日のバーがまだ現れていない（寄り付き直後）ときは1本も落とさないこと。"""
+    ib = MagicMock()
+    contract = MagicMock(symbol="AAPL")
+    cache = DailyBarCache()
+    fetched = _make_dated_bars([
+        (date(2026, 7, 29), 10.0),
+        (date(2026, 7, 30), 11.0),
+    ])
+
+    with patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=fetched)):
+        bars = asyncio.run(cache.get_async(ib, contract, now=_et(2026, 7, 31)))
+
+    assert list(bars["close"]) == [10.0, 11.0]
+
+
+def test_daily_bars_without_a_date_column_are_passed_through() -> None:
+    """日付が無いデータ源でも本数を減らさないこと（判別できないものは残す）。"""
+    ib = MagicMock()
+    contract = MagicMock(symbol="AAPL")
+    cache = DailyBarCache()
+
+    with patch(
+        "data.cache.get_historical_bars_async",
+        new=AsyncMock(return_value=_make_bars([1.0, 2.0, 3.0])),
+    ):
+        bars = asyncio.run(cache.get_async(ib, contract, now=_et(2026, 7, 31)))
+
+    assert len(bars) == 3
 
 
 def test_daily_bar_cache_uses_configured_duration() -> None:

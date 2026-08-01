@@ -232,6 +232,63 @@ def test_get_current_price_waits_for_streaming_tick_before_giving_up() -> None:
     ib.reqTickersAsync.assert_not_awaited()
 
 
+# --- 現在価格: 使い回しTickerによる価格の凍結 -----------------------------------
+#
+# ib_insyncのreqMktDataは同じコントラクトに対して同一のTickerを返し、
+# cancelMktData後も前回の値を保持する。購読直後にそれを読むと、市場が動いても
+# 永久に同じ価格を返し続ける（実測でボット側の決済判定が凍結した）。
+
+
+def _make_timed_ticker(market_price, close, update_time):
+    ticker = _make_ticker(market_price=market_price, close=close)
+    ticker.time = update_time
+    return ticker
+
+
+def test_streaming_price_is_rejected_when_the_ticker_is_not_updated() -> None:
+    """使い回しのTickerに新しいティックが来なければ、その値を採用しないこと。"""
+    contract = MagicMock(symbol="AAPL")
+    ticker = _make_timed_ticker(
+        market_price=151.0, close=149.5, update_time=datetime(2026, 7, 31, 13, 50),
+    )
+    ib = _make_ib(streaming_ticker=ticker, snapshot_ticker=_make_ticker(150.0, 149.5))
+
+    price = asyncio.run(get_current_price_async(ib, contract, **_NO_WAIT))
+
+    # ストリーミングは見送り、下位の経路（スナップショット）の値になる。
+    assert price == 150.0
+
+
+def test_streaming_price_is_used_when_a_new_tick_arrives() -> None:
+    """購読後に更新時刻が進んだら、その価格を採用すること。"""
+    contract = MagicMock(symbol="AAPL")
+    ticker = _make_timed_ticker(
+        market_price=151.0, close=149.5, update_time=datetime(2026, 7, 31, 13, 50),
+    )
+    ib = _make_ib(streaming_ticker=ticker)
+
+    async def _deliver_tick(_seconds: float) -> None:
+        ticker.time = datetime(2026, 7, 31, 13, 53)
+
+    with patch("data.market_data.asyncio.sleep", new=AsyncMock(side_effect=_deliver_tick)):
+        price = asyncio.run(
+            get_current_price_async(
+                ib, contract, streaming_timeout_seconds=4.0, allow_historical_fallback=False,
+            )
+        )
+
+    assert price == 151.0
+
+
+def test_streaming_price_is_used_when_the_ticker_has_no_update_time() -> None:
+    """更新時刻が読めない場合は鮮度を判定せず、従来どおり値を採用すること。"""
+    contract = MagicMock(symbol="AAPL")
+    # _make_tickerのtimeはMagicMockでdatetimeではない＝「判定できない」状態。
+    ib = _make_ib(streaming_ticker=_make_ticker(market_price=151.0, close=149.5))
+
+    assert asyncio.run(get_current_price_async(ib, contract, **_NO_WAIT)) == 151.0
+
+
 # --- USD/JPY -------------------------------------------------------------------
 
 

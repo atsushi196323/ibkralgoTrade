@@ -7,6 +7,9 @@
 
 - 日足バー: 1取引日に1本しか増えないため、同じ取引日に取り直す意味がない。
   ポーリング間隔(数分)ごとに再取得すると、それだけでペーシング制限を食い潰す。
+  ただし取引時間中の日足には**確定していない当日のバー**が並び、これは現在値と
+  一緒に動く。キャッシュの前提が崩れるため取得時に落としている
+  (market_data.drop_unconfirmed_today_bars)。
 - コントラクト(qualifyContractsAsyncの結果): 銘柄のconId・上場取引所は
   日中に変わらない。
 
@@ -22,7 +25,11 @@ import pandas as pd
 from ib_insync import IB, Contract, Stock
 
 from core.market_hours import US_EASTERN
-from data.market_data import get_historical_bars_async, qualify_stock_async
+from data.market_data import (
+    drop_unconfirmed_today_bars,
+    get_historical_bars_async,
+    qualify_stock_async,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +72,13 @@ class DailyBarCache:
             logger.debug("[%s] 日足バーをキャッシュから返します(%s)。", symbol, trading_date)
             return entry.bars
 
-        bars = await get_historical_bars_async(
+        fetched = await get_historical_bars_async(
             ib, contract, duration=self.duration, bar_size="1 day",
         )
+        # 取引時間中の日足には確定していない当日のバーが並ぶ。これを残すと
+        # 「その日最初のサイクルで取得した中途半端な終値」が確定値として
+        # 1日中キャッシュされ、判定がその時刻の値に固定される。
+        bars = drop_unconfirmed_today_bars(fetched, now=now)
         if not bars.empty:
             self._entries[symbol] = _DailyBarEntry(bars=bars, trading_date=trading_date)
         return bars
