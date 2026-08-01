@@ -1,15 +1,18 @@
 """main.py のオーケストレーションロジックの単体テスト（IB呼び出しはすべてモック化）。"""
 
 import asyncio
+import logging
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
 import pytest
 
 from data.market_data import PRICE_SOURCE_HISTORICAL, PRICE_SOURCE_STREAMING, PriceQuote
-from execution.order_manager import DryRunBracketResult, DryRunOrderResult
+from execution.order_manager import MAX_POSITION_SIZE, DryRunBracketResult, DryRunOrderResult
 from execution.position_manager import PositionManager, STRATEGY_TYPE_DAY, STRATEGY_TYPE_SWING
 from execution.trade_journal import TradeJournal
+from strategy.exit_signal import REASON_STOP_LOSS, REASON_TAKE_PROFIT
 from strategy.pullback import MarketFilterConfig
 from execution.position_sizing import calculate_position_size
 from main import (
@@ -27,6 +30,7 @@ from main import (
     main,
     process_symbol_async,
     resolve_max_affordable_price,
+    resolve_min_tradeable_price,
     run_watchlist_cycle_async,
 )
 
@@ -644,11 +648,28 @@ def test_refresh_watchlist_uses_screening_result_when_available() -> None:
     assert result == ["CHEAP1", "CHEAP2"]
 
 
+@contextmanager
+def _fallback_prices(prices: dict):
+    """フォールバック銘柄の株価を日足キャッシュ経由で与える。"""
+    async def _bars(ib, contract, now=None):
+        price = prices.get(contract.symbol)
+        if price is None:
+            return pd.DataFrame()
+        return _make_df([price] * 5)
+
+    with patch("data.cache.qualify_stock_async",
+               new=AsyncMock(side_effect=lambda ib, symbol: MagicMock(symbol=symbol))), \
+        patch("data.cache.DailyBarCache.get_async", new=AsyncMock(side_effect=_bars)):
+        yield
+
+
 def test_refresh_watchlist_falls_back_when_screening_returns_empty() -> None:
     ib = MagicMock()
 
-    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])):
-        result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"], account_equity=100_000.0))
+    # 資金1,220の取引可能帯は $24.40〜$244。FALLBACKはその中に入れる。
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
+        _fallback_prices({"FALLBACK": 100.0}):
+        result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"], account_equity=1220.0))
 
     assert result == ["FALLBACK"]
 
@@ -656,10 +677,94 @@ def test_refresh_watchlist_falls_back_when_screening_returns_empty() -> None:
 def test_refresh_watchlist_falls_back_when_screening_raises() -> None:
     ib = MagicMock()
 
-    with patch("main.screen_value_stocks_async", new=AsyncMock(side_effect=RuntimeError("boom"))):
-        result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"], account_equity=100_000.0))
+    with patch("main.screen_value_stocks_async", new=AsyncMock(side_effect=RuntimeError("boom"))), \
+        _fallback_prices({"FALLBACK": 100.0}):
+        result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"], account_equity=1220.0))
 
     assert result == ["FALLBACK"]
+
+
+def test_fallback_watchlist_is_filtered_by_the_tradeable_price_band() -> None:
+    """フォールバックの固定リストにも株価帯を掛けること。
+
+    掛けないと、資金額と無関係に書かれた main.WATCHLIST の銘柄がそのまま
+    監視枠に入る。2026-07-30〜07-31のドライランで唯一建った JOBY($7.05)は
+    この経路で入った低位株だった。
+    """
+    ib = MagicMock()
+    prices = {
+        "PENNY": 7.05,     # 下限割れ -> 株数クランプ
+        "NORMAL": 100.0,   # 取引可能
+        "PRICEY": 336.91,  # 上限超え -> 数量0株
+    }
+
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
+        _fallback_prices(prices):
+        result = asyncio.run(_refresh_watchlist_async(
+            ib, ["PENNY", "NORMAL", "PRICEY"], account_equity=1220.0,
+        ))
+
+    assert result == ["NORMAL"]
+
+
+def test_fallback_watchlist_drops_symbols_with_unknown_price() -> None:
+    """株価が取れない銘柄は除外に倒すこと（スクリーナー側と揃える）。"""
+    ib = MagicMock()
+
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
+        _fallback_prices({"NORMAL": 100.0}):
+        result = asyncio.run(_refresh_watchlist_async(
+            ib, ["NORMAL", "NOBARS"], account_equity=1220.0,
+        ))
+
+    assert result == ["NORMAL"]
+
+
+def test_empty_tradeable_band_yields_an_empty_watchlist_not_a_silent_fallback(caplog) -> None:
+    """取引可能な銘柄が1つも無いなら、空で返してERRORを出すこと。
+
+    ここで固定リストをそのまま返すと、買えない銘柄を監視し続ける。
+    資金$100,000では帯が $2,000〜$20,000 になり該当する米国株がほぼ無いため、
+    増資やMAX_POSITION_SIZEの変更でこの状態は現実に起こりうる。
+
+    空にしても保有中のポジションの決済判定は止まらない
+    （run_watchlist_cycle_asyncが保有銘柄との和集合を処理するため）。
+    """
+    ib = MagicMock()
+
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
+        _fallback_prices({"AAPL": 336.91, "MSFT": 389.10}), \
+        caplog.at_level(logging.ERROR):
+        result = asyncio.run(_refresh_watchlist_async(
+            ib, ["AAPL", "MSFT"], account_equity=100_000.0,
+        ))
+
+    assert result == []
+    assert any(record.levelno == logging.ERROR for record in caplog.records)
+
+
+def test_price_band_filter_reuses_the_daily_bar_cache() -> None:
+    """フォールバックの株価判定でIBKRリクエストを増やさないこと。
+
+    ペーシング制限(§6.1)の枠は銘柄あたり毎サイクル1件しか無い。ここで
+    日足を取り直すと、同じ銘柄の日足をこの後のシグナル判定でも取ることになる。
+    """
+    ib = MagicMock()
+    caches = MarketDataCaches()
+    bars = _make_df([100.0] * 5)
+
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
+        patch("data.cache.qualify_stock_async",
+              new=AsyncMock(side_effect=lambda ib, symbol: MagicMock(symbol=symbol))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=bars)) as mock_bars:
+        asyncio.run(_refresh_watchlist_async(
+            ib, ["NORMAL"], account_equity=1220.0, caches=caches,
+        ))
+        # 同じ取引日の2回目はキャッシュから返るため、リクエストは増えない。
+        contract = asyncio.run(caches.contracts.get_async(ib, "NORMAL"))
+        asyncio.run(caches.daily_bars.get_async(ib, contract))
+
+    assert mock_bars.await_count == 1
 
 
 # --- main()のTWS接続維持（切断検知・再接続） ---------------------------------------
@@ -1273,12 +1378,90 @@ def test_refresh_watchlist_passes_the_price_cap_to_the_screener() -> None:
     assert config.max_price == pytest.approx(1220.0 * RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT)
 
 
-# --- 決済済み現金による新規建ての制限（GFV回避） -------------------------------------
+# --- 買える下限株価（株数クランプの回避） --------------------------------------------
+
+
+def test_min_tradeable_price_is_the_boundary_where_the_share_clamp_starts() -> None:
+    """この値を下回るとMAX_POSITION_SIZEのクランプが掛かる、という境界であること。"""
+    equity = 1220.0
+
+    min_price = resolve_min_tradeable_price(equity)
+
+    # $1,220・リスク1%・損切り5%・10株上限なら $24.40。
+    assert min_price == pytest.approx(24.4)
+    # 下限ちょうどではクランプが掛からない（ここが上限側の境界）。
+    assert calculate_position_size(
+        equity, entry_price=min_price, stop_loss_pct=SWING_STOP_LOSS_PCT,
+        risk_per_trade_pct=RISK_PER_TRADE_PCT,
+    ) == MAX_POSITION_SIZE
+    # 下限より上ではクランプに掛かることはない。
+    assert calculate_position_size(
+        equity, entry_price=min_price * 1.1, stop_loss_pct=SWING_STOP_LOSS_PCT,
+        risk_per_trade_pct=RISK_PER_TRADE_PCT,
+    ) < MAX_POSITION_SIZE
+
+
+def test_min_tradeable_price_is_conservative_by_the_rounding_band() -> None:
+    """floor()の分だけ下限が安全側に寄っていること。
+
+    連続量の数量が10.x株になる帯（$1,220なら $22.18〜$24.40）では
+    floor()で10株に落ちるため、実際にはクランプが「効いて」いない。
+    下限をこの帯の上端に置いているので、その分だけ余計に除外する。
+    1銘柄あたり数ドル幅の話であり、クランプが掛かる銘柄を取りこぼすより
+    安全側に倒す方を選んでいる。
+    """
+    equity = 1220.0
+    exact_binding_price = equity * (RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT) / (MAX_POSITION_SIZE + 1)
+
+    assert exact_binding_price < resolve_min_tradeable_price(equity)
+    assert calculate_position_size(
+        equity, entry_price=exact_binding_price, stop_loss_pct=SWING_STOP_LOSS_PCT,
+        risk_per_trade_pct=RISK_PER_TRADE_PCT,
+    ) > MAX_POSITION_SIZE
+
+
+def test_min_tradeable_price_excludes_the_symbol_that_exposed_the_clamp() -> None:
+    """検証で実際にクランプが効いたJOBY($7.05)が下限で弾かれること。"""
+    equity = 1220.0
+
+    assert resolve_min_tradeable_price(equity) > 7.05
+    # 本来34株のところ10株にクランプされていた、という実測の再現。
+    assert calculate_position_size(
+        equity, entry_price=7.05, stop_loss_pct=SWING_STOP_LOSS_PCT,
+        risk_per_trade_pct=RISK_PER_TRADE_PCT,
+    ) == 34
+
+
+def test_min_tradeable_price_is_disabled_when_equity_is_unavailable() -> None:
+    """資金が取れないときは下限も掛けないこと（ウォッチリストが空になる）。"""
+    assert resolve_min_tradeable_price(0.0) is None
+    assert resolve_min_tradeable_price(-1.0) is None
+
+
+def test_min_price_stays_below_max_price() -> None:
+    """上下限が交差せず、監視可能な株価帯が必ず残ること。
+
+    交差するとスクリーニングが常に0件になり、固定ウォッチリストへ
+    静かにフォールバックし続ける。
+    """
+    for equity in (500.0, 1220.0, 6100.0, 100_000.0):
+        assert resolve_min_tradeable_price(equity) < resolve_max_affordable_price(equity)
+
+
+def test_refresh_watchlist_passes_the_price_floor_to_the_screener() -> None:
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=["AAPL"])) as mock_screen:
+        asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"], account_equity=1220.0))
+
+    config = mock_screen.await_args.args[1]
+    assert config.min_price == pytest.approx(24.4)
+
+
+# --- 決済済み現金による新規建ての制限（発注拒否の回避） -----------------------------
 #
-# キャッシュ口座では、未受渡しの売却代金で建てた建玉を受渡し(T+1)前に売ると
-# Good Faith Violationになる。利確・損切りはブローカー側の待機注文なので
-# 「当日中に決済されるかどうか」はボット側で選べない。よって唯一の止めどころは
-# 「未受渡しの資金で建てさせない」ことであり、以下はその入口を固定するテスト。
+# 受渡し(T+1)前の資金では買えず、その状態で発注するとIBKRは約定させずに注文を
+# 拒否する。注文が通った前提でローカルに建玉を記録すると実体の無いポジションを
+# 追跡することになるため、入口で数量を現金の裏付けまで落とす。
+# （GFVは日本居住者向けのIBSJ口座には適用されないため、ここでの関心事ではない。）
 
 
 def _entry_patches(*, price: float, equity: float, settled_cash):
@@ -1344,17 +1527,18 @@ def test_entry_is_skipped_when_settled_cash_cannot_buy_one_share(trade_journal) 
     assert position_manager.has_position("AAPL") is False
 
 
-def test_entry_is_skipped_when_settled_cash_is_unavailable(trade_journal) -> None:
-    """決済済み現金が取得できない場合は建てないこと（安全側に倒す）。
+def test_entry_is_not_blocked_when_settled_cash_is_unavailable(trade_journal) -> None:
+    """決済済み現金が取得できない場合は、数量を変えずに発注すること。
 
-    素通しすると、資金の裏付けを確認できないままGFVを踏みうる注文を出す。
+    判定できないことの実害は注文が拒否されうることに留まる（GFVは適用されない）。
+    ここで止めると、口座種別によるタグの有無だけで新規エントリーが全件停止する。
     """
-    mock_order, position_manager = _run_entry(
+    mock_order, _ = _run_entry(
         trade_journal, price=80.0, equity=100_000.0, settled_cash=None,
     )
 
-    mock_order.assert_not_awaited()
-    assert position_manager.has_position("AAPL") is False
+    # equity=100,000 / price=80 のリスク計算どおりの数量が、切り下げられずに渡ること。
+    assert mock_order.await_args.kwargs["quantity"] == 250
 
 
 def test_entry_is_not_capped_when_settled_cash_covers_the_full_size(trade_journal) -> None:
@@ -1497,3 +1681,125 @@ def test_stale_price_does_not_block_exits(trade_journal) -> None:
     # -10%で損切り水準に達しているため決済されること。
     mock_order.assert_awaited_once()
     assert position_manager.has_position("AAPL") is False
+
+
+# --- 決済経路の結合テスト ---------------------------------------------------------
+
+# ドライラン検証（2026-07-30〜07-31）では決済が1件も発生せず、
+# logs/trade_journal.csv が生成されなかった。ブラケット約定の検知から
+# TradeJournalへの記録・クールダウン登録・日次サーキットブレーカーまでの
+# 連鎖が実運用で一度も通っていないため、実市場を待たずにここで押さえる。
+
+
+@contextmanager
+def _entry_then_price(daily_df: pd.DataFrame, entry_price: float, later_price: float,
+                      quantity: int, symbol: str, equity: float):
+    """エントリー時と以降の決済判定で別々の価格を返すモック環境。
+
+    `get_current_price_quote_async`（新規建ての参照価格）と
+    `get_current_price_async`（決済判定）が別関数であることを利用して、
+    1回のwith句の中で「建てた後に値が動いた」状況を作る。
+    """
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol=symbol))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch("main.get_intraday_bars_async", new=AsyncMock(return_value=_make_df([100.0] * 20))), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(entry_price))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=later_price)), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=equity)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=equity)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=160.0)), \
+        patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()), \
+        patch("main.place_dry_run_order_async", new=AsyncMock()), \
+        patch(
+            "main.place_dry_run_bracket_order_async",
+            new=AsyncMock(return_value=DryRunBracketResult(
+                symbol=symbol, quantity=quantity,
+                stop_price=entry_price * (1 - SWING_STOP_LOSS_PCT / 100.0),
+                take_profit_price=entry_price * 1.10,
+                oca_group=f"OCA_{symbol}",
+            )),
+        ):
+        yield
+
+
+def test_resting_stop_fill_records_the_trade_and_starts_the_cooldown(trade_journal) -> None:
+    """損切りの待機注文が約定したときの一連の処理が繋がっていること。
+
+    建玉 -> ブラケット約定の検知 -> ポジション解放 -> TradeJournalへの記録 ->
+    同日中の再エントリー禁止、までを1本で通す。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    daily_df = _make_daily_df(drop=True)
+
+    # 資金100,000・株価100・損切り5% -> リスク1,000 / 1株あたり5.0 -> 200株。
+    with _entry_then_price(daily_df, entry_price=100.0, later_price=95.0,
+                           quantity=200, symbol="AAPL", equity=100_000.0):
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+        assert position_manager.has_position("AAPL") is True
+        assert position_manager.get_position("AAPL").quantity == 200
+
+        # 次のサイクル。観測価格が逆指値(95.0)まで落ちている。
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    assert position_manager.has_position("AAPL") is False
+
+    records = trade_journal.load_trades()
+    assert len(records) == 1
+    assert records[0].symbol == "AAPL"
+    assert records[0].reason == REASON_STOP_LOSS
+    # (95 - 100) * 200 = -1,000（口座資金の1% = 1トレードのリスクどおり）
+    assert records[0].pnl == pytest.approx(-1000.0)
+    assert records[0].r_multiple == pytest.approx(-1.0)
+    assert records[0].usd_jpy_rate == pytest.approx(160.0)
+
+    # 決済した当日は買い直さない。
+    assert position_manager.is_in_cooldown("AAPL") is True
+
+
+def test_resting_take_profit_fill_records_a_win(trade_journal) -> None:
+    """利確側の待機注文でも同じ経路が通ること。"""
+    ib = MagicMock()
+    position_manager = PositionManager()
+    daily_df = _make_daily_df(drop=True)
+
+    with _entry_then_price(daily_df, entry_price=100.0, later_price=110.0,
+                           quantity=200, symbol="AAPL", equity=100_000.0):
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    records = trade_journal.load_trades()
+    assert len(records) == 1
+    assert records[0].reason == REASON_TAKE_PROFIT
+    # 指値なので指値より不利な価格では約定しない。(110 - 100) * 200 = +2,000
+    assert records[0].pnl == pytest.approx(2000.0)
+    assert records[0].r_multiple == pytest.approx(2.0)
+
+
+def test_accumulated_stop_losses_trip_the_daily_circuit_breaker(trade_journal) -> None:
+    """記録した実現損失が積み上がると新規エントリーが止まること。
+
+    サーキットブレーカーは TradeJournal の実現損益を読むため、決済の記録が
+    繋がっていて初めて機能する。損失を直接書き込むのではなく、実際に
+    損切りを3回通してから4銘柄目が止まることを見る。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    daily_df = _make_daily_df(drop=True)
+
+    # 1回の損切りが -1,000（資金の1%）。3回で -3,000 = MAX_DAILY_LOSS_PCT(3%)。
+    for symbol in ("AAA", "BBB", "CCC"):
+        with _entry_then_price(daily_df, entry_price=100.0, later_price=95.0,
+                               quantity=200, symbol=symbol, equity=100_000.0):
+            asyncio.run(process_symbol_async(ib, symbol, position_manager, trade_journal))
+            asyncio.run(process_symbol_async(ib, symbol, position_manager, trade_journal))
+
+    assert len(trade_journal.load_trades()) == 3
+    assert trade_journal.compute_daily_pnl() == pytest.approx(-3000.0)
+
+    # 4銘柄目はクールダウンにも同時保有数にも掛からないが、建たない。
+    with _entry_then_price(daily_df, entry_price=100.0, later_price=100.0,
+                           quantity=200, symbol="DDD", equity=100_000.0):
+        asyncio.run(process_symbol_async(ib, "DDD", position_manager, trade_journal))
+
+    assert position_manager.has_position("DDD") is False

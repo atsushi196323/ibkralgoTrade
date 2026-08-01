@@ -401,6 +401,83 @@ def test_screen_value_stocks_excludes_symbols_with_unknown_price() -> None:
     assert result == ["CHEAP"]
 
 
+def test_screen_value_stocks_excludes_symbols_below_min_price() -> None:
+    """株数クランプが掛かる低位株を監視対象に残さないこと。
+
+    残すと MAX_POSITION_SIZE で建玉が縮み、1トレードのリスクが
+    RISK_PER_TRADE_PCT に届かないまま最低手数料の比率だけが跳ね上がる
+    （JOBY $7.05 の実測で往復0.29% -> 0.99%）。
+    """
+    candidates = [_make_contract("NORMAL"), _make_contract("PENNY")]
+    bars = {
+        "NORMAL": _make_price_df([100.0] * 200),
+        "PENNY": _make_price_df([7.05] * 200),
+    }
+
+    result = _run_with_bars(
+        ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=False, min_price=24.4),
+        candidates, bars,
+    )
+
+    assert result == ["NORMAL"]
+
+
+def test_min_and_max_price_bound_the_watchlist_from_both_sides() -> None:
+    """上下限が同時に効くこと。"""
+    candidates = [
+        _make_contract("PENNY"), _make_contract("NORMAL"), _make_contract("PRICEY"),
+    ]
+    bars = {
+        "PENNY": _make_price_df([7.05] * 200),
+        "NORMAL": _make_price_df([100.0] * 200),
+        "PRICEY": _make_price_df([500.0] * 200),
+    }
+
+    result = _run_with_bars(
+        ScreenerConfig(
+            max_pe_ratio=15.0, enable_trend_filter=False,
+            min_price=24.4, max_price=244.0,
+        ),
+        candidates, bars,
+    )
+
+    assert result == ["NORMAL"]
+
+
+def test_min_price_filter_excludes_symbols_with_unknown_price() -> None:
+    """下限だけが有効な場合も、株価が取れない銘柄は除外に倒すこと。"""
+    candidates = [_make_contract("NORMAL"), _make_contract("NOBARS")]
+    bars = {
+        "NORMAL": _make_price_df([100.0] * 200),
+        "NOBARS": pd.DataFrame(),
+    }
+
+    result = _run_with_bars(
+        ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=False, min_price=24.4),
+        candidates, bars,
+    )
+
+    assert result == ["NORMAL"]
+
+
+def test_min_price_alone_still_fetches_bars() -> None:
+    """下限だけ有効でも日足を取得すること（上限のみを見て早期returnしない）。"""
+    ib = MagicMock()
+    candidates = [_make_contract("NORMAL")]
+    mock_bars = AsyncMock(return_value=_make_price_df([100.0] * 200))
+
+    with patch("strategy.screener.run_market_cap_scan_async", new=AsyncMock(return_value=candidates)), \
+        patch("strategy.screener.get_pe_ratio_async", new=AsyncMock(return_value=10.0)), \
+        patch("strategy.screener.get_historical_bars_async", new=mock_bars), \
+        patch("strategy.screener.asyncio.sleep", new=AsyncMock()):
+        result = asyncio.run(screen_value_stocks_async(
+            ib, ScreenerConfig(max_pe_ratio=15.0, enable_trend_filter=False, min_price=24.4),
+        ))
+
+    assert result == ["NORMAL"]
+    assert mock_bars.await_count == 1
+
+
 def test_max_price_and_trend_filter_share_one_bar_request() -> None:
     """両方有効でも日足の取得は1銘柄1回で済ませること（ペーシング制限対策）。"""
     ib = MagicMock()

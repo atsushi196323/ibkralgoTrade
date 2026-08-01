@@ -65,6 +65,15 @@ class ScreenerConfig:
     # 必ずスキップされる。監視できる銘柄数は10件しかないため、
     # 買えない銘柄に枠を割く余裕は無い。
     max_price: Optional[float] = None
+    # 買える下限株価(USD)。Noneなら無効。
+    # 上限とは逆に、株価が安すぎる銘柄は order_manager.MAX_POSITION_SIZE の
+    # 株数クランプに掛かり、リスクベースのサイジングが効かなくなる。
+    # 数量が上限に達する条件は 株価 < 資金 × (リスク% ÷ 損切り%) ÷ MAX_POSITION_SIZE
+    # で、実測($1,220・10株)では $24.40 未満が該当する。
+    # クランプが掛かると建玉が小さくなる分だけ1注文あたりの最低手数料($0.35)の
+    # 比率が跳ね上がり（JOBY $7.05 の実測で往復0.29% -> 0.99%）、
+    # 「検証時の初期資金」節のバックテスト結果が実運用に当てはまらなくなる。
+    min_price: Optional[float] = None
 
 
 def _is_in_long_term_uptrend(df: pd.DataFrame, ma_window: int) -> Optional[bool]:
@@ -80,18 +89,15 @@ def _is_in_long_term_uptrend(df: pd.DataFrame, ma_window: int) -> Optional[bool]
     return latest_close > moving_average
 
 
-def _is_affordable(df: pd.DataFrame, max_price: float) -> Optional[bool]:
-    """直近の終値が max_price 以下か判定する。
-
-    株価が取れない場合はNoneを返す（判定不能）。
-    """
+def _latest_close(df: pd.DataFrame) -> Optional[float]:
+    """直近の終値を返す。取れない場合はNone（判定不能）。"""
     if df.empty or "close" not in df.columns:
         return None
 
     latest_close = float(df["close"].iloc[-1])
     if latest_close <= 0:
         return None
-    return latest_close <= max_price
+    return latest_close
 
 
 async def _passes_bar_based_filters_async(
@@ -102,16 +108,17 @@ async def _passes_bar_based_filters_async(
     2つの条件で別々にバーを取得するとIBKRへのリクエストが倍になるため、
     同じバーを使い回す。どちらも無効なら取得自体を行わない。
     """
-    if not config.enable_trend_filter and config.max_price is None:
+    price_filter_enabled = config.max_price is not None or config.min_price is not None
+    if not config.enable_trend_filter and not price_filter_enabled:
         return True
 
     daily_df = await get_historical_bars_async(
         ib, contract, duration=config.trend_lookback_duration, bar_size="1 day",
     )
 
-    if config.max_price is not None:
-        affordable = _is_affordable(daily_df, config.max_price)
-        if affordable is None:
+    if price_filter_enabled:
+        latest_close = _latest_close(daily_df)
+        if latest_close is None:
             # 株価が分からない銘柄は除外に倒す。素通しすると、買えない銘柄が
             # ウォッチリストの枠とペーシング枠を占め続けても気付けない。
             logger.info(
@@ -119,11 +126,19 @@ async def _passes_bar_based_filters_async(
                 contract.symbol,
             )
             return False
-        if not affordable:
+        if config.max_price is not None and latest_close > config.max_price:
             logger.info(
-                "[%s] 株価が上限(%.2f USD)を超えるため除外しました"
+                "[%s] 株価(%.2f USD)が上限(%.2f USD)を超えるため除外しました"
                 "（現在の口座資金では数量が0株になる）。",
-                contract.symbol, config.max_price,
+                contract.symbol, latest_close, config.max_price,
+            )
+            return False
+        if config.min_price is not None and latest_close < config.min_price:
+            logger.info(
+                "[%s] 株価(%.2f USD)が下限(%.2f USD)を下回るため除外しました"
+                "（MAX_POSITION_SIZEの株数クランプでリスクベースのサイジングが効かず、"
+                "手数料比率が跳ね上がる）。",
+                contract.symbol, latest_close, config.min_price,
             )
             return False
 
@@ -186,7 +201,11 @@ async def screen_value_stocks_async(ib: IB, config: ScreenerConfig) -> List[str]
                 pe_fetch_failed = True
             elif not (0 < pe_ratio <= config.max_pe_ratio):
                 pass  # 赤字・割高による通常の除外。購読権限の問題ではない。
-            elif config.enable_trend_filter or config.max_price is not None:
+            elif (
+                config.enable_trend_filter
+                or config.max_price is not None
+                or config.min_price is not None
+            ):
                 await _pace()
                 if await _passes_bar_based_filters_async(ib, contract, config):
                     selected.append(contract.symbol)

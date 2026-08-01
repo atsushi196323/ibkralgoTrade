@@ -11,6 +11,7 @@ import pandas as pd
 from ib_insync import IB, Stock
 
 from core.connection import IBKRConnection
+from core.logging_setup import configure_logging
 from core.market_hours import US_EASTERN, is_day_trade_flatten_time, is_regular_trading_hours
 from data.cache import ContractCache, DailyBarCache
 from data.market_data import (
@@ -21,6 +22,7 @@ from data.market_data import (
 )
 from execution.account import get_account_equity_async, get_settled_cash_async
 from execution.order_manager import (
+    MAX_POSITION_SIZE,
     cancel_dry_run_bracket_orders_async,
     place_dry_run_bracket_order_async,
     place_dry_run_order_async,
@@ -49,10 +51,6 @@ from strategy.pullback import (
 )
 from strategy.screener import ScreenerConfig, screen_value_stocks_async
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 # フォールバック用の固定ウォッチリスト。銘柄選定は本来スクリーニング
@@ -118,7 +116,7 @@ SWING_MARKET_FILTER: MarketFilterConfig = MarketFilterConfig()
 
 # デイトレード（短期足）でのエントリーを行うか。**既定は無効。**
 #
-# 無効にしている理由は3つあり、それぞれ独立している:
+# 無効にしている理由は2つあり、それぞれ独立している:
 #
 # 1. **検証実績がゼロ。** 5分足のバックテストは1件も行っていない（外部データでは
 #    60日程度しか遡れないため。CLAUDE.md「バックテストのデータ源」）。MA30の選定も
@@ -128,14 +126,14 @@ SWING_MARKET_FILTER: MarketFilterConfig = MarketFilterConfig()
 #    損切り1.5%では1銘柄で資金の67%を使う。MAX_CONCURRENT_POSITIONS=2 でも
 #    2銘柄目が入らない。現状これが表面化しないのはMAX_POSITION_SIZEの株数クランプが
 #    効いているからで、それは検証用の安全弁であって資金設計ではない。
-# 3. **キャッシュ口座の受渡し(T+1)。** デイトレードは定義上「同日中に買って売る」
-#    ロジックで、未受渡しの売却代金で建てて同日に決済するとGood Faith Violationに
-#    なりうる。
+# かつて3つ目に挙げていた「キャッシュ口座の受渡し(T+1)によるGood Faith Violation」は
+# 解消済み。GFVは米国のルールで日本居住者向けのIBSJ口座には適用されず、PDT規制も
+# 掛からない（2026-07-31にIBKRサポートへ照会して確認）。同日往復そのものを
+# 妨げるものは無い。受渡し前の資金で建てようとした場合は注文が拒否されるだけである。
 #
 # 再有効化するときは、(1) IBKR接続で5分足を取得しスイングと同じ基準（銘柄横断・
 # コスト込み・ウォークフォワード）で検証してPFが1を超えること、(2) 建玉サイズの
-# 問題を解決すること、(3) マージン口座にするかGFVの制約が無いと確認できること、
-# の3つを揃えること。
+# 問題を解決すること、の2つを揃えること。
 #
 # 無効でも、既存のデイトレードポジション（状態ファイルからの復元など）の決済判定と
 # 大引け前の強制決済は動く。エントリーだけを止めている。
@@ -228,29 +226,24 @@ MAX_DAILY_LOSS_PCT: float = 3.0
 MAX_DAILY_ENTRY_ORDERS: int = 10
 # 新規建ての数量を「決済済み現金で買える株数」に制限するか。
 #
-# キャッシュ口座では、未受渡しの売却代金で買った建玉を受渡し(T+1)より前に売ると
-# Good Faith Violationになる。この経路はデイトレード固有ではない:
-#   1. ある銘柄を決済する → 代金は翌営業日まで未受渡し
-#   2. 同じ日に別銘柄のシグナルが出て、その未受渡し代金で建てる
-#   3. ブラケットの利確指値/損切り逆指値に当日中に触れて決済 → GFV
-# 同日中の再エントリー禁止は同一銘柄しか止めないため2は素通りし、3は
-# 待機注文が板に乗っている以上ボット側では選べない。よってステップ2、すなわち
-# 「入口で未受渡しの資金を使わせない」ことが唯一の止めどころになる。
+# 目的は**資金不足による発注拒否を避けること**であって、Good Faith Violationの
+# 回避ではない。GFVは米国のルールであり、日本居住者向けのIBSJ口座には適用されない
+# （2026-07-31にIBKRサポートへ照会して確認。PDT規制も同様に適用されない）。
 #
-# 同日決済そのものを禁止する対処を採らないのは、利確・損切りをブローカー側に
-# 置いている意味（プロセスが落ちても約定する）を失うため。GFVを避けるために
-# 損切りを外すのは本末転倒である。
+# 適用されないと分かった以上、残る実害は「受渡し(T+1)前の資金では買えない」ことだけで、
+# その場合IBKRは約定させず**注文を拒否する**（同じ照会での回答。API経由でも手動でも
+# 取扱いは同一）。拒否はペナルティを伴わないが、注文が通った前提で
+# ローカルにポジションを記録すると実体の無い建玉を追跡することになるため、
+# 入口で数量を現金の裏付けまで落としておく方が素直である。
 #
 # **既定は無効。** 検証に使っているペーパー口座がSettledCashタグを返さないため
 # （実測: アカウントサマリー45タグ中に存在せず、BuyingPower/FullInitMarginReq/
-# Cushionが並ぶマージン型口座だった）。有効なままだと決済済み現金が常に取得
-# できず、新規エントリーが全件停止して他の経路の検証ができない。
-# ペーパーではGFV自体が再現できないため、ここでガードを効かせても検証にならない。
+# Cushionが並ぶマージン型口座だった）。ドライラン中は実約定が無く決済済み現金が
+# 動かないので、有効にしても観察できるものが無い。
 #
-# **実口座（キャッシュ口座）へ移す際は必ずTrueに戻すこと。** 上記のとおり実口座では
-# この経路が現実に成立する。戻す前にSettledCashが実際に取得できることを
-# scripts/check_market_data.py 等で確認し、取れないなら受渡し済み残高を
-# 別のタグから求める方法を先に決めること。
+# 実口座へ移す際にTrueへ戻す価値はあるが、GFVのような不可逆な不利益は無いため、
+# SettledCashが取得できない場合はエントリーを止めずに素通しする
+# （_clamp_quantity_to_settled_cash_asyncを参照）。
 ENFORCE_SETTLED_CASH_FUNDING: bool = False
 # 当日のものでない価格を掴んだまま新規建てするのを止めるか。
 #
@@ -453,26 +446,26 @@ async def _clamp_quantity_to_settled_cash_async(
     """新規建ての数量を、決済済み現金で実際に支払える株数まで切り下げる。
 
     リスクベースのサイジングはNetLiquidation（未受渡しの代金を含む評価額）を
-    基準にしているため、キャッシュ口座では「まだ手元に無い現金」を当てにした
-    数量が出うる。それで建てるとGFVの経路に乗るので、ここで現金の裏付けまで
-    数量を落とす（ENFORCE_SETTLED_CASH_FUNDINGの説明を参照）。
+    基準にしているため、「まだ手元に無い現金」を当てにした数量が出うる。
+    その数量で発注してもIBKRは資金不足として拒否するだけなので、入口で
+    現金の裏付けまで落としておく（ENFORCE_SETTLED_CASH_FUNDINGの説明を参照）。
 
-    決済済み現金が取得できない場合は0を返して**建てない**。ここを素通しすると、
-    資金の裏付けを確認できないままGFVを踏みうる注文を出すことになる。
-    エントリーだけが止まり決済判定は動き続けるため、既存ポジションが
-    損切りも無く放置されることはない。
+    決済済み現金が取得できない場合は**数量を変えずに通す**。判定できないことの
+    実害は注文が拒否されうることに留まり（GFVはIBSJ口座に適用されない）、
+    ここで止めると口座やタグの都合だけで新規エントリーが全件停止するため、
+    素通しの方が損失が小さい。
     """
     if not ENFORCE_SETTLED_CASH_FUNDING:
         return quantity
 
     settled_cash = await get_settled_cash_async(ib)
     if settled_cash is None:
-        logger.error(
-            "[%s] 決済済み現金が取得できなかったため、新規エントリーを見送ります"
-            "（未受渡し資金での建玉はGood Faith Violationにつながるため）。",
+        logger.warning(
+            "[%s] 決済済み現金が取得できなかったため、資金の裏付けを確認せずに発注します。"
+            "資金が不足していればIBKR側で注文が拒否されます。",
             symbol,
         )
-        return 0
+        return quantity
 
     affordable_quantity = max(math.floor(settled_cash / price), 0)
     if affordable_quantity <= 0:
@@ -486,7 +479,7 @@ async def _clamp_quantity_to_settled_cash_async(
     if affordable_quantity < quantity:
         logger.info(
             "[%s] 決済済み現金 %.2f USD の範囲に数量を切り下げます: %d株 -> %d株"
-            "（残りは未受渡しの代金であり、これで建てるとGFVの対象になりうる）。",
+            "（残りは未受渡しの代金で、これで発注しても資金不足で拒否されうる）。",
             symbol, settled_cash, quantity, affordable_quantity,
         )
         return affordable_quantity
@@ -686,9 +679,102 @@ def resolve_max_affordable_price(
     return max_price
 
 
+def resolve_min_tradeable_price(account_equity: float) -> Optional[float]:
+    """株数クランプが掛からずに済む下限株価を返す。
+
+    リスクベースのサイジングは
+        数量 = floor((資金 × RISK_PER_TRADE_PCT%) ÷ (株価 × 損切り%))
+    なので、数量が MAX_POSITION_SIZE を超える条件は
+        株価 < 資金 × (RISK_PER_TRADE_PCT% ÷ 損切り%) ÷ MAX_POSITION_SIZE
+    となる。これを下回る銘柄は、シグナルが出ても株数クランプで建玉が
+    小さくなり、**1トレードのリスクが RISK_PER_TRADE_PCT% に届かない**。
+
+    除外するのは手数料比率が跳ね上がるため。1注文あたりの最低手数料(0.35 USD)は
+    建玉の大きさによらず固定なので、クランプで建玉が縮むとその比率だけが上がる。
+    JOBY(7.05 USD)の実測では、本来34株($238.92)のところ10株($70.50)に
+    クランプされ、往復手数料の約定代金比が0.29% -> 0.99%、リスクが1.00% -> 0.29%
+    になっていた（CLAUDE.md「検証時の初期資金」節）。この条件下では
+    バックテストのPFが実運用に当てはまらない。
+
+    上限株価と同じく損切り幅にはスイングの値を使い、資金が取得できない場合
+    (0以下)はNoneを返してフィルターを掛けない（ウォッチリストが空になるため）。
+
+    なお floor() があるため、連続量の数量が10.x株になる帯（$1,220なら
+    $22.18〜$24.40）では実際にはクランプが効かない。この帯の上端を下限に
+    置いているので、その分だけ安全側に余計に除外する。
+    """
+    if account_equity <= 0:
+        return None
+
+    return account_equity * (RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT) / MAX_POSITION_SIZE
+
+
+async def _filter_symbols_by_price_band_async(
+    ib: IB, symbols: List[str], min_price: Optional[float], max_price: Optional[float],
+    caches: MarketDataCaches,
+) -> List[str]:
+    """取引可能な株価帯に入っている銘柄だけを返す。
+
+    スクリーニングの結果には `ScreenerConfig` が同じ判定を掛けるが、
+    **スクリーニングが失敗・0件のときに使うフォールバックのリストは
+    その判定を通らない**。固定リスト(`WATCHLIST`)は資金額と無関係に
+    書かれているため、素通しすると次のどちらかが起きる。
+
+    - 上限超え: 毎サイクルのリクエスト枠を消費したうえで必ず数量0でスキップ
+    - 下限割れ: `MAX_POSITION_SIZE` のクランプが掛かった建玉ができる
+
+    2026-07-30〜07-31のドライランで実際に建った唯一のポジション(JOBY $7.05)は
+    後者であり、当時の固定リスト8銘柄のうち取引可能なのは2銘柄だけだった。
+
+    日足は `DailyBarCache` から取るので、**追加のIBKRリクエストは発生しない**
+    （同じ銘柄の日足はこの後のシグナル判定でどのみち取得される）。
+
+    株価が取得できない銘柄は除外に倒す。素通しすると、買えない銘柄が
+    監視枠を占め続けても気付けない（スクリーナー側の判定と揃えている）。
+    """
+    if min_price is None and max_price is None:
+        return symbols
+
+    kept: List[str] = []
+    for symbol in symbols:
+        try:
+            contract = await caches.contracts.get_async(ib, symbol)
+            daily_df = await caches.daily_bars.get_async(ib, contract)
+        except Exception:
+            logger.exception(
+                "[%s] 株価の判定に失敗したため、監視対象から外します。", symbol,
+            )
+            continue
+
+        if daily_df.empty or "close" not in daily_df.columns:
+            logger.warning(
+                "[%s] 株価が取得できなかったため、監視対象から外します。", symbol,
+            )
+            continue
+
+        price = float(daily_df["close"].iloc[-1])
+        if max_price is not None and price > max_price:
+            logger.warning(
+                "[%s] 株価(%.2f USD)が上限(%.2f USD)を超えるため監視対象から外します"
+                "（現在の口座資金では数量が0株になる）。",
+                symbol, price, max_price,
+            )
+            continue
+        if min_price is not None and price < min_price:
+            logger.warning(
+                "[%s] 株価(%.2f USD)が下限(%.2f USD)を下回るため監視対象から外します"
+                "（株数クランプでリスクベースのサイジングが効かない）。",
+                symbol, price, min_price,
+            )
+            continue
+        kept.append(symbol)
+
+    return kept
+
+
 async def _refresh_watchlist_async(
     ib: IB, fallback_watchlist: List[str], account_equity: float,
-    settled_cash: Optional[float] = None,
+    settled_cash: Optional[float] = None, caches: Optional[MarketDataCaches] = None,
 ) -> List[str]:
     max_price = resolve_max_affordable_price(account_equity, settled_cash)
     if max_price is not None:
@@ -698,8 +784,18 @@ async def _refresh_watchlist_async(
             account_equity, max_price,
         )
 
+    min_price = resolve_min_tradeable_price(account_equity)
+    if min_price is not None:
+        logger.info(
+            "口座資金 %.2f USD で株数クランプ(%d株)が掛からない下限株価は %.2f USD です"
+            "（これを下回る銘柄は1トレードのリスクが %.1f%% に届かず、手数料比率が"
+            "跳ね上がるため監視対象から除外します）。",
+            account_equity, MAX_POSITION_SIZE, min_price, RISK_PER_TRADE_PCT,
+        )
+
     config = ScreenerConfig(
         max_price=max_price,
+        min_price=min_price,
         market_cap_above=SCREENER_MIN_MARKET_CAP,
         market_cap_below=SCREENER_MAX_MARKET_CAP,
         max_pe_ratio=SCREENER_MAX_PE_RATIO,
@@ -711,15 +807,44 @@ async def _refresh_watchlist_async(
         trend_lookback_duration=SCREENER_TREND_LOOKBACK_DURATION,
     )
 
+    caches = caches if caches is not None else MarketDataCaches()
+
+    async def _fallback(cause: str) -> List[str]:
+        # フォールバックはスクリーニングの判定を通っていないため、株価帯だけは
+        # ここで掛け直す。掛けないと固定リストの買えない銘柄がそのまま監視枠に入る。
+        filtered = await _filter_symbols_by_price_band_async(
+            ib, fallback_watchlist, min_price, max_price, caches,
+        )
+        if not filtered:
+            # ここに落ちるのは「スクリーニングも効かず、固定リストにも取引可能な
+            # 銘柄が無い」状態。新規エントリーは一切起きない（保有中の決済判定は
+            # run_watchlist_cycle_asyncが保有銘柄との和集合を取るので継続する）。
+            # 静かに空で回り続けると気付けないため、ここだけはERRORで出す。
+            logger.error(
+                "%s、フォールバックの固定ウォッチリスト%sにも取引可能な株価"
+                "(%s〜%s USD)の銘柄がありません。新規エントリーは発生しません。"
+                "スクリーニングの購読権限を `python -m scripts.check_screener` で"
+                "確認し、固定リストを現在の資金額に合わせて見直してください。",
+                cause, fallback_watchlist,
+                f"{min_price:.2f}" if min_price is not None else "下限なし",
+                f"{max_price:.2f}" if max_price is not None else "上限なし",
+            )
+            return []
+        logger.warning(
+            "%s、フォールバックの固定ウォッチリストで継続します: %s"
+            "（株価帯の判定で %d 件を除外）。",
+            cause, filtered, len(fallback_watchlist) - len(filtered),
+        )
+        return filtered
+
     try:
         screened = await screen_value_stocks_async(ib, config)
     except Exception:
-        logger.exception("銘柄スクリーニングに失敗しました。既存のウォッチリストを維持します。")
-        return fallback_watchlist
+        logger.exception("銘柄スクリーニングに失敗しました。")
+        return await _fallback("銘柄スクリーニングに失敗したため")
 
     if not screened:
-        logger.warning("スクリーニング結果が0件のため、既存のウォッチリストを維持します。")
-        return fallback_watchlist
+        return await _fallback("スクリーニング結果が0件のため")
 
     # 監視銘柄1件につき毎サイクル1回の日中足リクエストが発生するため、
     # スクリーニングが何件返しても監視対象は上限で頭打ちにする。
@@ -770,8 +895,11 @@ async def main() -> None:
                             await get_settled_cash_async(ib)
                             if ENFORCE_SETTLED_CASH_FUNDING else None
                         )
+                        # cachesを渡すのは、フォールバック時の株価帯の判定で
+                        # 日足を取り直さないため（同じ銘柄の日足はこの後の
+                        # シグナル判定でどのみち取得される）。
                         watchlist = await _refresh_watchlist_async(
-                            ib, watchlist, account_equity, settled_cash,
+                            ib, watchlist, account_equity, settled_cash, caches,
                         )
                         last_screened_date = today
 
@@ -803,4 +931,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    configure_logging()
     asyncio.run(main())
