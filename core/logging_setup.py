@@ -16,6 +16,7 @@
 
 import logging
 import logging.handlers
+import re
 from pathlib import Path
 
 DEFAULT_LOG_PATH: str = "logs/bot.log"
@@ -26,6 +27,50 @@ LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 # ディスクを無制限には食わない量として置いている。
 MAX_BYTES: int = 10 * 1024 * 1024
 BACKUP_COUNT: int = 10
+
+# 連続する \uXXXX の並びだけを対象にする。1つずつ変換すると、サロゲートペアが
+# 分断されて判別できなくなる。
+_ESCAPE_RUN = re.compile(r"(?:\\u[0-9a-fA-F]{4})+")
+
+
+def _decode_escape_run(match: "re.Match[str]") -> str:
+    text = match.group(0)
+    try:
+        decoded = text.encode("ascii").decode("unicode_escape")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return text
+
+    # サロゲートペアは unicode_escape では合成されず、単独サロゲートのまま残る。
+    # それをUTF-8で書き出そうとするとログ出力自体が例外で落ちるため、
+    # 読みやすさより安全側に倒して元の表記を保つ。
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in decoded):
+        return text
+    return decoded
+
+
+class DecodeUnicodeEscapesFilter(logging.Filter):
+    """メッセージ中の `\\uXXXX` を実際の文字へ戻すフィルター。
+
+    TWS/IB GatewayはAPIへ非ASCII文字をエスケープした形で送るため、
+    ib_insync経由のIBKRのメッセージがそのままでは読めない。実測では
+    切断のエラーが `Error 1100, reqId -1: \\u30de\\u30fc\\u30b1...` と記録され、
+    障害時に一番読みたいものが読めなかった。
+
+    **ハンドラに付けること。** ロガーに付けたフィルターは、子ロガーから
+    伝播してきたレコードには適用されない。IBKRのメッセージは
+    `ib_insync.wrapper` が出すので、ルートロガーに付けても効かない。
+
+    どんな入力でも例外を投げない。ログの整形が原因で稼働が止まるのは
+    本末転倒であるため、変換できないものは元のまま通す。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.msg, str) and "\\u" in record.msg:
+                record.msg = _ESCAPE_RUN.sub(_decode_escape_run, record.msg)
+        except Exception:  # noqa: BLE001 - ログ整形で稼働を止めない
+            pass
+        return True
 
 
 def configure_logging(
@@ -51,6 +96,7 @@ def configure_logging(
     resolved.parent.mkdir(parents=True, exist_ok=True)
 
     formatter = logging.Formatter(LOG_FORMAT)
+    escape_filter = DecodeUnicodeEscapesFilter()
 
     file_handler = logging.handlers.RotatingFileHandler(
         resolved,
@@ -59,6 +105,7 @@ def configure_logging(
         encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
+    file_handler.addFilter(escape_filter)
     root.addHandler(file_handler)
 
     if not any(
@@ -67,4 +114,5 @@ def configure_logging(
     ):
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(formatter)
+        stream_handler.addFilter(escape_filter)
         root.addHandler(stream_handler)
