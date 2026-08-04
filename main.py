@@ -1074,19 +1074,38 @@ async def _apply_attention_watchlist_async(
     **順序が重要である。** 先に下降トレンドの銘柄を落としてから急上昇銘柄を
     足す。逆にすると、枠が埋まっていて新しい銘柄が入らない。
 
-    枠は `MAX_WATCHLIST_SIZE` で頭打ちにし、**既存の監視銘柄を優先する**。
-    急上昇は残った枠に上昇幅の大きい順で入る。保有中の銘柄は落とさない。
+    **前日までに組み入れた注目銘柄は引き継ぐ**（`store.load_attention_symbols`）。
+    毎日ゼロから組み直すと、急上昇の翌日にランキングが落ち着いた時点で監視から
+    外れ、押し目が出るまで持ち続けられない。引き継いだ銘柄も下降トレンドの
+    判定と枠の上限は同じように受ける。
+
+    枠は `MAX_WATCHLIST_SIZE` で頭打ちにし、**渡されたウォッチリストを優先する**。
+    引き継ぎと急上昇は残った枠に入る。保有中の銘柄は落とさない。
     """
     protected = position_manager.open_symbols()
     min_price = resolve_min_tradeable_price(account_equity)
     max_price = resolve_max_affordable_price(account_equity)
 
+    carried = store.load_attention_symbols() if ENABLE_ATTENTION_WATCHLIST else []
+    combined = list(dict.fromkeys([*watchlist, *carried]))
+
     kept = (
-        await _drop_struggling_symbols_async(ib, watchlist, caches, protected)
-        if DROP_STRUGGLING_SYMBOLS else list(watchlist)
+        await _drop_struggling_symbols_async(ib, combined, caches, protected)
+        if DROP_STRUGGLING_SYMBOLS else combined
     )
+    # 引き継ぎで枠を超えることがある。渡されたウォッチリストが先に並んでいるので、
+    # 前から切ればそちらが優先される。
+    kept = kept[:MAX_WATCHLIST_SIZE]
     if not ENABLE_ATTENTION_WATCHLIST:
         return kept
+
+    # 引き継ぎの記録は、スキャンの成否より前に更新しておく。ここを後回しにすると、
+    # スキャンが失敗した日に「下降トレンドで落とした銘柄」が記録に残り続け、
+    # 翌日また組み入れては落とすことを繰り返す。
+    surviving_carried = [symbol for symbol in kept if symbol in carried]
+    if carried:
+        logger.info("前日までの注目銘柄を引き継ぎました: %s", surviving_carried)
+    store.save_attention_symbols(surviving_carried)
 
     try:
         today_ranks = await _scan_turnover_ranks_async(ib, min_price, max_price)
@@ -1133,7 +1152,7 @@ async def _apply_attention_watchlist_async(
             "注目銘柄として監視対象に追加します: %s（監視%d -> %d銘柄）",
             added, len(kept), len(kept) + len(added),
         )
-    store.save_attention_symbols(added)
+    store.save_attention_symbols(surviving_carried + added)
     return kept + added
 
 

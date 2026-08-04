@@ -2482,3 +2482,53 @@ def test_surges_are_ignored_while_the_feature_is_in_observation_mode(tmp_path) -
     assert result == ["KEEP"]
     # スキャナーは呼ばない（購読が無い口座で無駄なリクエストを出さない）。
     mock_scan.assert_not_awaited()
+
+
+def test_attention_symbols_are_carried_to_the_next_day(tmp_path) -> None:
+    """前日に組み入れた注目銘柄を翌日も監視すること。
+
+    毎日ゼロから組み直すと、急上昇の翌日にランキングが落ち着いた時点で監視から
+    外れ、押し目が出るまで持ち続けられない。
+    """
+    ib = MagicMock()
+    store = RankHistoryStore(str(tmp_path / "ranks.json"))
+    for index in range(10):
+        store.append(f"day-{index:03d}", {"OLD": 1})
+    store.save_attention_symbols(["YESTERDAY"])
+
+    with patch("main.ENABLE_ATTENTION_WATCHLIST", True), \
+        patch("data.cache.qualify_stock_async",
+              new=AsyncMock(side_effect=lambda ib, symbol: MagicMock(symbol=symbol))), \
+        _attention_bars({"KEEP": 100.0, "YESTERDAY": 50.0}), \
+        patch("main.run_turnover_scan_async", new=AsyncMock(return_value=[])):
+        result = asyncio.run(main_module._apply_attention_watchlist_async(
+            ib, ["KEEP"], 1220.0, MarketDataCaches(), PositionManager(), store,
+        ))
+
+    assert result == ["KEEP", "YESTERDAY"]
+    # 明日も引き継ぐ。
+    assert store.load_attention_symbols() == ["YESTERDAY"]
+
+
+def test_a_carried_symbol_that_turns_down_is_not_carried_again(tmp_path) -> None:
+    """引き継いだ銘柄が下降トレンドに入ったら、その日限りで引き継ぎを止めること。
+
+    残すと、翌日また同じ銘柄を組み入れて落とすことを繰り返す。
+    """
+    ib = MagicMock()
+    store = RankHistoryStore(str(tmp_path / "ranks.json"))
+    for index in range(10):
+        store.append(f"day-{index:03d}", {"OLD": 1})
+    store.save_attention_symbols(["FADED"])
+
+    with patch("main.ENABLE_ATTENTION_WATCHLIST", True), \
+        patch("data.cache.qualify_stock_async",
+              new=AsyncMock(side_effect=lambda ib, symbol: MagicMock(symbol=symbol))), \
+        _attention_bars({"KEEP": 100.0, "FADED": 50.0}, ma_below=("FADED",)), \
+        patch("main.run_turnover_scan_async", new=AsyncMock(return_value=[])):
+        result = asyncio.run(main_module._apply_attention_watchlist_async(
+            ib, ["KEEP"], 1220.0, MarketDataCaches(), PositionManager(), store,
+        ))
+
+    assert result == ["KEEP"]
+    assert store.load_attention_symbols() == []

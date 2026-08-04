@@ -77,3 +77,18 @@ def test_saved_file_is_valid_json(tmp_path: Path) -> None:
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["days"][0]["date"] == "2026-08-04"
+
+
+def test_appending_a_day_keeps_the_attention_symbols(tmp_path) -> None:
+    """ランキングの追記で注目銘柄のリストを消さないこと。
+
+    同じファイルに同居しているため、追記のたびに落とすと翌日の引き継ぎが
+    空になり、急上昇の翌日に監視から外れる。
+    """
+    path = str(tmp_path / "ranks.json")
+    store = RankHistoryStore(path)
+    store.save_attention_symbols(["AAA"])
+
+    store.append("2026-08-05", {"AAA": 3})
+
+    assert RankHistoryStore(path).load_attention_symbols() == ["AAA"]

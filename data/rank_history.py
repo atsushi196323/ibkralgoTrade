@@ -67,18 +67,9 @@ class RankHistoryStore:
         days.append({"date": trading_day, "ranks": dict(ranks)})
         days = days[-MAX_HISTORY_DAYS:]
 
-        directory = os.path.dirname(self.path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-
-        temp_path = f"{self.path}.tmp"
-        try:
-            with open(temp_path, "w", encoding="utf-8") as f:
-                json.dump({"days": days}, f, ensure_ascii=False)
-            os.replace(temp_path, self.path)
-        except OSError:
-            # 保存に失敗しても当日の判定は続けられる（戻り値は正しい）。
-            logger.exception("売買代金ランキングの履歴を保存できませんでした: %s", self.path)
+        # 注目銘柄のリストを巻き込んで消さないこと。同じファイルに同居しており、
+        # ランキングの追記のたびに落とすと、翌日の引き継ぎが空になる。
+        self._write({"days": days, "attention_symbols": self.load_attention_symbols()})
 
         return [dict(day["ranks"]) for day in days]
 
@@ -97,7 +88,13 @@ class RankHistoryStore:
             return []
 
     def save_attention_symbols(self, symbols: List[str]) -> None:
-        payload = {"days": self.load_days(), "attention_symbols": list(symbols)}
+        self._write({"days": self.load_days(), "attention_symbols": list(symbols)})
+
+    def _write(self, payload: dict) -> None:
+        """一時ファイルへ書いてから置換する（書き込み中に落ちても壊さない）。
+
+        保存に失敗しても呼び出し側の処理は続けられる（インメモリの値は正しい）。
+        """
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -107,7 +104,7 @@ class RankHistoryStore:
                 json.dump(payload, f, ensure_ascii=False)
             os.replace(temp_path, self.path)
         except OSError:
-            logger.exception("注目銘柄リストを保存できませんでした: %s", self.path)
+            logger.exception("売買代金ランキングのファイルを保存できませんでした: %s", self.path)
 
 
 def resolve_store(path: Optional[str] = None) -> RankHistoryStore:
