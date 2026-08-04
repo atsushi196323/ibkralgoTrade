@@ -20,7 +20,7 @@ def test_commission_scales_with_share_count() -> None:
 def test_minimum_commission_dominates_for_small_lots() -> None:
     """10株程度の小ロットでは1株あたり料率より最低手数料が支配的になる。
 
-    MAX_POSITION_SIZE(10株)でのドライラン相当の条件では、往復コストは
+    $1,220の口座では建玉が$244前後（株価$100なら2株）なので、往復コストは
     ほぼ最低手数料の2倍で決まる。
     """
     costs = CostModel(max_commission_pct_of_notional=0.0)

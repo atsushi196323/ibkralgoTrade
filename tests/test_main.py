@@ -705,14 +705,14 @@ def test_fallback_watchlist_is_filtered_by_the_tradeable_price_band() -> None:
     """フォールバックの固定リストにも株価帯を掛けること。
 
     掛けないと、資金額と無関係に書かれた main.WATCHLIST の銘柄がそのまま
-    監視枠に入る。2026-07-30〜07-31のドライランで唯一建った JOBY($7.05)は
-    この経路で入った低位株だった。
+    監視枠に入る。上限を超える銘柄は数量0株で永久に建たず、下限を下回る銘柄は
+    株数クランプでリスクベースのサイジングが効かない。
     """
     ib = MagicMock()
     prices = {
-        "PENNY": 7.05,     # 下限割れ -> 株数クランプ
+        "PENNY": 3.00,     # 下限($6.10)割れ -> 株数クランプ
         "NORMAL": 100.0,   # 取引可能
-        "PRICEY": 336.91,  # 上限超え -> 数量0株
+        "PRICEY": 336.91,  # 上限($244)超え -> 数量0株
     }
 
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
@@ -1627,8 +1627,8 @@ def test_min_tradeable_price_is_the_boundary_where_the_share_clamp_starts() -> N
 
     min_price = resolve_min_tradeable_price(equity)
 
-    # $1,220・リスク1%・損切り5%・10株上限なら $24.40。
-    assert min_price == pytest.approx(24.4)
+    # $1,220・リスク1%・損切り5%・40株上限なら $6.10。
+    assert min_price == pytest.approx(6.1)
     # 下限ちょうどではクランプが掛からない（ここが上限側の境界）。
     assert calculate_position_size(
         equity, entry_price=min_price, stop_loss_pct=SWING_STOP_LOSS_PCT,
@@ -1644,8 +1644,8 @@ def test_min_tradeable_price_is_the_boundary_where_the_share_clamp_starts() -> N
 def test_min_tradeable_price_is_conservative_by_the_rounding_band() -> None:
     """floor()の分だけ下限が安全側に寄っていること。
 
-    連続量の数量が10.x株になる帯（$1,220なら $22.18〜$24.40）では
-    floor()で10株に落ちるため、実際にはクランプが「効いて」いない。
+    連続量の数量が40.x株になる帯（$1,220なら $5.95〜$6.10）では
+    floor()で40株に落ちるため、実際にはクランプが「効いて」いない。
     下限をこの帯の上端に置いているので、その分だけ余計に除外する。
     1銘柄あたり数ドル幅の話であり、クランプが掛かる銘柄を取りこぼすより
     安全側に倒す方を選んでいる。
@@ -1660,16 +1660,25 @@ def test_min_tradeable_price_is_conservative_by_the_rounding_band() -> None:
     ) > MAX_POSITION_SIZE
 
 
-def test_min_tradeable_price_excludes_the_symbol_that_exposed_the_clamp() -> None:
-    """検証で実際にクランプが効いたJOBY($7.05)が下限で弾かれること。"""
+def test_the_symbol_that_exposed_the_clamp_is_now_sized_by_risk() -> None:
+    """クランプを表面化させたJOBY($7.05)が、いまは本来の株数で建つこと。
+
+    10株上限だった頃はここが下限($24.40)で弾かれていた。上限を40株へ
+    引き上げた目的は、この価格帯でリスクベースのサイジングを取り戻し、
+    実運用の条件をバックテスト（クランプを適用しない）と揃えることにある。
+    """
     equity = 1220.0
 
-    assert resolve_min_tradeable_price(equity) > 7.05
-    # 本来34株のところ10株にクランプされていた、という実測の再現。
-    assert calculate_position_size(
+    assert resolve_min_tradeable_price(equity) < 7.05
+    quantity = calculate_position_size(
         equity, entry_price=7.05, stop_loss_pct=SWING_STOP_LOSS_PCT,
         risk_per_trade_pct=RISK_PER_TRADE_PCT,
-    ) == 34
+    )
+    assert quantity == 34
+    # クランプに触れないので、1トレードのリスクが RISK_PER_TRADE_PCT に届く。
+    assert quantity <= MAX_POSITION_SIZE
+    risk_pct = quantity * 7.05 * SWING_STOP_LOSS_PCT / 100.0 / equity * 100.0
+    assert risk_pct == pytest.approx(RISK_PER_TRADE_PCT, abs=0.05)
 
 
 def test_min_tradeable_price_is_disabled_when_equity_is_unavailable() -> None:
@@ -1693,7 +1702,7 @@ def test_refresh_watchlist_passes_the_price_floor_to_the_screener() -> None:
         asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"], account_equity=1220.0))
 
     config = mock_screen.await_args.args[1]
-    assert config.min_price == pytest.approx(24.4)
+    assert config.min_price == pytest.approx(6.1)
 
 
 # --- 決済済み現金による新規建ての制限（発注拒否の回避） -----------------------------
