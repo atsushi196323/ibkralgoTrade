@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import math
+import signal
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
@@ -81,12 +82,14 @@ logger = logging.getLogger(__name__)
 #
 # このリストの性格として、稼働前に理解しておくべきことが3つある。
 #
-# 1. **資金$1,220の取引可能な株価帯（$24.40〜$244）を下回る銘柄が含まれる。**
-#    RIVN($15.22) と JOBY($7.15) は毎日の株価帯判定で除外される（`ScreenerConfig.min_price`
-#    / `resolve_min_tradeable_price`）。株数クランプが掛かって1トレードのリスクが
-#    リスク%に届かず、手数料比率が跳ね上がるためで、2026-07-30に実際に建った
-#    JOBYの建玉がその実例である（CLAUDE.md「検証時の初期資金」）。監視枠は
-#    消費するが建たない。増資すれば帯が下がって自動的に対象へ戻る。
+# 1. **資金$1,220の取引可能な株価帯は $6.10〜$244 である。** 下端は
+#    `MAX_POSITION_SIZE`（40株）から決まる（`resolve_min_tradeable_price`）。
+#    帯を外れた銘柄は毎日の株価帯判定でWARNING付きで除外され、監視枠は消費するが
+#    建たない。**このリストで確認済みなのは JOBY($7.15) と RIVN($15.22) が下端を
+#    上回ることだけで、残りの株価は未確認である**（クランプが10株だった頃は下端が
+#    $24.40で、この2銘柄は毎日除外されていた）。除外が続く銘柄はログで拾えるので、
+#    稼働初日の WARNING を確認すること。増資すると帯全体が比例して上がるため、
+#    安い側の銘柄が逆に落ちる点にも注意（CLAUDE.md「銘柄選定」）。
 # 2. **赤字・新規上場が多く、スクリーニング(PER<=15)では絶対に選ばれない。**
 #    スキャナーの購読権限が通った瞬間、ウォッチリストごと入れ替わって消える。
 # 3. **上場から日が浅い銘柄は日足30本が揃うまでスイング判定に入らない**
@@ -115,9 +118,9 @@ WATCHLIST: List[str] = [
     "MRVL",   # Marvell
     "CBRS",   # Cerebras
     "FRVO",   # Fervo Energy
-    "RIVN",   # Rivian（現在の資金では下限株価を下回り除外される）
+    "RIVN",   # Rivian
     "FIG",    # Figma
-    "JOBY",   # Joby Aviation（同上）
+    "JOBY",   # Joby Aviation（$7.15。下限$6.10に最も近い）
 ]
 
 # ファンダメンタルズスクリーニング（割安株抽出）のパラメータ。
@@ -913,17 +916,17 @@ def resolve_min_tradeable_price(account_equity: float) -> Optional[float]:
 
     除外するのは手数料比率が跳ね上がるため。1注文あたりの最低手数料(0.35 USD)は
     建玉の大きさによらず固定なので、クランプで建玉が縮むとその比率だけが上がる。
-    JOBY(7.05 USD)の実測では、本来34株($238.92)のところ10株($70.50)に
-    クランプされ、往復手数料の約定代金比が0.29% -> 0.99%、リスクが1.00% -> 0.29%
-    になっていた（CLAUDE.md「検証時の初期資金」節）。この条件下では
-    バックテストのPFが実運用に当てはまらない。
+    JOBY(7.05 USD)の実測（当時の10株クランプ）では、本来34株($238.92)のところ
+    10株($70.50)にクランプされ、往復手数料の約定代金比が0.29% -> 0.99%、
+    リスクが1.00% -> 0.29% になっていた（CLAUDE.md「検証時の初期資金」節）。
+    この条件下ではバックテストのPFが実運用に当てはまらない。
 
     上限株価と同じく損切り幅にはスイングの値を使い、資金が取得できない場合
     (0以下)はNoneを返してフィルターを掛けない（ウォッチリストが空になるため）。
 
-    なお floor() があるため、連続量の数量が10.x株になる帯（$1,220なら
-    $22.18〜$24.40）では実際にはクランプが効かない。この帯の上端を下限に
-    置いているので、その分だけ安全側に余計に除外する。
+    なお floor() があるため、連続量の数量が MAX_POSITION_SIZE.x 株になる帯
+    （$1,220・40株なら $5.95〜$6.10）では実際にはクランプが効かない。この帯の
+    上端を下限に置いているので、その分だけ安全側に余計に除外する。
     """
     if account_equity <= 0:
         return None
@@ -1415,6 +1418,23 @@ async def main() -> None:
         await connection.disconnect_async()
 
 
+def _raise_keyboard_interrupt_on_sigterm(_signum: int, _frame: object) -> None:
+    """SIGTERMを KeyboardInterrupt に変換する（`main()` の停止経路へ合流させる）。
+
+    引け後の停止(`scripts/after_close.sh`)はシグナルでBotを止めるが、
+    SIGTERMの既定動作はプロセスの即時終了であり、`main()` の
+    `finally: disconnect_async()` を通らない。ポジション状態は変更のたびに
+    保存されるので取りこぼしは無いものの、IBKRとのソケットは明示的に閉じた方が
+    次回接続で同じclientIdを取り合わずに済む。
+
+    SIGINTで済ませないのは、シェルがバックグラウンドで起動した子プロセスの
+    SIGINTを SIG_IGN にする場合があり（POSIXのジョブ制御）、届いても無視され
+    うるためである。
+    """
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
     configure_logging()
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt_on_sigterm)
     asyncio.run(main())
