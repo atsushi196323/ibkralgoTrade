@@ -82,9 +82,23 @@ logger = logging.getLogger(__name__)
 # **MAX_WATCHLIST_SIZE以内に保つこと。** _refresh_watchlist_asyncの
 # フォールバック経路は株価帯で絞るだけで件数の切り詰めを行わないため、
 # ここの件数がそのまま監視枠＝ペーシング消費になる（6.1節の不変条件）。
+# 後半6銘柄は2026-08-04に運用者の指示で追加したもので、上の選定基準（bars/の
+# 日足で測った押し目頻度）を通していない。**赤字・新規上場が多く、スクリーニング
+# (PER<=15)では絶対に選ばれない**ため、この固定リストにいる間だけ監視される。
+# 上場から日が浅い銘柄は日足30本が揃うまでスイング判定に入らない
+# （_detect_buy_signal_async がWARNINGを出す）。
+#
+# **AMBQ / CBRS / FRVO のティッカーは未確認である。** IBKRで qualify できるか、
+# できたとして意図した会社かを `python -m scripts.check_market_data --symbol AMBQ`
+# で確認すること。取得できない銘柄は株価帯の判定で監視対象から外れる（WARNING付き）
+# ので静かに壊れることは無いが、別会社を掴んでいる場合は気付けない。
+#
+# SpaceX（2026-06-12上場）は**ティッカーが確認できていないため入れていない。**
+# 確認でき次第ここへ追加すること（上限17に対して現在16銘柄なので枠は1つ空けてある）。
 WATCHLIST: List[str] = [
     "ADBE", "ORCL", "NKE", "INTC", "CRM",
     "UPS", "NVDA", "MRK", "SBUX", "DIS",
+    "PLTR", "AMD", "ALAB", "AMBQ", "CBRS", "FRVO",
 ]
 
 # ファンダメンタルズスクリーニング（割安株抽出）のパラメータ。
@@ -95,10 +109,14 @@ SCREENER_MAX_PE_RATIO: float = 15.0
 SCREENER_SCAN_CODE: str = "MOST_ACTIVE"
 SCREENER_NUM_CANDIDATES: int = 50
 # スクリーニング結果から実際に監視する銘柄数の上限。
-# 監視銘柄1件につき毎サイクル1回の日中足リクエストが発生するため、
+# 監視銘柄1件につき毎サイクル1回のリクエストが発生するため、
 # ここを絞ることがIBKRのペーシング制限(10分あたり60件)対策の要になる。
 # 目安: 監視銘柄数 <= POLL_INTERVAL_SECONDS / 10 なら制限内に収まる。
-MAX_WATCHLIST_SIZE: int = 10
+#
+# **POLL_INTERVAL_SECONDS と必ず一緒に決めること。** 2026-08-04に監視銘柄を
+# 増やすため 10 -> 17 に上げ、同時にポーリングを180 -> 300秒へ延ばした
+# （17 * 600/300 = 34件/10分）。片方だけ動かすと不変条件を割る。
+MAX_WATCHLIST_SIZE: int = 17
 
 # スクリーニングに失敗（例外・0件）した後、次に再試行するまでの間隔（秒）。
 #
@@ -124,11 +142,17 @@ SCREENER_TREND_LOOKBACK_DURATION: str = "300 D"
 
 # 監視ループのポーリング間隔（秒）: 市場時間中/時間外で切り替える。
 # 市場時間中の間隔は、IBKRのヒストリカルデータ制限(10分あたり60件)から逆算して
-# 決めている。監視銘柄1件あたり毎サイクル1リクエスト(日中足)なので、
+# 決めている。監視銘柄1件あたり毎サイクル1リクエストなので、
 #     MAX_WATCHLIST_SIZE * (600 / POLL_INTERVAL_SECONDS) <= 60
-# を満たす必要がある。10銘柄・180秒なら約33件/10分で、日足の初回取得や
+# を満たす必要がある。17銘柄・300秒なら34件/10分で、日足の初回取得や
 # スクリーニングの分の余裕も残る。
-POLL_INTERVAL_SECONDS: float = 180.0
+#
+# 300秒にしたのは監視銘柄を17に増やしたため（2026-08-04）。**代償は
+# ボット側で判定する決済（トレーリング）の検知が3分から5分に遅れること。**
+# 利確・損切りはブローカー側の待機注文なので影響しないが、
+# 「ライブのトレーリングはバックテストより遅れて発動する」既知の乖離
+# （CLAUDE.md「決済の置き場所」）はその分だけ広がる。
+POLL_INTERVAL_SECONDS: float = 300.0
 CLOSED_MARKET_POLL_INTERVAL_SECONDS: float = 300.0
 
 # 「再ログインが必要かもしれない」と1行だけ出すまでの、接続失敗の連続ラウンド数。
@@ -365,6 +389,16 @@ async def _detect_buy_signal_async(
     if daily_df.empty and intraday_df.empty:
         logger.warning("%s のヒストリカルデータが取得できなかったためスキップします。", symbol)
         return None
+
+    if 0 < len(daily_df) < SWING_MA_WINDOW:
+        # 新規上場銘柄では現実に起きる。黙ってスキップすると「シグナルが
+        # 出ない銘柄」と区別がつかず、監視枠を占めていることに気付けない。
+        logger.warning(
+            "[%s] 日足が%d本しかなく移動平均(%d本)を確定できないため、"
+            "スイング判定をスキップします（上場から日が浅い銘柄では"
+            "本数が揃うまでエントリーできません）。",
+            symbol, len(daily_df), SWING_MA_WINDOW,
+        )
 
     if len(daily_df) >= SWING_MA_WINDOW:
         market_deviation_pct = await _get_market_deviation_pct_async(ib, caches)

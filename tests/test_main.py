@@ -2249,3 +2249,44 @@ def test_a_rejected_entry_still_counts_toward_the_daily_order_limit(trade_journa
 
     assert position_manager.count_entry_orders_today() == 1
     assert position_manager.has_position("AAPL") is False
+
+
+def test_short_daily_history_is_reported_instead_of_silently_skipped(trade_journal, caplog) -> None:
+    """日足が移動平均の本数に満たない銘柄は、黙って飛ばさず理由を残すこと。
+
+    新規上場銘柄では現実に起きる（ウォッチリストにはIPO直後の銘柄が含まれる）。
+    黙ってスキップすると「シグナルが出ない銘柄」と区別がつかず、監視枠を
+    占めたまま永久にエントリーされないことに気付けない。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    # 移動平均30本に対して10本しか無い日足。
+    short_df = _make_df([100.0] * 10)
+
+    with caplog.at_level(logging.WARNING, logger="main"), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="IPO"))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=short_df)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.0))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.place_bracket_order_async", new=AsyncMock()) as mock_order:
+        asyncio.run(process_symbol_async(ib, "IPO", position_manager, trade_journal))
+
+    assert "日足が10本しかなく" in caplog.text
+    mock_order.assert_not_awaited()
+
+
+def test_full_daily_history_does_not_warn(trade_journal, caplog) -> None:
+    """本数が足りている銘柄では警告を出さないこと（毎サイクル出ると意味を失う）。"""
+    ib = MagicMock()
+    position_manager = PositionManager()
+
+    with caplog.at_level(logging.WARNING, logger="main"), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("data.cache.get_historical_bars_async",
+              new=AsyncMock(return_value=_make_daily_df(drop=False))), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.0))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.place_bracket_order_async", new=AsyncMock()):
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    assert "日足が" not in caplog.text
