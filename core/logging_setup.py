@@ -17,11 +17,17 @@
 import logging
 import logging.handlers
 import re
+import sys
 from pathlib import Path
+from typing import Optional
 
 DEFAULT_LOG_PATH: str = "logs/bot.log"
 
 LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+# 自分が付けたコンソールハンドラの目印。他のライブラリやpytestが挿す
+# StreamHandlerと取り違えないよう、名前で判別する。
+CONSOLE_HANDLER_NAME: str = "ibkralgotrade-console"
 
 # 1ファイル10MB × 10世代。180秒ポーリングで数ヶ月分が収まる一方、
 # ディスクを無制限には食わない量として置いている。
@@ -141,8 +147,17 @@ class DropIbkrNoiseFilter(logging.Filter):
 def configure_logging(
     log_path: str = DEFAULT_LOG_PATH,
     level: int = logging.INFO,
+    console: Optional[bool] = None,
 ) -> None:
     """ルートロガーにコンソールとローテーティングファイルの出力を設定する。
+
+    `console` を省略すると、標準エラーが端末に繋がっているときだけ
+    コンソールへ出す。**常設運用ではコンソール出力が丸ごと無駄になるため。**
+    launchd/systemd 配下では標準エラーがファイルへリダイレクトされ、
+    `bot.log`（10MB×10世代でローテーション）と同じ内容が
+    **ローテーションされないファイル**に積み上がる（実測で `launchd.err` が
+    `bot.log` と同サイズ）。configure_logging が動く前の例外（依存関係の
+    解決失敗など）はPython標準のstderrへ出るので、そちらは従来どおり残る。
 
     インポート時ではなくエントリーポイントから呼ぶこと。インポート時に
     設定すると、`main` を import するだけのテストが `logs/` を作ってしまう。
@@ -175,11 +190,12 @@ def configure_logging(
     file_handler.addFilter(escape_filter)
     root.addHandler(file_handler)
 
-    if not any(
-        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
-        for h in root.handlers
-    ):
+    if console is None:
+        console = sys.stderr.isatty()
+
+    if console and not any(h.name == CONSOLE_HANDLER_NAME for h in root.handlers):
         stream_handler = logging.StreamHandler()
+        stream_handler.name = CONSOLE_HANDLER_NAME
         stream_handler.setFormatter(formatter)
         stream_handler.addFilter(noise_filter)
         stream_handler.addFilter(escape_filter)

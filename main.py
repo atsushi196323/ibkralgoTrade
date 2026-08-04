@@ -656,6 +656,20 @@ async def _process_exit_async(
     # 2. ボット側で判定するもの（大引け前の強制決済・トレーリングストップ）。
     #    どちらも成行で出すため、先に待機注文を取り消さないと、決済済みの銘柄に
     #    売り注文だけが残る。
+    #
+    #    実発注時は、ブローカーが実際に持っていない建玉へSELLを出してはならない。
+    #    ドライラン期間に作った想定ポジションが状態ファイルに残っていると、
+    #    実発注を有効にした瞬間に「持っていない株の成行売り」＝売り建てになる。
+    #    決済を見送る方向は安全側で、損切り・利確はブローカー側の待機注文が
+    #    受け持っている（そもそも待機注文も無いので、守るべき建玉が無い）。
+    if ENABLE_REAL_ORDERS and not position_manager.is_confirmed_by_broker(symbol):
+        logger.error(
+            "[%s] ローカルには建玉がありますが、ブローカー側に実在しません。"
+            "成行決済を見送ります（持っていない株を売ると売り建てになるため）。"
+            "ドライラン期間の想定ポジションが %s に残っている可能性があります。",
+            symbol, DEFAULT_STATE_PATH,
+        )
+        return
     if position.strategy_type == STRATEGY_TYPE_DAY and is_day_trade_flatten_time():
         logger.info(
             "[%s] デイトレードポジションが大引け前の強制決済時刻に達したため決済します。", symbol,

@@ -2155,3 +2155,68 @@ def test_main_refuses_to_start_with_real_orders_on_a_non_paper_port() -> None:
         asyncio.run(main())
 
     connection.connect_async.assert_not_awaited()
+
+
+def test_real_mode_does_not_sell_a_position_the_broker_does_not_hold(trade_journal) -> None:
+    """ドライラン期間の想定ポジションへ、実発注で成行SELLを出さないこと。
+
+    ブローカーが持っていない株を成行で売ると売り建てになる。状態ファイルには
+    ドライラン中に建てた想定ポジションが残りうるため、実発注を有効にした
+    瞬間にこれが起きる。
+    """
+    ib = MagicMock()
+    ib.reqPositionsAsync = AsyncMock(return_value=[])
+    position_manager = PositionManager()
+    position_manager.open_position(
+        "JOBY", entry_price=7.05, quantity=10, risk_per_share=0.3525,
+        strategy_type=STRATEGY_TYPE_SWING,
+    )
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="JOBY"))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=6.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch("main.find_filled_resting_exit", return_value=None), \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()), \
+        patch("main.place_market_order_async", new=AsyncMock()) as mock_order:
+        # 損切り水準(-14%)まで下げても売らない。
+        asyncio.run(run_watchlist_cycle_async(ib, [], position_manager, trade_journal))
+
+    mock_order.assert_not_awaited()
+    assert trade_journal.load_trades() == []
+    # 追跡は消さない。消すと、実は建玉があった場合に無防備な建玉が生まれる。
+    assert position_manager.has_position("JOBY") is True
+
+
+def test_broker_confirmed_position_can_still_be_sold_in_real_mode(trade_journal) -> None:
+    """ブローカー側に実在する建玉は、従来どおり成行決済できること。"""
+    ib = MagicMock()
+    broker_position = MagicMock()
+    broker_position.contract.symbol = "AAPL"
+    broker_position.contract.secType = "STK"
+    broker_position.contract.currency = "USD"
+    broker_position.position = 10
+    broker_position.avgCost = 100.0
+    ib.reqPositionsAsync = AsyncMock(return_value=[broker_position])
+
+    position_manager = PositionManager()
+    position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=10, risk_per_share=5.0,
+        strategy_type=STRATEGY_TYPE_SWING,
+    )
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch("main.find_filled_resting_exit", return_value=None), \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()), \
+        patch(
+            "main.place_market_order_async",
+            new=AsyncMock(return_value=OrderResult("AAPL", "SELL", 10, "MKT",
+                                                   dry_run=False, fill_price=80.0, commission=0.35)),
+        ) as mock_order:
+        asyncio.run(run_watchlist_cycle_async(ib, [], position_manager, trade_journal))
+
+    mock_order.assert_awaited_once()
+    assert len(trade_journal.load_trades()) == 1

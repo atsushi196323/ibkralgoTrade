@@ -107,6 +107,9 @@ class PositionManager:
         # 建てては決済を繰り返す回数は抑えないため、別に数える必要がある。
         self._entry_order_day: Optional[str] = None
         self._entry_orders_today: int = 0
+        # 直近の sync_with_broker_async でブローカー側にも実在が確認できた銘柄。
+        # 永続化しない（再起動後は同期し直すまで「未確認」に戻すのが安全側）。
+        self._broker_confirmed_symbols: set = set()
         self.state_path = state_path
         if state_path:
             self._load()
@@ -366,12 +369,16 @@ class PositionManager:
 
         ブローカー側に存在しないローカルポジション（このBotがドライラン注文で
         建てたが未約定の想定ポジションなど）はそのまま保持し、削除しない。
+        ただし「ブローカーが実際に持っている銘柄」は記録しておく
+        （`is_confirmed_by_broker`）。実発注時に、持っていない建玉へ成行の
+        SELLを出すと売り建てになるため、呼び出し側がそれを防げるようにする。
 
         取り込むのは米国株の現物ロングのみ（TRACKED_SEC_TYPE / TRACKED_CURRENCY）。
         それ以外はこのBotの管理対象外として無視する。
         """
         broker_positions = await ib.reqPositionsAsync()
         changed = False
+        confirmed: set = set()
 
         for broker_position in broker_positions:
             if not self._is_tracked_position(broker_position):
@@ -379,6 +386,7 @@ class PositionManager:
 
             changed = True
             symbol = broker_position.contract.symbol
+            confirmed.add(symbol)
             entry_price = float(broker_position.avgCost)
             quantity = int(broker_position.position)
 
@@ -399,5 +407,16 @@ class PositionManager:
                 existing.quantity = quantity
                 existing.highest_price = max(existing.highest_price, entry_price)
 
+        self._broker_confirmed_symbols = confirmed
+
         if changed:
             self._save()
+
+    def is_confirmed_by_broker(self, symbol: str) -> bool:
+        """直近の同期でブローカー側にも実在が確認できた建玉か。
+
+        ドライランで建てた想定ポジションはブローカーに存在しないため常にFalse。
+        同期をまだ一度も行っていない場合もFalseになる（実在すると分かるまでは
+        「無い」側に倒す。実発注で持っていない株へSELLを出すと売り建てになる）。
+        """
+        return symbol in self._broker_confirmed_symbols

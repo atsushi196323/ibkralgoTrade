@@ -1,11 +1,12 @@
 """稼働ログの出力先設定のテスト。"""
 
 import logging
+import sys
 from pathlib import Path
 
 import pytest
 
-from core.logging_setup import configure_logging
+from core.logging_setup import CONSOLE_HANDLER_NAME, configure_logging
 
 
 @pytest.fixture
@@ -65,15 +66,45 @@ def test_configure_logging_is_idempotent(tmp_path: Path, _restore_root_logger) -
     assert log_path.read_text(encoding="utf-8").count("一度だけ") == 1
 
 
-def test_configure_logging_keeps_console_output(tmp_path: Path, _restore_root_logger) -> None:
-    """ファイルへ出すようになってもコンソールの出力は残ること。"""
+def _console_handlers() -> list:
+    # pytestのcaplogもStreamHandlerを挿すため、名前で自分のものだけを数える。
+    return [h for h in logging.getLogger().handlers if h.name == CONSOLE_HANDLER_NAME]
+
+
+def test_configure_logging_keeps_console_output_on_a_terminal(tmp_path: Path, _restore_root_logger) -> None:
+    """端末から実行したときはコンソールへも出すこと。"""
+    configure_logging(log_path=str(tmp_path / "bot.log"), console=True)
+
+    assert len(_console_handlers()) == 1
+
+
+def test_console_output_is_skipped_when_stderr_is_not_a_terminal(
+    tmp_path: Path, _restore_root_logger, monkeypatch,
+) -> None:
+    """常設運用（launchd等）ではコンソールへ出さないこと。
+
+    標準エラーはローテーションされないファイルへリダイレクトされ、
+    ローテーション付きの bot.log と同じ内容が無制限に積み上がる
+    （実測で launchd.err が bot.log と同サイズになっていた）。
+    """
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
+
     configure_logging(log_path=str(tmp_path / "bot.log"))
 
-    root = logging.getLogger()
-    assert any(
-        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
-        for h in root.handlers
-    )
+    assert _console_handlers() == []
+
+
+def test_startup_failures_still_reach_stderr(tmp_path: Path, _restore_root_logger, monkeypatch) -> None:
+    """コンソール出力を止めても、標準エラー自体は塞がないこと。
+
+    configure_logging が動く前の例外（依存関係の解決失敗など）は
+    Python標準のstderrへ出る。ここを塞ぐと起動失敗が完全に無音になる。
+    """
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
+
+    configure_logging(log_path=str(tmp_path / "bot.log"))
+
+    assert sys.stderr.closed is False
 
 
 def test_importing_main_does_not_create_log_files(tmp_path: Path, monkeypatch) -> None:
