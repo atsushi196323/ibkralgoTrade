@@ -484,6 +484,11 @@ async def _process_entry_async(
     stop_price = resolve_stop_price(price, exit_params.stop_loss_pct)
     take_profit_price = resolve_take_profit_price(price, exit_params.take_profit_pct)
 
+    # 発注は「出した時点」で数える。拒否された注文もブローカーへは届いており、
+    # 約定だけを数えると全件拒否される状況で上限が効かない。
+    attempt = position_manager.record_entry_order_attempt()
+    logger.info("[%s] 本日%d回目の新規建てを発注します。", symbol, attempt)
+
     # 約定しなかった場合（拒否・取消・タイムアウト）は OrderNotFilledError が
     # 飛び、ここから先へは進まない。実体の無い建玉をローカルに記録しないため。
     order_result = await place_bracket_order_async(

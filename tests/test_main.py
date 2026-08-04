@@ -1433,6 +1433,7 @@ def test_entry_is_blocked_after_the_daily_order_limit(trade_journal) -> None:
     # 上限に達した状態を作る（建てては決済を繰り返した後を想定）。
     for i in range(MAX_DAILY_ENTRY_ORDERS):
         symbol = f"SYM{i}"
+        position_manager.record_entry_order_attempt()
         position_manager.open_position(symbol, entry_price=100.0, quantity=1)
         position_manager.close_position(symbol)
 
@@ -1462,6 +1463,7 @@ def test_entry_is_allowed_just_below_the_daily_order_limit(trade_journal) -> Non
     position_manager = PositionManager()
     for i in range(MAX_DAILY_ENTRY_ORDERS - 1):
         symbol = f"SYM{i}"
+        position_manager.record_entry_order_attempt()
         position_manager.open_position(symbol, entry_price=100.0, quantity=1)
         position_manager.close_position(symbol)
 
@@ -1496,6 +1498,7 @@ def test_daily_order_limit_does_not_block_exits(trade_journal) -> None:
     position_manager = PositionManager()
     for i in range(MAX_DAILY_ENTRY_ORDERS):
         symbol = f"SYM{i}"
+        position_manager.record_entry_order_attempt()
         position_manager.open_position(symbol, entry_price=100.0, quantity=1)
         position_manager.close_position(symbol)
     # 上限に達した後も保有中のポジションが残っている状況
@@ -2220,3 +2223,29 @@ def test_broker_confirmed_position_can_still_be_sold_in_real_mode(trade_journal)
 
     mock_order.assert_awaited_once()
     assert len(trade_journal.load_trades()) == 1
+
+
+def test_a_rejected_entry_still_counts_toward_the_daily_order_limit(trade_journal) -> None:
+    """拒否された発注も1日の上限に数えること。
+
+    約定だけを数えると、資金不足などで全件拒否される状況で毎サイクル発注し
+    続けても上限に掛からない。有限回で打ち切るのがこの上限の役目である。
+    """
+    ib = MagicMock()
+    ib.reqPositionsAsync = AsyncMock(return_value=[])
+    position_manager = PositionManager()
+    daily_df = _make_daily_df(drop=True)
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.0))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
+        patch(
+            "main.place_bracket_order_async",
+            new=AsyncMock(side_effect=OrderNotFilledError("rejected")),
+        ):
+        asyncio.run(run_watchlist_cycle_async(ib, ["AAPL"], position_manager, trade_journal))
+
+    assert position_manager.count_entry_orders_today() == 1
+    assert position_manager.has_position("AAPL") is False

@@ -275,20 +275,30 @@ class PositionManager:
         )
         self._positions[symbol] = position
 
+        logger.info(
+            "[%s] ポジションを新規建てしました: entry=%.2f qty=%s strategy=%s "
+            "待機注文 STP=%.2f LMT=%.2f",
+            symbol, entry_price, quantity, strategy_type, stop_price, take_profit_price,
+        )
+        self._save()
+        return position
+
+    def record_entry_order_attempt(self, now: Optional[datetime] = None) -> int:
+        """新規建ての発注を1回数える。**発注する前に呼ぶこと。**
+
+        数えるのは「約定した回数」ではなく「発注した回数」である。実発注では
+        資金不足などで注文が拒否されうるが、拒否された注文も発注として
+        ブローカーへ届いている。約定だけを数えると、全件拒否される状況で
+        毎サイクル発注し続けても上限に掛からず、この上限が止めようとしている
+        「有限回で打ち切る」が成立しない。
+        """
         today = _current_trading_day(now).isoformat()
         if self._entry_order_day != today:
             self._entry_order_day = today
             self._entry_orders_today = 0
         self._entry_orders_today += 1
-
-        logger.info(
-            "[%s] ポジションを新規建てしました: entry=%.2f qty=%s strategy=%s "
-            "待機注文 STP=%.2f LMT=%.2f (本日%d回目の新規建て)",
-            symbol, entry_price, quantity, strategy_type, stop_price, take_profit_price,
-            self._entry_orders_today,
-        )
         self._save()
-        return position
+        return self._entry_orders_today
 
     def update_highest_price(self, symbol: str, current_price: float) -> Position:
         position = self._positions.get(symbol)

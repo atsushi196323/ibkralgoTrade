@@ -581,12 +581,26 @@ def test_entry_order_count_starts_at_zero() -> None:
     assert manager.count_entry_orders_today() == 0
 
 
-def test_open_position_increments_the_daily_entry_order_count() -> None:
+def test_placing_an_entry_order_increments_the_daily_count() -> None:
     manager = PositionManager()
-    manager.open_position("AAPL", entry_price=100.0, quantity=1)
-    manager.open_position("MSFT", entry_price=100.0, quantity=1)
+    manager.record_entry_order_attempt()
+    manager.record_entry_order_attempt()
 
     assert manager.count_entry_orders_today() == 2
+
+
+def test_rejected_orders_are_counted_too() -> None:
+    """約定しなかった発注も数えること。
+
+    実発注では資金不足などで拒否されうる。約定だけを数えると、全件拒否される
+    状況で毎サイクル発注し続けても上限に掛からない。
+    """
+    manager = PositionManager()
+    manager.record_entry_order_attempt()   # 拒否されてポジションは建たない
+    manager.record_entry_order_attempt()
+
+    assert manager.count_entry_orders_today() == 2
+    assert manager.count_open_positions() == 0
 
 
 def test_entry_order_count_is_not_reset_by_closing_positions() -> None:
@@ -595,8 +609,10 @@ def test_entry_order_count_is_not_reset_by_closing_positions() -> None:
     同時保有数の上限とは別に回数を数える意味がここにある。
     """
     manager = PositionManager()
+    manager.record_entry_order_attempt()
     manager.open_position("AAPL", entry_price=100.0, quantity=1)
     manager.close_position("AAPL")
+    manager.record_entry_order_attempt()
     manager.open_position("MSFT", entry_price=100.0, quantity=1)
     manager.close_position("MSFT")
 
@@ -605,10 +621,7 @@ def test_entry_order_count_is_not_reset_by_closing_positions() -> None:
 
 def test_entry_order_count_resets_on_the_next_trading_day() -> None:
     manager = PositionManager()
-    manager.open_position(
-        "AAPL", entry_price=100.0, quantity=1,
-        now=datetime(2026, 3, 10, 15, 0, tzinfo=US_EASTERN),
-    )
+    manager.record_entry_order_attempt(now=datetime(2026, 3, 10, 15, 0, tzinfo=US_EASTERN))
 
     next_day = datetime(2026, 3, 11, 9, 35, tzinfo=US_EASTERN)
 
@@ -620,10 +633,7 @@ def test_entry_order_count_uses_us_eastern_trading_day() -> None:
     """クールダウンと同じ区切り（米国東部時間）で数えること。"""
     manager = PositionManager()
     # 東部時間 3/10 14:00 = 日本時間 3/11 03:00
-    manager.open_position(
-        "AAPL", entry_price=100.0, quantity=1,
-        now=datetime(2026, 3, 10, 14, 0, tzinfo=US_EASTERN),
-    )
+    manager.record_entry_order_attempt(now=datetime(2026, 3, 10, 14, 0, tzinfo=US_EASTERN))
 
     japan_next_day = datetime(2026, 3, 11, 4, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
 
@@ -634,8 +644,8 @@ def test_entry_order_count_survives_restart(tmp_path) -> None:
     """再起動でカウンタが0に戻ると、上限がいくらでも回避できてしまう。"""
     state_path = str(tmp_path / "positions.json")
     manager = PositionManager(state_path=state_path)
-    manager.open_position("AAPL", entry_price=100.0, quantity=1)
-    manager.open_position("MSFT", entry_price=100.0, quantity=1)
+    manager.record_entry_order_attempt()
+    manager.record_entry_order_attempt()
 
     restored = PositionManager(state_path=state_path)
 
