@@ -109,7 +109,7 @@ WATCHLIST: List[str] = [
     "MU",     # Micron
     "SNDK",   # Sandisk
     "CRSP",   # Crispr Therapeutics
-    "SATS",   # EchoStar
+    "ECHO",   # EchoStar
     "AMBQ",   # Ambiq Micro
     "PL",     # Planet Labs
     "MRVL",   # Marvell
