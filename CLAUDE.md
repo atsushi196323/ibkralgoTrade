@@ -89,6 +89,18 @@
 - `logs/positions.json` — 保有ポジションの状態（再起動時に復元される）
 - `logs/bot.log` — 稼働ログ（10MB × 10世代でローテーション）
 - `logs/turnover_ranks.json` — 売買代金ランキングの日次履歴と、組み入れ済みの注目銘柄
+- `logs/after_close.log` — 引け後の締め処理（`scripts/after_close.sh`）の出力。1日あたり数十行の要約だけが積まれるため、ローテーションは置いていない
+
+**1日のサイクルはlaunchdの2本のジョブで閉じている**（macOSの `~/Library/LaunchAgents/`。リポジトリ管理外）。
+
+| ジョブ | 日本時間 | 内容 |
+| --- | --- | --- |
+| `com.user.ibkralgotrade` | 22:15 | Botを起動（寄り付き22:30の15分前に接続を確立しておく） |
+| `com.user.ibkralgotrade.afterclose` | 06:05 | `scripts/after_close.sh`（Bot停止 → 売買代金ランキング記録 → 稼働サマリ） |
+
+**06:05 なのは、夏時間で17:05 ET・冬時間で16:05 ETとなり、年間を通じて必ず引け(16:00 ET)の後になるため。** 05:05にすると冬時間の間はザラ場の最中に停止することになる。停止に **SIGTERM** を使い、`main.py` がこれを `KeyboardInterrupt` へ変換して `disconnect_async()` まで通す（`_raise_keyboard_interrupt_on_sigterm`）。SIGINTにしないのは、シェルがバックグラウンドで起動した子プロセスのSIGINTを `SIG_IGN` にする場合があるため（実測でcaffeinate配下のプロセスが無視した）。
+
+引け後にBotを止めるのは、IB Gatewayのログアウト（08:00 JST）以降に再接続の失敗ログだけが積み上がり、翌日のサマリが読みにくくなるためである。実測では8/4の `bot.log` 1560行のうち67回ぶんの接続試行がこれだった。
 
 **稼働ログをファイルへ残すのは、本プロジェクトの主要な故障モードが例外を出さずに静かに縮退するためである。** スキャナー/PER取得は購読権限が無いと空を返して固定ウォッチリストに縮退し、ペーシング違反は例外ではなく空のバー列として返り、価格取得が3段のどの経路まで落ちたかは戻り値に現れない（「6. IBKR API利用上の制約」）。いずれも異常終了しないため、「なぜ1件も建たなかったのか」は稼働中のログでしか切り分けられない。標準出力だけではターミナルを閉じた時点で消える。
 
@@ -148,6 +160,9 @@ scripts/
   check_market_data.py      実機でマーケットデータの取得経路を切り分ける診断CLI
   check_screener.py         スキャナー・PER取得の購読権限を切り分ける診断CLI
   fetch_bars.py             検証用の日足をCSVへ保存する（yfinance、IBKR接続不要）
+  rank_turnover.py          売買代金ランキングの日次記録（yfinance、観測専用）
+  daily_report.py           1取引日の稼働サマリ（bot.log + trade_journal.csv を読む）
+  after_close.sh            引け後の締め（Bot停止 → ランキング記録 → サマリ出力）
   export_tax_report.py      確定申告用CSVを出力するCLI
 tests/                      単体テスト。IBKRへの実接続は不要（すべてモック）
 conftest.py                 pytest共通設定
@@ -711,6 +726,13 @@ python -m backtest.run --csv-dir bars --market-csv bars/index/SPY.csv \
 # ウォークフォワードのウィンドウ設定（既定: test_barsずつスライド・最低5トレード）
 python -m backtest.run --csv bars/RIVN.csv --train-bars 252 --test-bars 63
 python -m backtest.run --csv bars/RIVN.csv --step-bars 315 --min-trades 1  # 旧来の進め方
+
+# 1取引日の稼働サマリ（IBKR接続不要。「なぜ建たなかったのか」を1画面で見る）
+python -m scripts.daily_report                  # ログ内の直近の取引日
+python -m scripts.daily_report --date 2026-08-04
+
+# 引け後の締め（launchdが日本時間06:05に呼ぶ。手動でも叩ける）
+bash scripts/after_close.sh
 
 # 売買代金ランキングの観測（yfinance、IBKR接続不要。観測のみで監視リストは変えない）
 python -m scripts.rank_turnover                 # universe.txt を使い logs/ へ記録

@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import signal
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2532,3 +2533,14 @@ def test_a_carried_symbol_that_turns_down_is_not_carried_again(tmp_path) -> None
 
     assert result == ["KEEP"]
     assert store.load_attention_symbols() == []
+
+
+def test_sigterm_is_converted_to_keyboard_interrupt():
+    """引け後の停止(scripts/after_close.sh)がSIGTERMで送るため。
+
+    KeyboardInterruptへ変換することで main() の
+    `finally: disconnect_async()` を通り、IBKRとのソケットが明示的に閉じる。
+    SIGTERMの既定動作（即時終了）のままだとこの経路を通らない。
+    """
+    with pytest.raises(KeyboardInterrupt):
+        main_module._raise_keyboard_interrupt_on_sigterm(signal.SIGTERM, None)
