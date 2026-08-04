@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pandas as pd
 import pytest
 
-from strategy.screener import ScreenerConfig, _is_in_long_term_uptrend, screen_value_stocks_async
+from strategy.screener import ScreenerConfig, is_in_long_term_uptrend, screen_value_stocks_async
 
 
 def _make_contract(symbol: str) -> MagicMock:
@@ -91,22 +91,22 @@ def test_screen_value_stocks_excludes_negative_pe_ratio() -> None:
     assert result == []
 
 
-def test_is_in_long_term_uptrend_true_when_close_above_ma() -> None:
+def testis_in_long_term_uptrend_true_when_close_above_ma() -> None:
     df = _make_price_df([100.0] * 199 + [150.0])  # 直近急伸 -> MAを上回る
 
-    assert _is_in_long_term_uptrend(df, ma_window=200) is True
+    assert is_in_long_term_uptrend(df, ma_window=200) is True
 
 
-def test_is_in_long_term_uptrend_false_when_close_below_ma() -> None:
+def testis_in_long_term_uptrend_false_when_close_below_ma() -> None:
     df = _make_price_df([100.0] * 199 + [50.0])  # 直近急落 -> MAを下回る
 
-    assert _is_in_long_term_uptrend(df, ma_window=200) is False
+    assert is_in_long_term_uptrend(df, ma_window=200) is False
 
 
-def test_is_in_long_term_uptrend_none_when_insufficient_data() -> None:
+def testis_in_long_term_uptrend_none_when_insufficient_data() -> None:
     df = _make_price_df([100.0] * 50)
 
-    assert _is_in_long_term_uptrend(df, ma_window=200) is None
+    assert is_in_long_term_uptrend(df, ma_window=200) is None
 
 
 def test_screen_value_stocks_excludes_candidate_below_long_term_trend() -> None:

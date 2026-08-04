@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pandas as pd
 import pytest
 
+import main as main_module
+
 from core.market_hours import US_EASTERN
 from data.market_data import PRICE_SOURCE_HISTORICAL, PRICE_SOURCE_STREAMING, PriceQuote
 from execution.order_manager import (
@@ -18,6 +20,7 @@ from execution.order_manager import (
     OrderResult,
     RestingOrderFill,
 )
+from data.rank_history import RankHistoryStore
 from execution.position_manager import PositionManager, STRATEGY_TYPE_DAY, STRATEGY_TYPE_SWING
 from execution.trade_journal import TradeJournal
 from strategy.exit_signal import REASON_STOP_LOSS, REASON_TAKE_PROFIT
@@ -2299,3 +2302,152 @@ def test_full_daily_history_does_not_warn(trade_journal, caplog) -> None:
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
     assert "日足が" not in caplog.text
+
+
+# --- 売買代金の急上昇による銘柄の入れ替え -------------------------------------------
+
+# スキャナーは順位しか返さないため、履歴と突き合わせて「急に上位へ来た」を判定する。
+# 追加のIBKRリクエストはスキャナー2回だけで、銘柄ごとの取得は行わない。
+
+
+def _attention_bars(prices: dict, ma_below: tuple = ()):
+    """日足を与えるモック環境。
+
+    ma_below に入れた銘柄は200日移動平均を下回る系列（＝下降トレンド）にする。
+    """
+    async def _bars(ib, contract, now=None):
+        price = prices.get(contract.symbol)
+        if price is None:
+            return pd.DataFrame()
+        if contract.symbol in ma_below:
+            # 高値圏から下げてきた系列。直近終値が200日平均を下回る。
+            closes = [price * 2] * 200 + [price] * 20
+        else:
+            closes = [price * 0.5] * 200 + [price] * 20
+        return _make_df(closes)
+
+    return patch("data.cache.DailyBarCache.get_async", new=AsyncMock(side_effect=_bars))
+
+
+def _run_attention(watchlist, ranks, history, prices, ma_below=(), positions=None,
+                   equity=1220.0, tmp_path=None):
+    ib = MagicMock()
+    store = RankHistoryStore(str(tmp_path / "ranks.json"))
+    for index, day in enumerate(history):
+        store.append(f"day-{index:03d}", day)
+
+    position_manager = positions or PositionManager()
+    scans = [list(ranks), []]
+
+    with patch("data.cache.qualify_stock_async",
+               new=AsyncMock(side_effect=lambda ib, symbol: MagicMock(symbol=symbol))), \
+        _attention_bars(prices, ma_below), \
+        patch("main.run_turnover_scan_async", new=AsyncMock(side_effect=scans)) as mock_scan:
+        result = asyncio.run(main_module._apply_attention_watchlist_async(
+            ib, list(watchlist), equity, MarketDataCaches(), position_manager, store,
+            now=datetime(2026, 8, 4, 10, 0, tzinfo=US_EASTERN),
+        ))
+    return result, mock_scan, store
+
+
+def test_surging_symbol_is_added_to_the_watchlist(tmp_path) -> None:
+    """ランク外から上位へ来た銘柄が監視対象に入ること。"""
+    history = [{"OLD": 1} for _ in range(10)]
+    result, mock_scan, _ = _run_attention(
+        watchlist=["KEEP"], ranks=["SURGE"], history=history,
+        prices={"KEEP": 100.0, "SURGE": 50.0}, tmp_path=tmp_path,
+    )
+
+    assert result == ["KEEP", "SURGE"]
+    # 取引所ごとに1回ずつ。numberOfRowsの上限が50のため2回に分けている。
+    assert mock_scan.await_count == 2
+
+
+def test_symbol_below_its_long_term_average_is_dropped(tmp_path) -> None:
+    """下降トレンドの銘柄を監視対象から外すこと。"""
+    history = [{"OLD": 1} for _ in range(10)]
+    result, _, _ = _run_attention(
+        watchlist=["HEALTHY", "STRUGGLING"], ranks=[], history=history,
+        prices={"HEALTHY": 100.0, "STRUGGLING": 80.0}, ma_below=("STRUGGLING",),
+        tmp_path=tmp_path,
+    )
+
+    assert result == ["HEALTHY"]
+
+
+def test_held_positions_are_never_dropped(tmp_path) -> None:
+    """保有中の銘柄は下降トレンドでも監視対象に残すこと。
+
+    外しても決済判定は続く（保有銘柄との和集合を処理するため）が、
+    再エントリーの判断ができなくなる。
+    """
+    position_manager = PositionManager()
+    position_manager.open_position("STRUGGLING", entry_price=80.0, quantity=1)
+    history = [{"OLD": 1} for _ in range(10)]
+
+    result, _, _ = _run_attention(
+        watchlist=["STRUGGLING"], ranks=[], history=history,
+        prices={"STRUGGLING": 80.0}, ma_below=("STRUGGLING",),
+        positions=position_manager, tmp_path=tmp_path,
+    )
+
+    assert result == ["STRUGGLING"]
+
+
+def test_watchlist_never_exceeds_the_monitoring_cap(tmp_path) -> None:
+    """急上昇が何件あっても監視枠を超えないこと（ペーシング制限の不変条件）。"""
+    existing = [f"SYM{i}" for i in range(MAX_WATCHLIST_SIZE)]
+    surges = [f"SURGE{i}" for i in range(10)]
+    prices = {s: 100.0 for s in existing + surges}
+    history = [{"OLD": 1} for _ in range(10)]
+
+    result, _, _ = _run_attention(
+        watchlist=existing, ranks=surges, history=history, prices=prices, tmp_path=tmp_path,
+    )
+
+    assert len(result) == MAX_WATCHLIST_SIZE
+    # 既存の監視銘柄が優先され、急上昇は空いた枠にだけ入る。
+    assert result == existing
+
+
+def test_surging_symbol_outside_the_price_band_is_not_added(tmp_path) -> None:
+    """買えない株価の銘柄は、急上昇していても入れないこと。"""
+    history = [{"OLD": 1} for _ in range(10)]
+    result, _, _ = _run_attention(
+        watchlist=["KEEP"], ranks=["EXPENSIVE"], history=history,
+        prices={"KEEP": 100.0, "EXPENSIVE": 900.0}, tmp_path=tmp_path,
+    )
+
+    assert result == ["KEEP"]
+
+
+def test_nothing_is_added_until_the_history_is_deep_enough(tmp_path) -> None:
+    """履歴が浅いうちは組み入れないこと。
+
+    基準順位がランク外に張り付き、上位銘柄が軒並み「急上昇」になる。
+    """
+    result, _, store = _run_attention(
+        watchlist=["KEEP"], ranks=["SURGE"], history=[{"OLD": 1}],
+        prices={"KEEP": 100.0, "SURGE": 50.0}, tmp_path=tmp_path,
+    )
+
+    assert result == ["KEEP"]
+    # 記録だけは進める（翌日以降の基準になる）。
+    assert len(store.load()) == 2
+
+
+def test_scanner_failure_keeps_the_watchlist_running(tmp_path) -> None:
+    """スキャナーが落ちてもウォッチリストの手入れは続けること。"""
+    ib = MagicMock()
+    store = RankHistoryStore(str(tmp_path / "ranks.json"))
+
+    with patch("data.cache.qualify_stock_async",
+               new=AsyncMock(side_effect=lambda ib, symbol: MagicMock(symbol=symbol))), \
+        _attention_bars({"HEALTHY": 100.0, "STRUGGLING": 80.0}, ("STRUGGLING",)), \
+        patch("main.run_turnover_scan_async", new=AsyncMock(side_effect=RuntimeError("boom"))):
+        result = asyncio.run(main_module._apply_attention_watchlist_async(
+            ib, ["HEALTHY", "STRUGGLING"], 1220.0, MarketDataCaches(),
+            PositionManager(), store,
+        ))
+
+    assert result == ["HEALTHY"]

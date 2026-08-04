@@ -14,6 +14,8 @@ from ib_insync import IB, ScannerSubscription, Stock
 logger = logging.getLogger(__name__)
 
 DEFAULT_SCAN_CODE: str = "MOST_ACTIVE"
+# 売買代金順のスキャン。MOST_ACTIVE は株数ベースなので低位株が上位に来る。
+TURNOVER_SCAN_CODE: str = "MOST_ACTIVE_USD"
 DEFAULT_LOCATION_CODE: str = "STK.US.MAJOR"
 DEFAULT_INSTRUMENT: str = "STK"
 
@@ -86,3 +88,54 @@ async def get_pe_ratio_async(ib: IB, contract: Stock) -> Optional[float]:
     pe_ratio = _extract_ratio(xml_report, PE_RATIO_FIELD_NAME)
     logger.info("%s のPER: %s", contract.symbol, pe_ratio)
     return pe_ratio
+
+
+async def run_turnover_scan_async(
+    ib: IB,
+    location_code: str,
+    number_of_rows: int = 50,
+    above_price: Optional[float] = None,
+    below_price: Optional[float] = None,
+    scan_code: str = TURNOVER_SCAN_CODE,
+) -> List[str]:
+    """売買代金の上位銘柄を、順位の順に並んだシンボルとして返す。
+
+    **`numberOfRows` の上限はIBKR側で50である。** 上位100件が欲しい場合は
+    `location_code` を `STK.NASDAQ` と `STK.NYSE` に分けて2回呼び、統合する。
+
+    **返るのは順位だけで、売買代金の数値は含まれない。** 数値まで得るには
+    銘柄ごとに日足を取り直すことになり、ペーシング枠（10分あたり60件）を
+    使い切る。順位の変化だけで判定するのはこのためである。
+
+    株価の帯は `above_price` / `below_price` としてサーバー側へ渡す。手元で
+    絞ると、買えない銘柄のぶんまでランキングの枠を消費してしまう。
+
+    スキャナーは購読権限が無いと**例外ではなく空を返す**（CLAUDE.md「6.2」）ので、
+    0件のときは警告を出す。
+    """
+    subscription = ScannerSubscription(
+        instrument=DEFAULT_INSTRUMENT,
+        locationCode=location_code,
+        scanCode=scan_code,
+        numberOfRows=number_of_rows,
+    )
+    if above_price is not None:
+        subscription.abovePrice = above_price
+    if below_price is not None:
+        subscription.belowPrice = below_price
+
+    scan_data = await ib.reqScannerDataAsync(subscription)
+    symbols = [item.contractDetails.contract.symbol for item in scan_data]
+
+    if not symbols:
+        logger.warning(
+            "売買代金スキャンの結果が0件でした: scan_code=%s location=%s。"
+            "マーケットスキャナーの購読権限が無い可能性があります。",
+            scan_code, location_code,
+        )
+    else:
+        logger.info(
+            "売買代金スキャン完了: location=%s hits=%d 上位5件=%s",
+            location_code, len(symbols), symbols[:5],
+        )
+    return symbols

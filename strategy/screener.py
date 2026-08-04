@@ -76,7 +76,7 @@ class ScreenerConfig:
     min_price: Optional[float] = None
 
 
-def _is_in_long_term_uptrend(df: pd.DataFrame, ma_window: int) -> Optional[bool]:
+def is_in_long_term_uptrend(df: pd.DataFrame, ma_window: int) -> Optional[bool]:
     """終値がma_window日移動平均を上回っているか判定する。
 
     データ不足で判定できない場合はNoneを返す（除外せず素通しする）。
@@ -143,7 +143,7 @@ async def _passes_bar_based_filters_async(
             return False
 
     if config.enable_trend_filter:
-        in_uptrend = _is_in_long_term_uptrend(daily_df, config.trend_ma_window)
+        in_uptrend = is_in_long_term_uptrend(daily_df, config.trend_ma_window)
         if in_uptrend is None:
             logger.info(
                 "[%s] 長期トレンド判定に必要なデータが不足しているため、フィルターを素通りさせます。",

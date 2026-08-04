@@ -5,7 +5,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import pandas as pd
 from ib_insync import IB, Stock
@@ -14,6 +14,8 @@ from core.connection import IBKRConnection
 from core.logging_setup import configure_logging
 from core.market_hours import US_EASTERN, is_day_trade_flatten_time, is_regular_trading_hours
 from data.cache import ContractCache, DailyBarCache
+from data.fundamentals import run_turnover_scan_async
+from data.rank_history import RankHistoryStore, resolve_store
 from data.market_data import (
     get_current_price_async,
     get_current_price_quote_async,
@@ -49,13 +51,19 @@ from strategy.exit_signal import (
     resolve_stop_price,
     resolve_take_profit_price,
 )
+from strategy.attention import (
+    AttentionConfig,
+    build_rank_map,
+    detect_rank_surges,
+    has_enough_history,
+)
 from strategy.pullback import (
     MarketFilterConfig,
     SignalResult,
     compute_deviation_pct,
     detect_pullback_signal,
 )
-from strategy.screener import ScreenerConfig, screen_value_stocks_async
+from strategy.screener import ScreenerConfig, is_in_long_term_uptrend, screen_value_stocks_async
 
 logger = logging.getLogger(__name__)
 
@@ -125,9 +133,9 @@ SCREENER_NUM_CANDIDATES: int = 50
 # 目安: 監視銘柄数 <= POLL_INTERVAL_SECONDS / 10 なら制限内に収まる。
 #
 # **POLL_INTERVAL_SECONDS と必ず一緒に決めること。** 2026-08-04に監視銘柄を
-# 増やすため 10 -> 17 に上げ、同時にポーリングを180 -> 300秒へ延ばした
-# （17 * 600/300 = 34件/10分）。片方だけ動かすと不変条件を割る。
-MAX_WATCHLIST_SIZE: int = 17
+# 増やすため 10 -> 17 -> 20 と上げ、同時にポーリングを180 -> 300秒へ延ばした
+# （20 * 600/300 = 40件/10分）。片方だけ動かすと不変条件を割る。
+MAX_WATCHLIST_SIZE: int = 20
 
 # スクリーニングに失敗（例外・0件）した後、次に再試行するまでの間隔（秒）。
 #
@@ -141,6 +149,36 @@ MAX_WATCHLIST_SIZE: int = 17
 # 「一時的な不調なら復旧を拾い、恒久的な失敗なら安く諦める」ための妥協である。
 # 900秒なら米国のレギュラーセッション(6.5時間)で最大26回。
 SCREENING_RETRY_INTERVAL_SECONDS: float = 900.0
+
+# 売買代金の急上昇銘柄をウォッチリストへ組み入れるか。
+#
+# **この軸は検証されていない。** 押し目買いのエッジは42銘柄・10年の日足で
+# 確認したものだが、ここで入る銘柄はその母集団と無関係に決まる。しかも
+# 過去時点の売買代金ランキングはIBKRから遡れないため、バックテストで
+# 検証する方法が無い（PERと同じ制約。CLAUDE.md「銘柄選定」）。
+#
+# 急に売買代金の上位へ来る銘柄は、決算やニュースで**価格が再評価されている
+# 最中**であることが多い。そこで出る-5%乖離は、この戦略が狙う「ノイズによる
+# 一時的な下振れ」ではなく新しい価格への移動の初期段階でありうる。
+# 運用者の指示により有効にしているが、成績はこの点を踏まえて読むこと。
+ENABLE_ATTENTION_WATCHLIST: bool = True
+
+# スキャンする取引所と件数。numberOfRowsの上限が50なので、上位100件を得るには
+# 取引所を分けて2回呼ぶ必要がある（data.fundamentals.run_turnover_scan_async）。
+ATTENTION_SCAN_LOCATIONS: Tuple[str, ...] = ("STK.NASDAQ", "STK.NYSE")
+ATTENTION_SCAN_ROWS: int = 50
+
+# 急上昇の判定条件。rank_ceiling=50 は運用者の指定（1〜50位に入ったもの）。
+# min_rank_improvement は検証で決めた値ではなく、監視枠(20)に収まる件数へ
+# 絞るための足切りである。**成績を見てこの値を刻み直してはならない。**
+ATTENTION_CONFIG: AttentionConfig = AttentionConfig(
+    rank_ceiling=50, min_rank_improvement=20, history_window=10, absent_rank=101,
+)
+
+# 下降トレンドの銘柄をウォッチリストから外すときの移動平均日数。
+# 銘柄選定のトレンドフィルター(SCREENER_TREND_MA_WINDOW)と同じ物差しを使う。
+# 選定で通した条件と維持で使う条件が食い違うと、入れた翌日に外すことになる。
+STRUGGLING_MA_WINDOW: int = 200
 # IBKRのペーシング制限を避けるため、PER取得(reqFundamentalDataAsync)を
 # 連続発行せずこの秒数だけ間隔を空ける
 SCREENER_PE_REQUEST_INTERVAL_SECONDS: float = 1.0
@@ -158,7 +196,7 @@ SCREENER_TREND_LOOKBACK_DURATION: str = "300 D"
 # を満たす必要がある。17銘柄・300秒なら34件/10分で、日足の初回取得や
 # スクリーニングの分の余裕も残る。
 #
-# 300秒にしたのは監視銘柄を17に増やしたため（2026-08-04）。**代償は
+# 300秒にしたのは監視銘柄を20に増やしたため（2026-08-04）。**代償は
 # ボット側で判定する決済（トレーリング）の検知が3分から5分に遅れること。**
 # 利確・損切りはブローカー側の待機注文なので影響しないが、
 # 「ライブのトレーリングはバックテストより遅れて発動する」既知の乖離
@@ -940,6 +978,142 @@ async def _filter_symbols_by_price_band_async(
     return kept
 
 
+async def _drop_struggling_symbols_async(
+    ib: IB, symbols: List[str], caches: MarketDataCaches, protected: Sequence[str] = (),
+) -> List[str]:
+    """明確な下降トレンドの銘柄を監視対象から外す。
+
+    判定は銘柄選定と同じ「終値が長期移動平均(`STRUGGLING_MA_WINDOW`日)を
+    下回っているか」で、`strategy.screener.is_in_long_term_uptrend` を共有する。
+    別の物差しを新たに作らないのは、選定で通した条件と維持で使う条件が
+    食い違うと、入れた翌日に外すような振る舞いになるため。
+
+    日足は `DailyBarCache` から取るので追加リクエストは発生しない
+    （キャッシュの取得期間を300日にしてあるのはこの判定のためでもある）。
+
+    **本数が足りず判定できない銘柄は残す。** 新規上場銘柄は200本に届かないが、
+    それは「下降トレンドである」ことを意味しない。分からないものを外すと、
+    上場直後の銘柄が理由も無く監視から消える。
+
+    `protected` は保有中の銘柄。外してもポジションの決済判定は続く
+    （`run_watchlist_cycle_async` が保有銘柄との和集合を処理する）が、
+    再エントリーの判断ができなくなるため残す。
+    """
+    kept: List[str] = []
+    for symbol in symbols:
+        if symbol in protected:
+            kept.append(symbol)
+            continue
+        try:
+            contract = await caches.contracts.get_async(ib, symbol)
+            daily_df = await caches.daily_bars.get_async(ib, contract)
+        except Exception:
+            logger.exception("[%s] トレンド判定に失敗したため、監視対象に残します。", symbol)
+            kept.append(symbol)
+            continue
+
+        in_uptrend = is_in_long_term_uptrend(daily_df, STRUGGLING_MA_WINDOW)
+        if in_uptrend is False:
+            logger.info(
+                "[%s] 終値が%d日移動平均を下回る下降トレンドのため、監視対象から外します。",
+                symbol, STRUGGLING_MA_WINDOW,
+            )
+            continue
+        kept.append(symbol)
+
+    return kept
+
+
+async def _scan_turnover_ranks_async(
+    ib: IB, min_price: Optional[float], max_price: Optional[float],
+) -> Dict[str, int]:
+    """NASDAQとNYSEの売買代金上位を統合し、「銘柄 -> 順位」を返す。
+
+    取引所ごとに分けて呼ぶのは、`numberOfRows` の上限が50だからである
+    （上位100件を1回では取れない）。統合後の順位は
+    `strategy.attention.build_rank_map` が決める。
+    """
+    ranked: List[str] = []
+    for location in ATTENTION_SCAN_LOCATIONS:
+        symbols = await run_turnover_scan_async(
+            ib, location_code=location, number_of_rows=ATTENTION_SCAN_ROWS,
+            above_price=min_price, below_price=max_price,
+        )
+        ranked.extend(symbols)
+    return build_rank_map(ranked)
+
+
+async def _apply_attention_watchlist_async(
+    ib: IB, watchlist: List[str], account_equity: float,
+    caches: MarketDataCaches, position_manager: PositionManager,
+    store: RankHistoryStore, now: Optional[datetime] = None,
+) -> List[str]:
+    """売買代金の急上昇銘柄を組み入れ、下降トレンドの銘柄を落とす。
+
+    1日1回だけ呼ぶこと。スキャナー2回ぶんのリクエストが増える（順位しか
+    見ないので、銘柄ごとの追加取得は行わない）。
+
+    **順序が重要である。** 先に下降トレンドの銘柄を落としてから急上昇銘柄を
+    足す。逆にすると、枠が埋まっていて新しい銘柄が入らない。
+
+    枠は `MAX_WATCHLIST_SIZE` で頭打ちにし、**既存の監視銘柄を優先する**。
+    急上昇は残った枠に上昇幅の大きい順で入る。保有中の銘柄は落とさない。
+    """
+    protected = position_manager.open_symbols()
+    min_price = resolve_min_tradeable_price(account_equity)
+    max_price = resolve_max_affordable_price(account_equity)
+
+    kept = await _drop_struggling_symbols_async(ib, watchlist, caches, protected)
+
+    try:
+        today_ranks = await _scan_turnover_ranks_async(ib, min_price, max_price)
+    except Exception:
+        logger.exception("売買代金スキャンに失敗しました。ウォッチリストの入れ替えのみ行います。")
+        return kept
+
+    if not today_ranks:
+        return kept
+
+    trading_day = (now or datetime.now(US_EASTERN)).astimezone(US_EASTERN).date().isoformat()
+    history = store.load()
+    surges = detect_rank_surges(today_ranks, history, ATTENTION_CONFIG)
+    store.append(trading_day, today_ranks)
+
+    if not has_enough_history(history, ATTENTION_CONFIG):
+        # 履歴が浅いうちは全銘柄の基準がランク外になり、上位が軒並み
+        # 「急上昇」になる。記録だけ進めて組み入れは見送る。
+        logger.info(
+            "売買代金ランキングの履歴が%d日ぶんしかないため、注目銘柄の組み入れは見送ります"
+            "（基準順位が確定するまでは上位銘柄と区別できません）。",
+            len(history),
+        )
+        return kept
+
+    if surges:
+        logger.info("売買代金が急上昇した銘柄: %s", surges)
+
+    added: List[str] = []
+    for symbol in surges:
+        if len(kept) + len(added) >= MAX_WATCHLIST_SIZE:
+            break
+        if symbol in kept or symbol in added:
+            continue
+        added.append(symbol)
+
+    if added:
+        # 株価帯だけは掛け直す。スキャナー側にも渡しているが、通らなかった
+        # 場合（フィルタ非対応の口座など）にそのまま入れてしまわないため。
+        added = await _filter_symbols_by_price_band_async(ib, added, min_price, max_price, caches)
+
+    if added:
+        logger.info(
+            "注目銘柄として監視対象に追加します: %s（監視%d -> %d銘柄）",
+            added, len(kept), len(kept) + len(added),
+        )
+    store.save_attention_symbols(added)
+    return kept + added
+
+
 class WatchlistRefresh(NamedTuple):
     """ウォッチリスト更新の結果と、それがスクリーニング由来かどうか。
 
@@ -1066,6 +1240,8 @@ async def main() -> None:
     # なり（さらに空で返った日にはフォールバック先が消え）、失敗が重なるほど
     # 監視候補が痩せていく。
     fallback_watchlist: List[str] = list(WATCHLIST)
+    # 売買代金ランキングの履歴。急上昇の判定には昨日までの順位が要る。
+    rank_history: RankHistoryStore = resolve_store()
     last_screened_date: Optional[date] = None
     next_screening_attempt_at: Optional[datetime] = None
     # 接続の「一時的な瞬断」と「人手が要る状態」を区別するためのラウンド数。
@@ -1121,6 +1297,21 @@ async def main() -> None:
                                 "（それまではフォールバックのウォッチリストで継続）。",
                                 SCREENING_RETRY_INTERVAL_SECONDS,
                             )
+
+                        if ENABLE_ATTENTION_WATCHLIST:
+                            # 売買代金の急上昇銘柄の組み入れと、下降トレンド銘柄の
+                            # 除外。スクリーニングの成否によらず掛ける（フォールバックの
+                            # 固定リストにも同じ手入れが要る）。失敗しても稼働は続ける。
+                            try:
+                                watchlist = await _apply_attention_watchlist_async(
+                                    ib, watchlist, account_equity, caches,
+                                    position_manager, rank_history, now=now_et,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "注目銘柄の組み入れに失敗しました。"
+                                    "既存のウォッチリストで継続します。",
+                                )
 
                     await run_watchlist_cycle_async(
                         ib, watchlist, position_manager, trade_journal, caches,
