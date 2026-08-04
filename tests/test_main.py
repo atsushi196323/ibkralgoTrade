@@ -2308,6 +2308,10 @@ def test_full_daily_history_does_not_warn(trade_journal, caplog) -> None:
 
 # スキャナーは順位しか返さないため、履歴と突き合わせて「急に上位へ来た」を判定する。
 # 追加のIBKRリクエストはスキャナー2回だけで、銘柄ごとの取得は行わない。
+#
+# 組み入れ(ENABLE_ATTENTION_WATCHLIST)は既定で無効なので、そこを見るテストは
+# 明示的にTrueへ差し替える。下降トレンドの除外(DROP_STRUGGLING_SYMBOLS)は
+# 購読権限も追加リクエストも要らないため既定で有効。
 
 
 def _attention_bars(prices: dict, ma_below: tuple = ()):
@@ -2339,8 +2343,9 @@ def _run_attention(watchlist, ranks, history, prices, ma_below=(), positions=Non
     position_manager = positions or PositionManager()
     scans = [list(ranks), []]
 
-    with patch("data.cache.qualify_stock_async",
-               new=AsyncMock(side_effect=lambda ib, symbol: MagicMock(symbol=symbol))), \
+    with patch("main.ENABLE_ATTENTION_WATCHLIST", True), \
+        patch("data.cache.qualify_stock_async",
+              new=AsyncMock(side_effect=lambda ib, symbol: MagicMock(symbol=symbol))), \
         _attention_bars(prices, ma_below), \
         patch("main.run_turnover_scan_async", new=AsyncMock(side_effect=scans)) as mock_scan:
         result = asyncio.run(main_module._apply_attention_watchlist_async(
@@ -2451,3 +2456,29 @@ def test_scanner_failure_keeps_the_watchlist_running(tmp_path) -> None:
         ))
 
     assert result == ["HEALTHY"]
+
+
+def test_surges_are_ignored_while_the_feature_is_in_observation_mode(tmp_path) -> None:
+    """既定（観測モード）では監視リストを入れ替えないこと。
+
+    スキャナーの購読が無く、かつ「急上昇銘柄がその後どう動くか」を
+    誰も見ていない段階では、組み入れを行わない。下降トレンドの除外だけは
+    追加リクエストも購読も要らないので動く。
+    """
+    ib = MagicMock()
+    store = RankHistoryStore(str(tmp_path / "ranks.json"))
+    for index in range(10):
+        store.append(f"day-{index:03d}", {"OLD": 1})
+
+    with patch("data.cache.qualify_stock_async",
+               new=AsyncMock(side_effect=lambda ib, symbol: MagicMock(symbol=symbol))), \
+        _attention_bars({"KEEP": 100.0, "STRUGGLING": 80.0, "SURGE": 50.0}, ("STRUGGLING",)), \
+        patch("main.run_turnover_scan_async", new=AsyncMock(return_value=["SURGE"])) as mock_scan:
+        result = asyncio.run(main_module._apply_attention_watchlist_async(
+            ib, ["KEEP", "STRUGGLING"], 1220.0, MarketDataCaches(),
+            PositionManager(), store,
+        ))
+
+    assert result == ["KEEP"]
+    # スキャナーは呼ばない（購読が無い口座で無駄なリクエストを出さない）。
+    mock_scan.assert_not_awaited()

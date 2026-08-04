@@ -160,8 +160,19 @@ SCREENING_RETRY_INTERVAL_SECONDS: float = 900.0
 # 急に売買代金の上位へ来る銘柄は、決算やニュースで**価格が再評価されている
 # 最中**であることが多い。そこで出る-5%乖離は、この戦略が狙う「ノイズによる
 # 一時的な下振れ」ではなく新しい価格への移動の初期段階でありうる。
-# 運用者の指示により有効にしているが、成績はこの点を踏まえて読むこと。
-ENABLE_ATTENTION_WATCHLIST: bool = True
+# **したがって既定は無効（観測モード）である。** 有効化の前提が2つ揃っていない:
+#
+# 1. IBKRのスキャナーは購読権限が無いと空を返す（現状そうなっている）
+# 2. 「急上昇と判定された銘柄がその後どう動くか」を誰も見ていない
+#
+# 2つ目は購読なしで進められる。`python -m scripts.rank_turnover` が
+# yfinance経由で日次の売買代金順位を `logs/turnover_ranks.json` へ記録し、
+# 同じ判定ロジック(strategy/attention.py)で急上昇銘柄をログに出す
+# （監視リストは変更しない）。**ただしそれはユニバース内での順位でしかなく、
+# 取引所全体からの発見はスキャナーにしかできない。**
+#
+# 有効にするのは、スキャナーの購読が通り、かつ観測で有用性が確認できてから。
+ENABLE_ATTENTION_WATCHLIST: bool = False
 
 # スキャンする取引所と件数。numberOfRowsの上限が50なので、上位100件を得るには
 # 取引所を分けて2回呼ぶ必要がある（data.fundamentals.run_turnover_scan_async）。
@@ -174,6 +185,11 @@ ATTENTION_SCAN_ROWS: int = 50
 ATTENTION_CONFIG: AttentionConfig = AttentionConfig(
     rank_ceiling=50, min_rank_improvement=20, history_window=10, absent_rank=101,
 )
+
+# 下降トレンドの銘柄をウォッチリストから外すか。**急上昇の組み入れとは
+# 独立した機能である。** こちらは日足キャッシュだけで判定でき、追加の
+# IBKRリクエストも購読権限も要らないため、観測モードでも有効にしている。
+DROP_STRUGGLING_SYMBOLS: bool = True
 
 # 下降トレンドの銘柄をウォッチリストから外すときの移動平均日数。
 # 銘柄選定のトレンドフィルター(SCREENER_TREND_MA_WINDOW)と同じ物差しを使う。
@@ -1050,7 +1066,9 @@ async def _apply_attention_watchlist_async(
 ) -> List[str]:
     """売買代金の急上昇銘柄を組み入れ、下降トレンドの銘柄を落とす。
 
-    1日1回だけ呼ぶこと。スキャナー2回ぶんのリクエストが増える（順位しか
+    1日1回だけ呼ぶこと。2つの機能は独立していて、それぞれ
+    `DROP_STRUGGLING_SYMBOLS` / `ENABLE_ATTENTION_WATCHLIST` で切り替える。
+    組み入れを有効にするとスキャナー2回ぶんのリクエストが増える（順位しか
     見ないので、銘柄ごとの追加取得は行わない）。
 
     **順序が重要である。** 先に下降トレンドの銘柄を落としてから急上昇銘柄を
@@ -1063,7 +1081,12 @@ async def _apply_attention_watchlist_async(
     min_price = resolve_min_tradeable_price(account_equity)
     max_price = resolve_max_affordable_price(account_equity)
 
-    kept = await _drop_struggling_symbols_async(ib, watchlist, caches, protected)
+    kept = (
+        await _drop_struggling_symbols_async(ib, watchlist, caches, protected)
+        if DROP_STRUGGLING_SYMBOLS else list(watchlist)
+    )
+    if not ENABLE_ATTENTION_WATCHLIST:
+        return kept
 
     try:
         today_ranks = await _scan_turnover_ranks_async(ib, min_price, max_price)
@@ -1298,7 +1321,7 @@ async def main() -> None:
                                 SCREENING_RETRY_INTERVAL_SECONDS,
                             )
 
-                        if ENABLE_ATTENTION_WATCHLIST:
+                        if ENABLE_ATTENTION_WATCHLIST or DROP_STRUGGLING_SYMBOLS:
                             # 売買代金の急上昇銘柄の組み入れと、下降トレンド銘柄の
                             # 除外。スクリーニングの成否によらず掛ける（フォールバックの
                             # 固定リストにも同じ手入れが要る）。失敗しても稼働は続ける。

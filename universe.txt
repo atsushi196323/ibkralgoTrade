@@ -1,0 +1,63 @@
+# 売買代金ランキングの観測に使うユニバース（scripts/rank_turnover.py）。
+#
+# **ここに書いていない銘柄は永久に見つからない。** Yahooには「全米国株を
+# 売買代金順に並べる」入口が無いため、順位はこのリストの中だけで付く。
+# 取引所全体から発見したい場合はIBKRのスキャナー購読が要る。
+#
+# 1行1銘柄。空行と # で始まる行は無視される。増やすほど観測の価値は上がるが、
+# yfinanceへの1回のリクエストが重くなる（数百銘柄までは実用的）。
+AAPL
+ABBV
+ADBE
+AMBQ
+AMD
+AVGO
+AXP
+BAC
+CAT
+CBRS
+COST
+CRM
+CRSP
+CSCO
+CVX
+DE
+DIS
+FIG
+FRVO
+GS
+HD
+HON
+INTC
+JNJ
+JOBY
+JPM
+KO
+LMT
+MCD
+MRK
+MRVL
+MSFT
+MU
+NKE
+NVDA
+ORCL
+PEP
+PFE
+PG
+PL
+PLTR
+RIVN
+SATS
+SBUX
+SNDK
+SPCX
+T
+TMO
+TXN
+UNH
+UPS
+VZ
+WFC
+WMT
+XOM
