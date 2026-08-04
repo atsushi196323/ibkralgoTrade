@@ -191,3 +191,133 @@ def test_non_string_messages_are_not_touched(tmp_path: Path, _restore_root_logge
         handler.flush()
 
     assert "AAPL" in log_path.read_text(encoding="utf-8")
+
+
+# --- IBKRの定型通知の抑制 ---------------------------------------------------------
+
+# 2026-08-04時点の logs/bot.log では、データファームの状態通知と ib_insync.client の
+# 接続ログが全体の32%を占め、「なぜ1件も建たなかったのか」の答え（スキャン結果0件）は
+# 1行しか無かった。以下はその1行が埋もれないための境界の固定。
+
+
+def _write_and_read(log_path: Path, name: str, level: int, message: str) -> str:
+    logging.getLogger(name).log(level, message)
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    return log_path.read_text(encoding="utf-8")
+
+
+def test_data_farm_status_notifications_are_dropped(tmp_path: Path, _restore_root_logger) -> None:
+    """接続のたびに繰り返される正常系の状態通知を残さないこと。"""
+    log_path = tmp_path / "bot.log"
+    configure_logging(log_path=str(log_path))
+
+    written = _write_and_read(
+        log_path,
+        "ib_insync.wrapper",
+        logging.INFO,
+        "Warning 2108, reqId -1: マーケットデータファームの接続状況は現在無効です。:usfarm",
+    )
+
+    assert written == ""
+
+
+def test_data_farm_failures_are_kept(tmp_path: Path, _restore_root_logger) -> None:
+    """データファームの障害は残すこと。
+
+    バーが空で返る原因になりうる。空バーは例外にならないため（6.1節）、
+    ここを落とすと「データが無い銘柄」と区別する材料が消える。
+    """
+    log_path = tmp_path / "bot.log"
+    configure_logging(log_path=str(log_path))
+
+    written = _write_and_read(
+        log_path,
+        "ib_insync.wrapper",
+        logging.INFO,
+        "Warning 2103, reqId -1: マーケットデータファームのコネクションが破損されています:usfarm",
+    )
+
+    assert "Warning 2103" in written
+
+
+def test_ibkr_disconnection_errors_are_kept(tmp_path: Path, _restore_root_logger) -> None:
+    """切断のエラーは抑制の対象にしないこと（WARNING以上は素通し）。"""
+    log_path = tmp_path / "bot.log"
+    configure_logging(log_path=str(log_path))
+
+    written = _write_and_read(
+        log_path,
+        "ib_insync.wrapper",
+        logging.ERROR,
+        "Error 1100, reqId -1: IBKRとTrader Workstationの接続が切断されました。",
+    )
+
+    assert "Error 1100" in written
+
+
+def test_ib_insync_connection_progress_is_dropped(tmp_path: Path, _restore_root_logger) -> None:
+    """接続の進行ログは core/connection.py の記録と二重になるため残さないこと。"""
+    log_path = tmp_path / "bot.log"
+    configure_logging(log_path=str(log_path))
+
+    written = _write_and_read(
+        log_path, "ib_insync.client", logging.INFO, "Connecting to 127.0.0.1:4002 with clientId 1..."
+    )
+
+    assert written == ""
+
+
+def test_ib_insync_client_errors_are_kept(tmp_path: Path, _restore_root_logger) -> None:
+    log_path = tmp_path / "bot.log"
+    configure_logging(log_path=str(log_path))
+
+    written = _write_and_read(
+        log_path, "ib_insync.client", logging.ERROR, "API connection failed: ConnectionRefusedError"
+    )
+
+    assert "API connection failed" in written
+
+
+def test_the_screening_degradation_line_survives(tmp_path: Path, _restore_root_logger) -> None:
+    """埋もれていた側の行を落とさないこと。
+
+    スキャナーの購読権限が無いと0件が返り、固定ウォッチリストへ静かに
+    縮退する（「5. 銘柄選定」）。この1行がログを残している理由そのものである。
+    """
+    log_path = tmp_path / "bot.log"
+    configure_logging(log_path=str(log_path))
+
+    written = _write_and_read(
+        log_path,
+        "data.fundamentals",
+        logging.WARNING,
+        "時価総額スキャンの結果が0件でした: scan_code=MOST_ACTIVE",
+    )
+
+    assert "時価総額スキャンの結果が0件でした" in written
+
+
+def test_application_info_logs_are_not_affected(tmp_path: Path, _restore_root_logger) -> None:
+    """抑制はib_insync由来に限ること。自前のINFOは判断の材料そのもの。"""
+    log_path = tmp_path / "bot.log"
+    configure_logging(log_path=str(log_path))
+
+    written = _write_and_read(
+        log_path, "strategy.pullback", logging.INFO, "[XOM] 乖離率=7.41% シグナル=NONE"
+    )
+
+    assert "シグナル=NONE" in written
+
+
+def test_unparseable_ibkr_messages_are_kept(tmp_path: Path, _restore_root_logger) -> None:
+    """コードを読み取れないメッセージは残す側に倒すこと。
+
+    抑制の判定を外したときに、黙って行が消える方が危険である。
+    """
+    log_path = tmp_path / "bot.log"
+    configure_logging(log_path=str(log_path))
+
+    written = _write_and_read(log_path, "ib_insync.wrapper", logging.INFO, "position: Position(...)")
+
+    assert "position: Position(...)" in written

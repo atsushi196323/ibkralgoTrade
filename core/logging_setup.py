@@ -32,6 +32,33 @@ BACKUP_COUNT: int = 10
 # 分断されて判別できなくなる。
 _ESCAPE_RUN = re.compile(r"(?:\\u[0-9a-fA-F]{4})+")
 
+# ib_insync.wrapper が出すIBKRのメッセージの先頭。
+# 実体は `Warning 2104, reqId -1: ...` / `Error 1100, reqId -1: ...`。
+_IBKR_MESSAGE_CODE = re.compile(r"^(?:Warning|Error) (\d+), reqId ")
+
+# 定常運用で繰り返されるだけで、判断に使えない情報を持たないIBKRのコード。
+#
+# 2026-08-04時点の logs/bot.log（1560行）では、この後の ib_insync.client の
+# INFO と合わせて全体の32%を占めていた。内訳は 2108 が131行、2104 が74行、
+# 2119 が66行、10167 が51行。一方で「なぜ1件も建たなかったのか」の答えである
+# 「時価総額スキャンの結果が0件でした」は1行しか無く、この量に埋もれていた。
+#
+# **データファームの障害側（2103/2105/2157）は落とさない。** バーが空で返る
+# 原因になりうるため、ログを残している目的そのものに関わる（「6.1 ペーシング
+# 制限」の空バーと同じく、例外を出さずにデータだけが来なくなる）。落とすのは
+# 正常・接続中・非アクティブといった状態通知に限る。
+_IBKR_STATUS_NOISE_CODES = frozenset(
+    {
+        2104,  # マーケットデータファームの接続には問題ありません
+        2106,  # HMDSデータファーム・コネクションはOKです
+        2107,  # HMDSデータファームの接続が非アクティブです
+        2108,  # マーケットデータファームの接続状況は現在無効です
+        2119,  # マーケットデータのファームに接続中です
+        2158,  # Sec-defデータファームの接続に問題ありません
+        10167,  # 購読が無いため遅延マーケットデータを表示しています
+    }
+)
+
 
 def _decode_escape_run(match: "re.Match[str]") -> str:
     text = match.group(0)
@@ -73,6 +100,44 @@ class DecodeUnicodeEscapesFilter(logging.Filter):
         return True
 
 
+class DropIbkrNoiseFilter(logging.Filter):
+    """IBKRの定型的な状態通知を稼働ログから落とすフィルター。
+
+    ログを残す目的は、静かに縮退した原因を後から切り分けることである
+    （モジュール冒頭）。その答えになる行は1サイクルに1行しか出ないのに対し、
+    ib_insync が中継するデータファームの状態通知は接続のたびに数行ずつ増える。
+    2026-08-04時点の実測で全体の32%がこれで、肝心の1行が埋もれていた。
+
+    落とすのは次の2種類だけで、いずれも**同じ情報を別の行から読める**もの:
+
+    - `_IBKR_STATUS_NOISE_CODES` の状態通知（障害側のコードは残す）
+    - `ib_insync.client` の INFO（接続・切断の進行）。`core/connection.py` が
+      試行回数とホストを添えて同じ出来事を記録しているため二重になる
+
+    WARNING以上は名前空間によらず素通しする。IBKRの切断(1100/1101/1102)や
+    注文の拒否はここで判断できる情報が無く、落とすと復旧の経緯が追えない。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+
+        if record.name.startswith("ib_insync.client"):
+            return False
+
+        if record.name != "ib_insync.wrapper":
+            return True
+
+        try:
+            match = _IBKR_MESSAGE_CODE.match(record.getMessage())
+        except Exception:  # noqa: BLE001 - ログ整形で稼働を止めない
+            return True
+
+        if match is None:
+            return True
+        return int(match.group(1)) not in _IBKR_STATUS_NOISE_CODES
+
+
 def configure_logging(
     log_path: str = DEFAULT_LOG_PATH,
     level: int = logging.INFO,
@@ -97,6 +162,7 @@ def configure_logging(
 
     formatter = logging.Formatter(LOG_FORMAT)
     escape_filter = DecodeUnicodeEscapesFilter()
+    noise_filter = DropIbkrNoiseFilter()
 
     file_handler = logging.handlers.RotatingFileHandler(
         resolved,
@@ -105,6 +171,7 @@ def configure_logging(
         encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
+    file_handler.addFilter(noise_filter)
     file_handler.addFilter(escape_filter)
     root.addHandler(file_handler)
 
@@ -114,5 +181,6 @@ def configure_logging(
     ):
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(formatter)
+        stream_handler.addFilter(noise_filter)
         stream_handler.addFilter(escape_filter)
         root.addHandler(stream_handler)
