@@ -77,6 +77,10 @@ class Position:
     # 待機注文を結んでいるOCAグループ名。ボット側の判断で成行決済した際に、
     # 残っている待機注文を取り消すために使う。
     oca_group: Optional[str] = None
+    # 新規建て時に支払った手数料(USD)。決済時に往復ぶんをまとめて損益へ
+    # 織り込むため、建玉と一緒に持ち越す（決済時には決済側の手数料しか
+    # 分からない）。ドライラン中と、ブローカー同期で取り込んだ建玉は0.0。
+    entry_commission: float = 0.0
 
 
 class PositionManager:
@@ -239,6 +243,7 @@ class PositionManager:
         strategy_type: str = STRATEGY_TYPE_UNKNOWN,
         stop_price: float = 0.0, take_profit_price: float = 0.0,
         oca_group: Optional[str] = None,
+        entry_commission: float = 0.0,
         now: Optional[datetime] = None,
     ) -> Position:
         if entry_price <= 0:
@@ -263,6 +268,7 @@ class PositionManager:
             stop_price=stop_price,
             take_profit_price=take_profit_price,
             oca_group=oca_group,
+            entry_commission=entry_commission,
         )
         self._positions[symbol] = position
 

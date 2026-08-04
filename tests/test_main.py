@@ -3,13 +3,21 @@
 import asyncio
 import logging
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
 import pytest
 
+from core.market_hours import US_EASTERN
 from data.market_data import PRICE_SOURCE_HISTORICAL, PRICE_SOURCE_STREAMING, PriceQuote
-from execution.order_manager import MAX_POSITION_SIZE, DryRunBracketResult, DryRunOrderResult
+from execution.order_manager import (
+    MAX_POSITION_SIZE,
+    BracketResult,
+    OrderNotFilledError,
+    OrderResult,
+    RestingOrderFill,
+)
 from execution.position_manager import PositionManager, STRATEGY_TYPE_DAY, STRATEGY_TYPE_SWING
 from execution.trade_journal import TradeJournal
 from strategy.exit_signal import REASON_STOP_LOSS, REASON_TAKE_PROFIT
@@ -20,12 +28,16 @@ from main import (
     MARKET_INDEX_SYMBOL,
     MAX_CONCURRENT_POSITIONS,
     MAX_DAILY_ENTRY_ORDERS,
+    CONNECTION_FAILURE_ROUNDS_BEFORE_MANUAL_LOGIN,
     MAX_WATCHLIST_SIZE,
     POLL_INTERVAL_SECONDS,
+    SCREENING_RETRY_INTERVAL_SECONDS,
     RISK_PER_TRADE_PCT,
     SWING_MA_WINDOW,
     SWING_STOP_LOSS_PCT,
+    WATCHLIST,
     MarketDataCaches,
+    WatchlistRefresh,
     _refresh_watchlist_async,
     main,
     process_symbol_async,
@@ -60,12 +72,17 @@ def _make_daily_df(*, drop: bool = False) -> pd.DataFrame:
     return _make_df([100.0] * SWING_MA_WINDOW)
 
 
-def _bracket_result(quantity: int, symbol: str = "AAPL") -> DryRunBracketResult:
+def _bracket_result(quantity: int, symbol: str = "AAPL") -> BracketResult:
     """新規建て時のブラケット注文の戻り値（値段は呼び出し側の検証対象外）。"""
-    return DryRunBracketResult(
+    return BracketResult(
         symbol=symbol, quantity=quantity, stop_price=0.0, take_profit_price=0.0,
         oca_group="OCA_TEST",
     )
+
+
+def _order_result(quantity: int = 1, symbol: str = "AAPL", action: str = "SELL") -> OrderResult:
+    """ドライラン相当の成行注文の戻り値（約定価格が無く、呼び出し側が観測価格で代用する）。"""
+    return OrderResult(symbol=symbol, action=action, quantity=quantity, order_type="MKT")
 
 
 @pytest.fixture
@@ -92,7 +109,7 @@ def test_process_symbol_opens_position_on_swing_daily_buy_signal(trade_journal) 
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
-            "main.place_dry_run_bracket_order_async",
+            "main.place_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=250)),
         ) as mock_order:
 
@@ -144,7 +161,7 @@ def test_process_symbol_skips_intraday_buy_signal_while_day_trading_is_disabled(
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
-            "main.place_dry_run_bracket_order_async",
+            "main.place_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=222)),
         ) as mock_order:
 
@@ -177,7 +194,7 @@ def test_process_symbol_opens_position_on_intraday_buy_signal_when_daily_flat(tr
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
-            "main.place_dry_run_bracket_order_async",
+            "main.place_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=222)),
         ) as mock_order:
 
@@ -202,7 +219,7 @@ def test_process_symbol_skips_entry_when_risk_based_quantity_is_zero(trade_journ
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=1.0)), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -223,7 +240,7 @@ def test_process_symbol_does_not_open_position_when_no_buy_signal_on_either_time
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=intraday_df)), \
         patch("main.get_current_price_async", new=AsyncMock()) as mock_price, \
         patch("main.get_current_price_quote_async", new=AsyncMock()) as mock_quote, \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -241,7 +258,7 @@ def test_process_symbol_skips_entry_when_both_timeframes_have_no_data(trade_jour
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=pd.DataFrame())), \
         patch("main.get_intraday_bars_async", new=AsyncMock(return_value=pd.DataFrame())), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -269,7 +286,7 @@ def test_process_symbol_skips_entry_when_max_concurrent_positions_reached(trade_
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -300,7 +317,7 @@ def test_process_symbol_skips_entry_when_daily_loss_circuit_breaker_tripped(trad
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -325,7 +342,7 @@ def test_daily_loss_circuit_breaker_does_not_block_exits(trade_journal) -> None:
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -348,7 +365,7 @@ def test_process_symbol_closes_position_on_exit_signal(trade_journal) -> None:
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -393,7 +410,7 @@ def test_process_symbol_records_none_r_multiple_when_risk_per_share_unknown(trad
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()):
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())):
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -411,7 +428,7 @@ def test_process_symbol_keeps_position_when_no_exit_signal(trade_journal) -> Non
     with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=101.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(101.0))), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -432,7 +449,7 @@ def test_process_symbol_updates_highest_price_for_trailing_stop(trade_journal) -
         patch("main.get_current_price_async", new=AsyncMock(return_value=108.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(108.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -459,7 +476,7 @@ def test_day_position_uses_tighter_stop_loss_than_swing_position(trade_journal) 
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(97.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.is_day_trade_flatten_time", return_value=False), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -481,7 +498,7 @@ def test_swing_position_keeps_open_at_move_that_would_stop_out_a_day_position(tr
         patch("main.get_current_price_async", new=AsyncMock(return_value=97.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(97.0))), \
         patch("main.is_day_trade_flatten_time", return_value=False), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -503,7 +520,7 @@ def test_day_position_force_closed_at_eod_flatten_time_even_without_exit_signal(
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.5))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.is_day_trade_flatten_time", return_value=True), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -526,7 +543,7 @@ def test_swing_position_not_force_closed_at_eod_flatten_time(trade_journal) -> N
         patch("main.get_current_price_async", new=AsyncMock(return_value=100.5)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.5))), \
         patch("main.is_day_trade_flatten_time", return_value=True), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -553,9 +570,9 @@ def test_process_symbol_opens_day_position_with_day_specific_risk_per_share(trad
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
-            "main.place_dry_run_order_async",
+            "main.place_market_order_async",
             new=AsyncMock(
-                side_effect=lambda ib, contract, action, quantity: DryRunOrderResult(
+                side_effect=lambda ib, contract, action, quantity: OrderResult(
                     symbol="AAPL", action=action, quantity=quantity, order_type="MKT"
                 )
             ),
@@ -645,7 +662,7 @@ def test_refresh_watchlist_uses_screening_result_when_available() -> None:
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=["CHEAP1", "CHEAP2"])):
         result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"], account_equity=100_000.0))
 
-    assert result == ["CHEAP1", "CHEAP2"]
+    assert result == WatchlistRefresh(["CHEAP1", "CHEAP2"], screened=True)
 
 
 @contextmanager
@@ -671,7 +688,7 @@ def test_refresh_watchlist_falls_back_when_screening_returns_empty() -> None:
         _fallback_prices({"FALLBACK": 100.0}):
         result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"], account_equity=1220.0))
 
-    assert result == ["FALLBACK"]
+    assert result == WatchlistRefresh(["FALLBACK"], screened=False)
 
 
 def test_refresh_watchlist_falls_back_when_screening_raises() -> None:
@@ -681,7 +698,7 @@ def test_refresh_watchlist_falls_back_when_screening_raises() -> None:
         _fallback_prices({"FALLBACK": 100.0}):
         result = asyncio.run(_refresh_watchlist_async(ib, ["FALLBACK"], account_equity=1220.0))
 
-    assert result == ["FALLBACK"]
+    assert result == WatchlistRefresh(["FALLBACK"], screened=False)
 
 
 def test_fallback_watchlist_is_filtered_by_the_tradeable_price_band() -> None:
@@ -704,7 +721,7 @@ def test_fallback_watchlist_is_filtered_by_the_tradeable_price_band() -> None:
             ib, ["PENNY", "NORMAL", "PRICEY"], account_equity=1220.0,
         ))
 
-    assert result == ["NORMAL"]
+    assert result == WatchlistRefresh(["NORMAL"], screened=False)
 
 
 def test_fallback_watchlist_drops_symbols_with_unknown_price() -> None:
@@ -717,7 +734,7 @@ def test_fallback_watchlist_drops_symbols_with_unknown_price() -> None:
             ib, ["NORMAL", "NOBARS"], account_equity=1220.0,
         ))
 
-    assert result == ["NORMAL"]
+    assert result == WatchlistRefresh(["NORMAL"], screened=False)
 
 
 def test_empty_tradeable_band_yields_an_empty_watchlist_not_a_silent_fallback(caplog) -> None:
@@ -739,7 +756,7 @@ def test_empty_tradeable_band_yields_an_empty_watchlist_not_a_silent_fallback(ca
             ib, ["AAPL", "MSFT"], account_equity=100_000.0,
         ))
 
-    assert result == []
+    assert result == WatchlistRefresh([], screened=False)
     assert any(record.levelno == logging.ERROR for record in caplog.records)
 
 
@@ -815,7 +832,10 @@ def test_main_continues_after_unexpected_exception_in_cycle() -> None:
 
     with patch("main.IBKRConnection", return_value=connection), \
         patch("main.is_regular_trading_hours", return_value=True), \
-        patch("main._refresh_watchlist_async", new=AsyncMock(return_value=["AAPL"])), \
+        patch(
+            "main._refresh_watchlist_async",
+            new=AsyncMock(return_value=WatchlistRefresh(["AAPL"], screened=True)),
+        ), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
@@ -848,6 +868,210 @@ def test_main_retries_after_connection_error_exhausted() -> None:
     connection.disconnect_async.assert_awaited_once()
 
 
+# --- 復帰しない切断の切り分け ------------------------------------------------------
+
+# 再試行のログだけでは、瞬断・Auto restart（数分で復帰する）と、再ログインが要る
+# 状態（再試行では永久に解けない）が区別できない。2026-08-04のログでは同じ2行が
+# 9分おきに6回並んでいた。
+
+
+_MANUAL_LOGIN_HINT = "再ログインが必要な可能性があります"
+
+
+def _run_main_with_connection(connection, max_sleeps: int, market_open: bool = True) -> None:
+    sleep_calls = {"n": 0}
+
+    async def fake_sleep(_seconds):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= max_sleeps:
+            raise KeyboardInterrupt()
+
+    with patch("main.IBKRConnection", return_value=connection), \
+        patch("main.is_regular_trading_hours", return_value=market_open), \
+        patch("main.run_watchlist_cycle_async", new=AsyncMock()), \
+        patch("main._refresh_watchlist_async",
+              new=AsyncMock(return_value=WatchlistRefresh([], screened=True))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=1220.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=1220.0)), \
+        patch("main.asyncio.sleep", new=fake_sleep):
+        asyncio.run(main())
+
+
+def test_manual_login_hint_is_not_emitted_for_a_short_outage(caplog) -> None:
+    """Auto restart相当の長さでは出さないこと（誤検知するとこの行の意味が薄れる）。"""
+    connection = _make_fake_connection(ConnectionError("boom"))
+
+    with caplog.at_level(logging.ERROR, logger="main"):
+        _run_main_with_connection(connection, CONNECTION_FAILURE_ROUNDS_BEFORE_MANUAL_LOGIN - 1)
+
+    assert _MANUAL_LOGIN_HINT not in caplog.text
+
+
+def test_manual_login_hint_is_emitted_once_after_repeated_failures(caplog) -> None:
+    """規定ラウンドを超えたら、繰り返しではなく1行だけ出すこと。"""
+    connection = _make_fake_connection(ConnectionError("boom"))
+
+    with caplog.at_level(logging.ERROR, logger="main"):
+        # 規定ラウンドの倍まで失敗を続けても、この行は増えない。
+        _run_main_with_connection(connection, CONNECTION_FAILURE_ROUNDS_BEFORE_MANUAL_LOGIN * 2)
+
+    assert caplog.text.count(_MANUAL_LOGIN_HINT) == 1
+
+
+def test_closed_market_outages_do_not_trigger_the_manual_login_hint(caplog) -> None:
+    """市場時間外の接続失敗は数えないこと。
+
+    IB Gatewayを日次で落とす運用（検証中は日本時間8:00にログアウトし22:30に
+    再ログイン）では、閉場中に何十ラウンドも失敗するのが正常な状態である。
+    数えると案内が毎日出て、本当に人手が要るときと見分けがつかなくなる。
+    """
+    connection = _make_fake_connection(ConnectionError("boom"))
+
+    with caplog.at_level(logging.INFO, logger="main"):
+        _run_main_with_connection(
+            connection, CONNECTION_FAILURE_ROUNDS_BEFORE_MANUAL_LOGIN * 3, market_open=False,
+        )
+
+    assert _MANUAL_LOGIN_HINT not in caplog.text
+    # 沈黙はさせない（再試行していることは残す）。
+    assert "市場時間外" in caplog.text
+
+
+def test_connection_failure_streak_resets_after_a_successful_connect(caplog) -> None:
+    """接続に成功したら連続回数を0に戻すこと。
+
+    戻さないと、断続的な瞬断が積み上がって「再ログインが要る」と誤って
+    言い出し、本当に人手が要るときの行と見分けがつかなくなる。
+    """
+    ib = MagicMock()
+    # 接続直後のサイクルはisConnected()=True、その次のサイクルでは切れている
+    # （= 再度connect_asyncが呼ばれる）。
+    ib.isConnected = MagicMock(side_effect=[True, False] + [False] * 10)
+    failures_before = CONNECTION_FAILURE_ROUNDS_BEFORE_MANUAL_LOGIN - 1
+    failures_after = CONNECTION_FAILURE_ROUNDS_BEFORE_MANUAL_LOGIN - 1
+    connection = _make_fake_connection(
+        [ConnectionError("boom")] * failures_before + [ib] + [ConnectionError("boom")] * 10
+    )
+
+    with caplog.at_level(logging.ERROR, logger="main"):
+        # 合計の失敗回数は規定ラウンドを超えるが、間に成功を挟んでいる。
+        _run_main_with_connection(connection, failures_before + 1 + failures_after)
+
+    assert _MANUAL_LOGIN_HINT not in caplog.text
+
+
+# --- スクリーニング失敗後の再試行 --------------------------------------------------
+
+# スキャナーもPER取得も購読権限が無いと例外ではなく空を返すが（6.2）、同じ形の
+# 空応答は起動直後やデータファームの再接続中にも起きる。1回目の結果でその日の
+# 選定を確定させると、一時的な失敗が一日ぶんの固定リスト運転になる。
+
+
+@contextmanager
+def _main_loop_at(times, refresh_results):
+    """指定した東部時間で main() のサイクルを回す。
+
+    times の要素数だけサイクルを回して KeyboardInterrupt で抜ける。
+    """
+    clock = iter(times)
+    ib = MagicMock()
+    ib.isConnected = MagicMock(return_value=True)
+    connection = _make_fake_connection([ib] * (len(times) + 1))
+
+    def _now(_tz=None):
+        try:
+            return next(clock)
+        except StopIteration:
+            raise KeyboardInterrupt()
+
+    async def fake_sleep(_seconds):
+        return None
+
+    refresh = AsyncMock(side_effect=refresh_results)
+    fake_datetime = MagicMock()
+    fake_datetime.now = _now
+
+    with patch("main.IBKRConnection", return_value=connection), \
+        patch("main.is_regular_trading_hours", return_value=True), \
+        patch("main.datetime", fake_datetime), \
+        patch("main._refresh_watchlist_async", new=refresh), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=1220.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=1220.0)), \
+        patch("main.run_watchlist_cycle_async", new=AsyncMock()) as cycle, \
+        patch("main.asyncio.sleep", new=fake_sleep):
+        asyncio.run(main())
+        yield refresh, cycle
+
+
+def test_screening_is_retried_after_a_fallback() -> None:
+    """フォールバックした日は、間隔を空けて再試行すること。"""
+    start = datetime(2026, 8, 4, 10, 0, tzinfo=US_EASTERN)
+    times = [start, start + timedelta(seconds=SCREENING_RETRY_INTERVAL_SECONDS)]
+
+    with _main_loop_at(
+        times,
+        [
+            WatchlistRefresh(["FALLBACK"], screened=False),
+            WatchlistRefresh(["SCREENED"], screened=True),
+        ],
+    ) as (refresh, cycle):
+        pass
+
+    assert refresh.await_count == 2
+    # 再試行が成功した時点で、そのサイクルからスクリーニング結果を監視する。
+    assert cycle.await_args_list[-1].args[1] == ["SCREENED"]
+
+
+def test_successful_screening_is_not_repeated_within_the_day() -> None:
+    """成功した日は再実行しないこと（スキャナー要求を1日1回に保つ）。"""
+    start = datetime(2026, 8, 4, 10, 0, tzinfo=US_EASTERN)
+    times = [start, start + timedelta(hours=3)]
+
+    with _main_loop_at(times, [WatchlistRefresh(["SCREENED"], screened=True)]) as (refresh, _):
+        pass
+
+    assert refresh.await_count == 1
+
+
+def test_screening_retry_waits_for_the_retry_interval() -> None:
+    """再試行は毎サイクルではないこと。
+
+    購読権限が無い口座では失敗が復旧しないため、毎サイクル(180秒)叩くと
+    一日中スキャナー要求とログを出し続けることになる。
+    """
+    start = datetime(2026, 8, 4, 10, 0, tzinfo=US_EASTERN)
+    times = [start, start + timedelta(seconds=POLL_INTERVAL_SECONDS)]
+
+    with _main_loop_at(times, [WatchlistRefresh(["FALLBACK"], screened=False)]) as (refresh, cycle):
+        pass
+
+    assert refresh.await_count == 1
+    # 再試行を待つ間もフォールバックのウォッチリストで監視は続く。
+    assert cycle.await_count == 2
+    assert cycle.await_args_list[-1].args[1] == ["FALLBACK"]
+
+
+def test_fallback_source_is_not_narrowed_by_previous_fallbacks() -> None:
+    """フォールバック元は成功時だけ入れ替えること。
+
+    株価帯で絞られた結果を次回のフォールバック元にすると、失敗が重なるほど
+    監視候補が痩せる。空で返った日には候補そのものが消える。
+    """
+    start = datetime(2026, 8, 4, 10, 0, tzinfo=US_EASTERN)
+    times = [start, start + timedelta(seconds=SCREENING_RETRY_INTERVAL_SECONDS)]
+
+    with _main_loop_at(
+        times,
+        [
+            WatchlistRefresh([], screened=False),
+            WatchlistRefresh([], screened=False),
+        ],
+    ) as (refresh, _):
+        pass
+
+    assert [call.args[1] for call in refresh.await_args_list] == [WATCHLIST, WATCHLIST]
+
+
 # --- ペーシング制限対策 ----------------------------------------------------------
 
 
@@ -859,8 +1083,8 @@ def test_watchlist_is_capped_to_limit_screening_request_volume() -> None:
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=screened)):
         result = asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"], account_equity=100_000.0))
 
-    assert len(result) == MAX_WATCHLIST_SIZE
-    assert result == screened[:MAX_WATCHLIST_SIZE]
+    assert len(result.symbols) == MAX_WATCHLIST_SIZE
+    assert result.symbols == screened[:MAX_WATCHLIST_SIZE]
 
 
 def test_watchlist_below_cap_is_kept_intact() -> None:
@@ -869,7 +1093,7 @@ def test_watchlist_below_cap_is_kept_intact() -> None:
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=screened)):
         result = asyncio.run(_refresh_watchlist_async(MagicMock(), ["FALLBACK"], account_equity=100_000.0))
 
-    assert result == screened
+    assert result.symbols == screened
 
 
 def test_poll_interval_keeps_watchlist_within_ibkr_pacing_limit() -> None:
@@ -882,6 +1106,19 @@ def test_poll_interval_keeps_watchlist_within_ibkr_pacing_limit() -> None:
     requests_per_10min = MAX_WATCHLIST_SIZE * (600.0 / POLL_INTERVAL_SECONDS)
 
     assert requests_per_10min <= 60
+
+
+def test_fallback_watchlist_stays_within_the_monitoring_cap() -> None:
+    """固定ウォッチリストがMAX_WATCHLIST_SIZEを超えないこと。
+
+    _refresh_watchlist_asyncのフォールバック経路は株価帯で絞るだけで
+    件数の切り詰めを行わない（スクリーニング経路だけが上位N件に絞る）。
+    そのためこのリストの件数がそのまま監視枠になり、増やすと上の
+    ペーシング不変条件を黙って割る。
+    """
+    assert len(WATCHLIST) <= MAX_WATCHLIST_SIZE
+
+    assert len(set(WATCHLIST)) == len(WATCHLIST), "重複した銘柄が監視枠を二重に消費します。"
 
 
 def test_daily_bars_are_fetched_once_per_symbol_across_cycles(trade_journal) -> None:
@@ -991,8 +1228,8 @@ def test_resting_stop_order_closes_the_position_without_a_market_order(trade_jou
         patch("main.get_current_price_async", new=AsyncMock(return_value=85.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(85.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order, \
-        patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()) as mock_cancel:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order, \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()) as mock_cancel:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -1021,7 +1258,7 @@ def test_resting_limit_order_closes_position_at_the_take_profit_price(trade_jour
         patch("main.get_current_price_async", new=AsyncMock(return_value=115.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(115.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -1052,8 +1289,8 @@ def test_trailing_stop_cancels_resting_orders_before_selling_at_market(trade_jou
         patch("main.get_current_price_async", new=AsyncMock(return_value=102.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(102.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order, \
-        patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()) as mock_cancel:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order, \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()) as mock_cancel:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -1076,8 +1313,8 @@ def test_eod_flatten_cancels_resting_orders_before_selling_at_market(trade_journ
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.5))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch("main.is_day_trade_flatten_time", return_value=True), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order, \
-        patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()) as mock_cancel:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order, \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()) as mock_cancel:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -1098,7 +1335,7 @@ def test_broker_synced_position_without_resting_orders_still_exits_on_signal(tra
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -1126,7 +1363,7 @@ def test_entry_is_skipped_for_a_symbol_already_closed_today(trade_journal) -> No
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
-        patch("main.place_dry_run_bracket_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_bracket_order_async", new=AsyncMock(return_value=_bracket_result(quantity=1))) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -1153,7 +1390,7 @@ def test_cooldown_does_not_block_other_symbols(trade_journal) -> None:
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
-            "main.place_dry_run_bracket_order_async",
+            "main.place_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=250, symbol="MSFT")),
         ) as mock_order:
 
@@ -1208,7 +1445,7 @@ def test_entry_is_blocked_after_the_daily_order_limit(trade_journal) -> None:
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
-        patch("main.place_dry_run_bracket_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_bracket_order_async", new=AsyncMock(return_value=_bracket_result(quantity=1))) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -1238,7 +1475,7 @@ def test_entry_is_allowed_just_below_the_daily_order_limit(trade_journal) -> Non
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
-            "main.place_dry_run_bracket_order_async",
+            "main.place_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=250)),
         ) as mock_order:
 
@@ -1270,10 +1507,10 @@ def test_daily_order_limit_does_not_block_exits(trade_journal) -> None:
         patch("main.get_current_price_async", new=AsyncMock(return_value=80.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
-        patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()), \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()), \
         patch(
-            "main.place_dry_run_order_async",
-            new=AsyncMock(return_value=DryRunOrderResult("AAPL", "SELL", 3, "MKT")),
+            "main.place_market_order_async",
+            new=AsyncMock(return_value=OrderResult("AAPL", "SELL", 3, "MKT")),
         ) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
@@ -1303,7 +1540,7 @@ def test_market_filter_blocks_entry_when_drop_is_market_wide(trade_journal) -> N
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
-        patch("main.place_dry_run_bracket_order_async", new=AsyncMock()) as mock_order:
+        patch("main.place_bracket_order_async", new=AsyncMock(return_value=_bracket_result(quantity=1))) as mock_order:
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
@@ -1329,7 +1566,7 @@ def test_market_index_is_not_fetched_while_filter_is_disabled(trade_journal) -> 
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
-            "main.place_dry_run_bracket_order_async",
+            "main.place_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=250)),
         ):
 
@@ -1491,7 +1728,7 @@ def _run_entry(trade_journal, *, price: float, equity: float, settled_cash):
     ib = MagicMock()
 
     with patch(
-        "main.place_dry_run_bracket_order_async",
+        "main.place_bracket_order_async",
         new=AsyncMock(return_value=_bracket_result(quantity=1)),
     ) as mock_order:
         for p in patches:
@@ -1564,7 +1801,7 @@ def test_settled_cash_is_not_fetched_while_the_funding_check_is_disabled(trade_j
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=settled_cash_mock), \
         patch(
-            "main.place_dry_run_bracket_order_async",
+            "main.place_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=250)),
         ) as mock_order:
 
@@ -1622,7 +1859,7 @@ def _run_entry_with_quote(trade_journal, quote, *, reject_stale: bool = True):
         patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
         patch(
-            "main.place_dry_run_bracket_order_async",
+            "main.place_bracket_order_async",
             new=AsyncMock(return_value=_bracket_result(quantity=250)),
         ) as mock_order:
 
@@ -1672,8 +1909,8 @@ def test_stale_price_does_not_block_exits(trade_journal) -> None:
         patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
         patch(
-            "main.place_dry_run_order_async",
-            new=AsyncMock(return_value=DryRunOrderResult("AAPL", "SELL", 10, "MKT")),
+            "main.place_market_order_async",
+            new=AsyncMock(return_value=OrderResult("AAPL", "SELL", 10, "MKT")),
         ) as mock_order:
 
         asyncio.run(process_symbol_async(MagicMock(), "AAPL", position_manager, trade_journal))
@@ -1708,11 +1945,11 @@ def _entry_then_price(daily_df: pd.DataFrame, entry_price: float, later_price: f
         patch("main.get_account_equity_async", new=AsyncMock(return_value=equity)), \
         patch("main.get_settled_cash_async", new=AsyncMock(return_value=equity)), \
         patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=160.0)), \
-        patch("main.cancel_dry_run_bracket_orders_async", new=AsyncMock()), \
-        patch("main.place_dry_run_order_async", new=AsyncMock()), \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()), \
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())), \
         patch(
-            "main.place_dry_run_bracket_order_async",
-            new=AsyncMock(return_value=DryRunBracketResult(
+            "main.place_bracket_order_async",
+            new=AsyncMock(return_value=BracketResult(
                 symbol=symbol, quantity=quantity,
                 stop_price=entry_price * (1 - SWING_STOP_LOSS_PCT / 100.0),
                 take_profit_price=entry_price * 1.10,
@@ -1803,3 +2040,118 @@ def test_accumulated_stop_losses_trip_the_daily_circuit_breaker(trade_journal) -
         asyncio.run(process_symbol_async(ib, "DDD", position_manager, trade_journal))
 
     assert position_manager.has_position("DDD") is False
+
+
+# --- 実発注（ペーパー口座）との接続部 ----------------------------------------------
+
+# ドライランは「注文が通った前提」で記録するが、実発注では通らないことがある。
+# ここは main 側がその差を正しく扱うかを固定する。
+
+
+def test_entry_records_the_actual_fill_not_the_reference_price(trade_journal) -> None:
+    """建値は参照価格ではなく実約定を記録すること。
+
+    参照価格で記録すると、損益・R倍率・トレーリングの基準がすべて実際の
+    約定とずれる。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    daily_df = _make_daily_df(drop=True)
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.0))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
+        patch(
+            "main.place_bracket_order_async",
+            new=AsyncMock(return_value=BracketResult(
+                symbol="AAPL", quantity=200, stop_price=95.0, take_profit_price=110.0,
+                oca_group="OCA_AAPL", dry_run=False, fill_price=101.25, commission=0.70,
+            )),
+        ):
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    position = position_manager.get_position("AAPL")
+    assert position.entry_price == pytest.approx(101.25)
+    assert position.entry_commission == pytest.approx(0.70)
+
+
+def test_rejected_entry_order_does_not_create_a_local_position(trade_journal) -> None:
+    """注文が拒否されたらローカルに建玉を記録しないこと。
+
+    記録すると実体の無い建玉を追跡し、存在しない建玉へ決済のSELLを出す。
+    """
+    ib = MagicMock()
+    ib.reqPositionsAsync = AsyncMock(return_value=[])
+    position_manager = PositionManager()
+    daily_df = _make_daily_df(drop=True)
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.0))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
+        patch(
+            "main.place_bracket_order_async",
+            new=AsyncMock(side_effect=OrderNotFilledError("rejected")),
+        ):
+        # 銘柄単位の例外は監視ループが握り潰すため、ここでも例外は外へ出さない。
+        asyncio.run(run_watchlist_cycle_async(ib, ["AAPL"], position_manager, trade_journal))
+
+    assert position_manager.has_position("AAPL") is False
+
+
+def test_real_exit_uses_the_broker_fill_and_records_round_trip_commission(trade_journal) -> None:
+    """実発注時は待機注文の実約定で決済を記録すること。
+
+    ドライランの推定（観測した現在値が待機注文の値段に届いたか）は180秒ごとの
+    1点しか見ないため、ザラ場で逆指値に触れて戻した動きを取りこぼす。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=10, risk_per_share=5.0,
+        strategy_type=STRATEGY_TYPE_SWING,
+        stop_price=95.0, take_profit_price=110.0, oca_group="OCA_AAPL",
+        entry_commission=0.35,
+    )
+
+    resting_fill = RestingOrderFill(order_type="LMT", fill_price=110.0, commission=0.35)
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=104.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch("main.find_filled_resting_exit", return_value=resting_fill), \
+        patch("main.place_market_order_async", new=AsyncMock()) as mock_order:
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    records = trade_journal.load_trades()
+    assert len(records) == 1
+    # 観測価格(104.0)ではなく、待機注文の約定(110.0)で記録される。
+    assert records[0].exit_price == pytest.approx(110.0)
+    assert records[0].reason == REASON_TAKE_PROFIT
+    # 往復ぶんの手数料。控除後の損益はサーキットブレーカーの判定に使われる。
+    assert records[0].commission == pytest.approx(0.70)
+    assert records[0].net_pnl_usd == pytest.approx(100.0 - 0.70)
+    # 待機注文が約定した銘柄へ、重ねて成行の決済を出さないこと。
+    mock_order.assert_not_awaited()
+    assert position_manager.has_position("AAPL") is False
+
+
+def test_main_refuses_to_start_with_real_orders_on_a_non_paper_port() -> None:
+    """実発注が有効なまま本番ポートを向いていたら、1件も注文を出す前に止まること。
+
+    ガード自体は order_manager 側にあるが、main() が接続より前に呼んでいなければ
+    意味が無い。
+    """
+    connection = _make_fake_connection([MagicMock()])
+    connection.port = 7496
+
+    with patch("main.IBKRConnection", return_value=connection), \
+        patch("execution.order_manager.ENABLE_REAL_ORDERS", True), \
+        pytest.raises(RuntimeError):
+        asyncio.run(main())
+
+    connection.connect_async.assert_not_awaited()

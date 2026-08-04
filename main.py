@@ -4,8 +4,8 @@ import asyncio
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime
-from typing import Dict, List, Optional, Tuple
+from datetime import date, datetime, timedelta
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pandas as pd
 from ib_insync import IB, Stock
@@ -22,10 +22,14 @@ from data.market_data import (
 )
 from execution.account import get_account_equity_async, get_settled_cash_async
 from execution.order_manager import (
+    ENABLE_REAL_ORDERS,
+    MAX_ORDER_NOTIONAL_USD,
     MAX_POSITION_SIZE,
-    cancel_dry_run_bracket_orders_async,
-    place_dry_run_bracket_order_async,
-    place_dry_run_order_async,
+    cancel_bracket_orders_async,
+    ensure_orders_are_paper_only,
+    find_filled_resting_exit,
+    place_bracket_order_async,
+    place_market_order_async,
 )
 from execution.position_manager import (
     DEFAULT_STATE_PATH,
@@ -38,6 +42,8 @@ from execution.position_sizing import calculate_position_size
 from execution.trade_journal import TradeJournal
 from strategy.exit_signal import (
     REASON_EOD_FLATTEN,
+    REASON_STOP_LOSS,
+    REASON_TAKE_PROFIT,
     detect_exit_signal,
     detect_resting_order_exit,
     resolve_stop_price,
@@ -56,7 +62,30 @@ logger = logging.getLogger(__name__)
 # フォールバック用の固定ウォッチリスト。銘柄選定は本来スクリーニング
 # （時価総額+PER）で毎日動的に決定するが、起動直後の初回スクリーニング前や
 # スクリーニング失敗時にはこのリストで動作を継続する。
-WATCHLIST: List[str] = ["RIVN", "JOBY", "AAPL", "MSFT", "JNJ", "JPM", "KO", "XOM"]
+#
+# 資金$1,220の取引可能な株価帯（$24.40〜$244。「銘柄選定」節参照）に入る銘柄で
+# 構成すること。旧リスト(RIVN/JOBY/AAPL/MSFT/JNJ/JPM/KO/XOM)は大口座向けに
+# 書かれており、2026-08-03のドライランでは8銘柄中6銘柄が帯の判定で落ち、
+# KOとXOMの2銘柄しか残らなかった。しかもその2銘柄は押し目の発生頻度が
+# 低く（乖離≤-5%が年11日・30日）、監視していてもエントリー機会が年数回しか無い。
+#
+# 選定基準は bars/ の日足で測った**直近2年の押し目シグナル発生頻度**
+# （乖離率が-5%以下になった営業日の割合）の上位10銘柄。ドライランで
+# エントリー経路を実際に通すには、まず観測回数が要るため。
+#
+# **銘柄別のプロフィットファクターでは選んでいない。** CLAUDE.md「複数銘柄での
+# 判断」のとおり単一銘柄の成績は運であり、数十トレードの実績で銘柄を選ぶのは
+# ウォークフォワードが検出しようとしている過剰最適化を検証の外側でやることに
+# 等しい。押し目買いのエッジは42銘柄横断で確認済みで、ここはその適用先を
+# 「買える銘柄」に揃えるだけの位置づけである。
+#
+# **MAX_WATCHLIST_SIZE以内に保つこと。** _refresh_watchlist_asyncの
+# フォールバック経路は株価帯で絞るだけで件数の切り詰めを行わないため、
+# ここの件数がそのまま監視枠＝ペーシング消費になる（6.1節の不変条件）。
+WATCHLIST: List[str] = [
+    "ADBE", "ORCL", "NKE", "INTC", "CRM",
+    "UPS", "NVDA", "MRK", "SBUX", "DIS",
+]
 
 # ファンダメンタルズスクリーニング（割安株抽出）のパラメータ。
 # 1日1回（取引時間の最初のサイクル）だけ実行し、ウォッチリストを入れ替える。
@@ -70,6 +99,19 @@ SCREENER_NUM_CANDIDATES: int = 50
 # ここを絞ることがIBKRのペーシング制限(10分あたり60件)対策の要になる。
 # 目安: 監視銘柄数 <= POLL_INTERVAL_SECONDS / 10 なら制限内に収まる。
 MAX_WATCHLIST_SIZE: int = 10
+
+# スクリーニングに失敗（例外・0件）した後、次に再試行するまでの間隔（秒）。
+#
+# 銘柄選定は1取引日に1回で足りるが、**失敗をその日1日ぶん確定させてはならない。**
+# スキャナーもPER取得も購読権限が無いと例外ではなく空を返し（「6.2」）、
+# 起動直後・データファームの再接続中・IBKR側の一時的な不調のいずれでも同じ形で
+# 空になる。1回目の結果で打ち切ると、その日は固定リストのまま回り続ける。
+#
+# 一方で毎サイクル(180秒)再試行すると、購読権限が無い口座では一日中
+# スキャナー要求とログを吐き続ける（この失敗は復旧しない）。間隔を空けるのは
+# 「一時的な不調なら復旧を拾い、恒久的な失敗なら安く諦める」ための妥協である。
+# 900秒なら米国のレギュラーセッション(6.5時間)で最大26回。
+SCREENING_RETRY_INTERVAL_SECONDS: float = 900.0
 # IBKRのペーシング制限を避けるため、PER取得(reqFundamentalDataAsync)を
 # 連続発行せずこの秒数だけ間隔を空ける
 SCREENER_PE_REQUEST_INTERVAL_SECONDS: float = 1.0
@@ -88,6 +130,21 @@ SCREENER_TREND_LOOKBACK_DURATION: str = "300 D"
 # スクリーニングの分の余裕も残る。
 POLL_INTERVAL_SECONDS: float = 180.0
 CLOSED_MARKET_POLL_INTERVAL_SECONDS: float = 300.0
+
+# 「再ログインが必要かもしれない」と1行だけ出すまでの、接続失敗の連続ラウンド数。
+#
+# ログだけでは**復帰する切断と復帰しない切断が区別できない。** どちらも
+# 同じ `TWSへの再接続に失敗しました` が同じ間隔で並ぶだけで、実際に
+# 2026-08-04のログでは同じ2行が9分おきに6回続いていた。
+#
+# 1ラウンド = connect_asyncのリトライ使い切り（10回・1回あたり上限60秒で約4分。
+# core/connection.py）+ CLOSED_MARKET_POLL_INTERVAL_SECONDS の待機 ≒ 9分。
+# IB GatewayのAuto restartはこの1ラウンドで復帰する長さなので、3ラウンド
+# （約27分）続いたらソケットが閉じたままであり、再試行では解けない状態
+# （2要素認証の期限切れ・セッション失効・Gatewayの停止）を疑う根拠になる。
+#
+# 短くすると通常のAuto restartで誤検知し、この行の意味が薄れる。
+CONNECTION_FAILURE_ROUNDS_BEFORE_MANUAL_LOGIN: int = 3
 
 # スイングトレード判定用（日足）のプルバックパラメータ。
 # 移動平均30本は、42銘柄・10年の日足で移動平均期間だけを固定した
@@ -427,16 +484,23 @@ async def _process_entry_async(
     stop_price = resolve_stop_price(price, exit_params.stop_loss_pct)
     take_profit_price = resolve_take_profit_price(price, exit_params.take_profit_pct)
 
-    order_result = await place_dry_run_bracket_order_async(
+    # 約定しなかった場合（拒否・取消・タイムアウト）は OrderNotFilledError が
+    # 飛び、ここから先へは進まない。実体の無い建玉をローカルに記録しないため。
+    order_result = await place_bracket_order_async(
         ib, contract, quantity=quantity,
         stop_price=stop_price, take_profit_price=take_profit_price,
         reference_price=price,
     )
+    # 建値は実約定を優先する。参照価格で記録すると、損益・R倍率・トレーリングの
+    # 基準がすべて実際の約定とずれる。
+    entry_price = order_result.fill_price if order_result.fill_price is not None else price
     position_manager.open_position(
-        symbol, entry_price=price, quantity=order_result.quantity, risk_per_share=risk_per_share,
+        symbol, entry_price=entry_price, quantity=order_result.quantity,
+        risk_per_share=risk_per_share,
         strategy_type=strategy_type,
         stop_price=stop_price, take_profit_price=take_profit_price,
         oca_group=order_result.oca_group,
+        entry_commission=order_result.commission,
     )
 
 
@@ -489,6 +553,7 @@ async def _clamp_quantity_to_settled_cash_async(
 
 async def _record_closed_trade(
     ib: IB, trade_journal: TradeJournal, closed_position: Position, exit_price: float, reason: str, pnl_pct: float,
+    exit_commission: float = 0.0,
 ) -> None:
     pnl = (exit_price - closed_position.entry_price) * closed_position.quantity
     r_multiple = (
@@ -496,9 +561,9 @@ async def _record_closed_trade(
         if closed_position.risk_per_share > 0 else None
     )
 
-    # ドライラン中は実約定の手数料が発生しないため0固定。
-    # 実発注(placeOrder)を有効化する際は、FillのcommissionReport.commissionを渡すこと。
-    commission = 0.0
+    # 往復ぶんを記録する。建て側の手数料は決済時には分からないので、
+    # 建玉と一緒に持ち越したものを使う。ドライラン中は実約定が無いため両方0。
+    commission = closed_position.entry_commission + exit_commission
     usd_jpy_rate = await get_usd_jpy_rate_async(ib)
 
     trade_journal.record_trade(
@@ -542,7 +607,31 @@ async def _process_exit_async(
     # 1. ブローカー側に置いた待機注文（損切りの逆指値・利確の指値）が約定していないか。
     #    こちらはポーリングを待たずに市場で約定しているため、他の判定より先に確認する。
     #    ブローカー同期で取り込んだ未追跡ポジションは待機注文を持たない(値段が0)ため対象外。
-    if position.stop_price > 0 and position.take_profit_price > 0:
+    #
+    #    実発注時はブローカー側の約定そのものを見る。ドライランの推定
+    #    （観測した現在値が待機注文の値段に届いたか）は180秒ごとの1点しか
+    #    見ないため、ザラ場で逆指値に触れて戻した動きを取りこぼす。
+    if ENABLE_REAL_ORDERS:
+        resting_fill = find_filled_resting_exit(ib, position.oca_group)
+        if resting_fill is not None:
+            reason = (
+                REASON_TAKE_PROFIT if resting_fill.order_type == "LMT" else REASON_STOP_LOSS
+            )
+            logger.info(
+                "[%s] ブローカー側の待機注文が約定していました: reason=%s fill=%.2f commission=%.2f",
+                symbol, reason, resting_fill.fill_price, resting_fill.commission,
+            )
+            pnl_pct = (
+                (resting_fill.fill_price - position.entry_price) / position.entry_price * 100.0
+            )
+            # OCAグループの相方はIBKR側が自動で取り消すため、ここでの取り消しは不要。
+            closed_position = position_manager.close_position(symbol)
+            await _record_closed_trade(
+                ib, trade_journal, closed_position, resting_fill.fill_price, reason, pnl_pct,
+                exit_commission=resting_fill.commission,
+            )
+            return
+    elif position.stop_price > 0 and position.take_profit_price > 0:
         resting_exit = detect_resting_order_exit(
             stop_price=position.stop_price,
             take_profit_price=position.take_profit_price,
@@ -571,11 +660,17 @@ async def _process_exit_async(
         logger.info(
             "[%s] デイトレードポジションが大引け前の強制決済時刻に達したため決済します。", symbol,
         )
-        pnl_pct = (price - position.entry_price) / position.entry_price * 100.0
-        await cancel_dry_run_bracket_orders_async(ib, symbol, position.oca_group)
-        await place_dry_run_order_async(ib, contract, action="SELL", quantity=position.quantity)
+        await cancel_bracket_orders_async(ib, symbol, position.oca_group)
+        exit_result = await place_market_order_async(
+            ib, contract, action="SELL", quantity=position.quantity,
+        )
+        exit_price = exit_result.fill_price if exit_result.fill_price is not None else price
+        pnl_pct = (exit_price - position.entry_price) / position.entry_price * 100.0
         closed_position = position_manager.close_position(symbol)
-        await _record_closed_trade(ib, trade_journal, closed_position, price, REASON_EOD_FLATTEN, pnl_pct)
+        await _record_closed_trade(
+            ib, trade_journal, closed_position, exit_price, REASON_EOD_FLATTEN, pnl_pct,
+            exit_commission=exit_result.commission,
+        )
         return
 
     exit_params = EXIT_PARAMS_BY_STRATEGY_TYPE.get(
@@ -594,10 +689,19 @@ async def _process_exit_async(
     if not result.should_sell:
         return
 
-    await cancel_dry_run_bracket_orders_async(ib, symbol, position.oca_group)
-    await place_dry_run_order_async(ib, contract, action="SELL", quantity=position.quantity)
+    await cancel_bracket_orders_async(ib, symbol, position.oca_group)
+    exit_result = await place_market_order_async(
+        ib, contract, action="SELL", quantity=position.quantity,
+    )
+    # 決済価格も実約定を優先する。判定に使った観測価格と実際の約定は
+    # 成行のスリッページのぶんだけずれる。
+    exit_price = exit_result.fill_price if exit_result.fill_price is not None else price
+    pnl_pct = (exit_price - position.entry_price) / position.entry_price * 100.0
     closed_position = position_manager.close_position(symbol)
-    await _record_closed_trade(ib, trade_journal, closed_position, price, result.reason, result.pnl_pct)
+    await _record_closed_trade(
+        ib, trade_journal, closed_position, exit_price, result.reason, pnl_pct,
+        exit_commission=exit_result.commission,
+    )
 
 
 async def process_symbol_async(
@@ -772,10 +876,23 @@ async def _filter_symbols_by_price_band_async(
     return kept
 
 
+class WatchlistRefresh(NamedTuple):
+    """ウォッチリスト更新の結果と、それがスクリーニング由来かどうか。
+
+    `screened=False`（フォールバック）を呼び出し側が区別できないと、
+    「その日はもう選定済み」として扱われ、一時的な失敗が1日ぶん確定する。
+    `symbols` は失敗時も使える監視対象（フォールバックの固定リストを
+    株価帯で絞ったもの）で、取引可能な銘柄が無ければ空になる。
+    """
+
+    symbols: List[str]
+    screened: bool
+
+
 async def _refresh_watchlist_async(
     ib: IB, fallback_watchlist: List[str], account_equity: float,
     settled_cash: Optional[float] = None, caches: Optional[MarketDataCaches] = None,
-) -> List[str]:
+) -> WatchlistRefresh:
     max_price = resolve_max_affordable_price(account_equity, settled_cash)
     if max_price is not None:
         logger.info(
@@ -809,7 +926,7 @@ async def _refresh_watchlist_async(
 
     caches = caches if caches is not None else MarketDataCaches()
 
-    async def _fallback(cause: str) -> List[str]:
+    async def _fallback(cause: str) -> WatchlistRefresh:
         # フォールバックはスクリーニングの判定を通っていないため、株価帯だけは
         # ここで掛け直す。掛けないと固定リストの買えない銘柄がそのまま監視枠に入る。
         filtered = await _filter_symbols_by_price_band_async(
@@ -829,13 +946,13 @@ async def _refresh_watchlist_async(
                 f"{min_price:.2f}" if min_price is not None else "下限なし",
                 f"{max_price:.2f}" if max_price is not None else "上限なし",
             )
-            return []
+            return WatchlistRefresh([], screened=False)
         logger.warning(
             "%s、フォールバックの固定ウォッチリストで継続します: %s"
             "（株価帯の判定で %d 件を除外）。",
             cause, filtered, len(fallback_watchlist) - len(filtered),
         )
-        return filtered
+        return WatchlistRefresh(filtered, screened=False)
 
     try:
         screened = await screen_value_stocks_async(ib, config)
@@ -858,11 +975,20 @@ async def _refresh_watchlist_async(
         screened = screened[:MAX_WATCHLIST_SIZE]
 
     logger.info("スクリーニング結果でウォッチリストを更新しました: %s", screened)
-    return screened
+    return WatchlistRefresh(screened, screened=True)
 
 
 async def main() -> None:
     connection = IBKRConnection()
+    # 接続する前に判定する。実発注が有効なまま本番ポートを向いていたら、
+    # 1件も注文を出す前にここで止める。
+    ensure_orders_are_paper_only(connection.port)
+    if ENABLE_REAL_ORDERS:
+        logger.warning(
+            "実発注が有効です（接続先ポート %s = ペーパー取引）。"
+            "株数上限%d株・1注文%.0f USDのクランプは有効のままです。",
+            connection.port, MAX_POSITION_SIZE, MAX_ORDER_NOTIONAL_USD,
+        )
     # 状態ファイルを指定して、再起動しても保有ポジションと
     # トレーリングストップの基準（高値）を引き継げるようにする。
     position_manager = PositionManager(state_path=DEFAULT_STATE_PATH)
@@ -871,7 +997,16 @@ async def main() -> None:
     # ペーシング制限対策の意味が無くなる。
     caches = MarketDataCaches()
     watchlist: List[str] = list(WATCHLIST)
+    # フォールバックの元になるリストは、スクリーニングが成功したときだけ入れ替える。
+    # watchlist をそのまま渡すと、株価帯で絞られた結果が次回のフォールバック元に
+    # なり（さらに空で返った日にはフォールバック先が消え）、失敗が重なるほど
+    # 監視候補が痩せていく。
+    fallback_watchlist: List[str] = list(WATCHLIST)
     last_screened_date: Optional[date] = None
+    next_screening_attempt_at: Optional[datetime] = None
+    # 接続の「一時的な瞬断」と「人手が要る状態」を区別するためのラウンド数。
+    # 接続に成功した時点で0へ戻す。
+    consecutive_connection_failures: int = 0
 
     ib: Optional[IB] = None
     try:
@@ -882,10 +1017,17 @@ async def main() -> None:
                 # （connect_async自体は指数的バックオフ付きリトライを内包している）。
                 if ib is None or not ib.isConnected():
                     ib = await connection.connect_async()
+                    consecutive_connection_failures = 0
 
                 if is_regular_trading_hours():
-                    today = datetime.now(US_EASTERN).date()
-                    if today != last_screened_date:
+                    now_et = datetime.now(US_EASTERN)
+                    today = now_et.date()
+                    # 成功した日だけ選定済みとして扱い、失敗した日は間隔を空けて
+                    # 再試行する。スキャナーの空応答は購読権限が無い場合だけでなく
+                    # 一時的な不調でも起きるため、1回目の結果で1日を確定させない。
+                    if today != last_screened_date and (
+                        next_screening_attempt_at is None or now_et >= next_screening_attempt_at
+                    ):
                         # 銘柄選定は口座資金に依存する（買えない株価の銘柄を除外する）。
                         # スクリーニングは1日1回なので、資金の取得もこのタイミングだけで足りる。
                         account_equity = await get_account_equity_async(ib)
@@ -898,10 +1040,23 @@ async def main() -> None:
                         # cachesを渡すのは、フォールバック時の株価帯の判定で
                         # 日足を取り直さないため（同じ銘柄の日足はこの後の
                         # シグナル判定でどのみち取得される）。
-                        watchlist = await _refresh_watchlist_async(
-                            ib, watchlist, account_equity, settled_cash, caches,
+                        refresh = await _refresh_watchlist_async(
+                            ib, fallback_watchlist, account_equity, settled_cash, caches,
                         )
-                        last_screened_date = today
+                        watchlist = refresh.symbols
+                        if refresh.screened:
+                            fallback_watchlist = refresh.symbols
+                            last_screened_date = today
+                            next_screening_attempt_at = None
+                        else:
+                            next_screening_attempt_at = now_et + timedelta(
+                                seconds=SCREENING_RETRY_INTERVAL_SECONDS,
+                            )
+                            logger.info(
+                                "銘柄スクリーニングは %.0f 秒後に再試行します"
+                                "（それまではフォールバックのウォッチリストで継続）。",
+                                SCREENING_RETRY_INTERVAL_SECONDS,
+                            )
 
                     await run_watchlist_cycle_async(
                         ib, watchlist, position_manager, trade_journal, caches,
@@ -913,10 +1068,43 @@ async def main() -> None:
             except ConnectionError:
                 # connect_asyncのリトライを使い果たした場合（延長メンテナンス等）。
                 # プロセスを落とさず、時間外ポーリング間隔でリトライし続ける。
-                logger.exception(
-                    "TWSへの再接続に失敗しました。%.0f秒後に再試行します。",
-                    CLOSED_MARKET_POLL_INTERVAL_SECONDS,
-                )
+                if not is_regular_trading_hours():
+                    # **市場時間外の接続失敗は数えない。** IB Gatewayを日次で
+                    # 落とす運用（検証中は日本時間8:00にログアウトし22:30に再ログイン）
+                    # では、閉場中に何十ラウンドも失敗するのが正常な状態である。
+                    # ここで数えると再ログインの案内が毎日出て、本当に人手が要る
+                    # ときと見分けがつかなくなる。取れなかったデータも無い。
+                    logger.info(
+                        "TWSへ接続できません（市場時間外）。%.0f秒後に再試行します。",
+                        CLOSED_MARKET_POLL_INTERVAL_SECONDS,
+                    )
+                    await asyncio.sleep(CLOSED_MARKET_POLL_INTERVAL_SECONDS)
+                    continue
+
+                consecutive_connection_failures += 1
+                if consecutive_connection_failures == 1:
+                    # 1回目だけスタックトレースを出す。以降は同じ例外が同じ経路で
+                    # 繰り返されるだけで、行数が増える以上の情報が無い。
+                    logger.exception(
+                        "TWSへの再接続に失敗しました。%.0f秒後に再試行します。",
+                        CLOSED_MARKET_POLL_INTERVAL_SECONDS,
+                    )
+                else:
+                    logger.error(
+                        "TWSへの再接続に失敗しました（連続%d回）。%.0f秒後に再試行します。",
+                        consecutive_connection_failures, CLOSED_MARKET_POLL_INTERVAL_SECONDS,
+                    )
+                if consecutive_connection_failures == CONNECTION_FAILURE_ROUNDS_BEFORE_MANUAL_LOGIN:
+                    # 等号で1回だけ出す。以降のラウンドで繰り返すと、この行自体が
+                    # 上の再試行ログに埋もれて「読むべき1行」でなくなる。
+                    logger.error(
+                        "%d ラウンド連続で接続できません。IB GatewayのAuto restartは"
+                        "数分で復帰するため、この長さは瞬断や再起動では説明できません。"
+                        "**IB Gatewayへの再ログインが必要な可能性があります**"
+                        "（2要素認証の期限切れ・セッション失効・Gatewayのプロセス停止）。"
+                        "再試行自体はこのまま継続します。",
+                        consecutive_connection_failures,
+                    )
                 await asyncio.sleep(CLOSED_MARKET_POLL_INTERVAL_SECONDS)
             except Exception:
                 # サイクル処理中の予期しないエラー（サイクル途中の切断等を含む）で

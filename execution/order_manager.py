@@ -1,6 +1,7 @@
-"""注文の組み立て・発注（ドライラン仕様）。
+"""注文の組み立て・発注。
 
-検証が完了するまで実発注(placeOrder)は行わず、注文内容をログ出力するのみ。
+`ENABLE_REAL_ORDERS` が False（既定）の間は実発注(placeOrder)を行わず、
+注文内容をログ出力するのみ。True にするとペーパー口座へ実際に発注する。
 
 新規建てはブラケット注文（親の成行買い＋子の損切り逆指値・利確指値）で組む。
 子注文をブローカー側に置いておくことが重要で、ボットのプロセスが落ちていても、
@@ -11,6 +12,7 @@ TWSとの接続が切れていても、市場が動けば約定する。ポー�
 売り注文だけが残り、次に建てた瞬間に意図せず売られる）。
 """
 
+import asyncio
 import logging
 import math
 from dataclasses import dataclass, field
@@ -19,6 +21,60 @@ from typing import List, Optional
 from ib_insync import IB, LimitOrder, MarketOrder, Order, Stock, StopOrder
 
 logger = logging.getLogger(__name__)
+
+# 実際にブローカーへ注文を送るか。**既定は無効（ドライラン）。**
+#
+# 有効にしてよいのはペーパー口座だけである（`ensure_orders_are_paper_only` が
+# 起動時に強制する）。ドライランのままでは、ブラケットのtransmit順序・OCAの
+# 連動・実約定価格・手数料・注文拒否時の挙動が一切検証できない。これらは
+# 「9. 開発時の禁止事項」が実発注の前提として挙げている項目そのものであり、
+# ペーパー口座はそれを安全に潰すための環境である。
+#
+# 有効にしても株数(MAX_POSITION_SIZE)と金額(MAX_ORDER_NOTIONAL_USD)の
+# クランプは外さない。
+ENABLE_REAL_ORDERS: bool = False
+
+# 実発注を許可するポート（ペーパー取引）。TWS=7497 / IB Gateway=4002。
+# **許可リストで判定する。** 本番ポート(7496/4001)の拒否リストにすると、
+# .env の打ち間違い（7495等）が素通りする。
+PAPER_TRADING_PORTS = frozenset({7497, 4002})
+
+# 発注後、約定または拒否が確定するまで待つ上限（秒）。
+# 成行注文は取引時間中なら即座に約定するため、これを超えるのは異常
+# （時間外・板が無い・IBKR側の滞留）であり、待ち続けても意味が無い。
+ORDER_FILL_TIMEOUT_SECONDS: float = 60.0
+_ORDER_STATUS_POLL_INTERVAL_SECONDS: float = 1.0
+
+_STATUS_FILLED: str = "Filled"
+# 約定せずに終わった状態。拒否(Inactive)もここに含まれる。
+_TERMINAL_UNFILLED_STATUSES = frozenset({"Cancelled", "ApiCancelled", "Inactive"})
+
+
+class OrderNotFilledError(RuntimeError):
+    """注文が約定しないまま終了した（拒否・取消・タイムアウト）。
+
+    **例外にしているのは、呼び出し側にローカル記録を作らせないためである。**
+    資金不足などでIBKRが注文を拒否した場合に、約定した前提でポジションを
+    記録すると、実体の無い建玉を追跡し、存在しない建玉へ決済のSELLを出す
+    （「9. 開発時の禁止事項」）。決済側で投げた場合はポジションが開いたまま
+    残るが、これも「売れていないのに閉じる」より安全な側である。
+    """
+
+
+def ensure_orders_are_paper_only(port: int) -> None:
+    """実発注が有効なら、接続先がペーパーのポートであることを強制する。
+
+    起動時に1度だけ呼ぶ。ドライランのまま本番ポートへつなぐのは（データ取得だけ
+    なので）従来どおり許すが、実発注が有効な状態での本番ポートは止める。
+    """
+    if not ENABLE_REAL_ORDERS:
+        return
+    if port not in PAPER_TRADING_PORTS:
+        raise RuntimeError(
+            f"実発注(ENABLE_REAL_ORDERS=True)が有効ですが、接続先ポート {port} は"
+            f"ペーパー取引のポート {sorted(PAPER_TRADING_PORTS)} ではありません。"
+            "検証中の実発注はペーパー口座に限ります。"
+        )
 
 # ロジック検証完了まではハードコードで最大ロット数を制限する。
 # 制限をかけるのは新規建て(BUY)のみ。決済(SELL)には適用しない理由は
@@ -103,23 +159,93 @@ def validate_resting_order_prices(
 
 
 @dataclass
-class DryRunOrderResult:
+class OrderResult:
     symbol: str
     action: str
     quantity: int
     order_type: str
     dry_run: bool = True
+    # 実発注時のみ埋まる。ドライラン中は約定が無いため呼び出し側が
+    # 観測した価格で代用する。
+    fill_price: Optional[float] = None
+    commission: float = 0.0
 
 
-async def place_dry_run_order_async(
+def _fill_price_of(trade) -> Optional[float]:
+    """約定価格を返す。取れなければNone。
+
+    IBKRは未受信のフィールドをNaNや0で埋めてくるため、値として採用する前に
+    「NaNでない、かつ正の数」を確認する（「6.4」）。
+    """
+    price = getattr(trade.orderStatus, "avgFillPrice", None)
+    if price is None:
+        return None
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(price) or price <= 0:
+        return None
+    return price
+
+
+def _commission_of(trade) -> float:
+    """約定に紐づく手数料の合計を返す。
+
+    部分約定では Fill が複数に分かれるため合算する。commissionReport は
+    約定直後にはまだ届いていないことがあり、その場合は0として扱う
+    （取れなかった手数料を推定で埋めると、損益が静かにずれる）。
+    """
+    total = 0.0
+    for fill in getattr(trade, "fills", []) or []:
+        report = getattr(fill, "commissionReport", None)
+        commission = getattr(report, "commission", None)
+        if commission is None:
+            continue
+        try:
+            commission = float(commission)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(commission):
+            continue
+        total += commission
+    return total
+
+
+async def _await_fill_async(ib: IB, trade, symbol: str, label: str) -> None:
+    """約定が確定するまで待つ。約定しなければ OrderNotFilledError を投げる。"""
+    waited = 0.0
+    while not trade.isDone() and waited < ORDER_FILL_TIMEOUT_SECONDS:
+        await asyncio.sleep(_ORDER_STATUS_POLL_INTERVAL_SECONDS)
+        waited += _ORDER_STATUS_POLL_INTERVAL_SECONDS
+
+    status = trade.orderStatus.status
+    if status == _STATUS_FILLED:
+        return
+
+    if status in _TERMINAL_UNFILLED_STATUSES:
+        raise OrderNotFilledError(
+            f"[{symbol}] {label}が約定せずに終了しました: status={status}。"
+            "資金不足などでIBKRが拒否した可能性があります。"
+        )
+    # タイムアウト。板が無い・時間外など、待ち続けても約定しない状況を想定する。
+    # 宙に浮いたままにすると建玉の有無が分からなくなるため、取り消してから投げる。
+    ib.cancelOrder(trade.order)
+    raise OrderNotFilledError(
+        f"[{symbol}] {label}が {ORDER_FILL_TIMEOUT_SECONDS:.0f} 秒以内に約定しませんでした"
+        f"（status={status}）。注文を取り消しました。"
+    )
+
+
+async def place_market_order_async(
     ib: IB,
     contract: Stock,
     action: str,
     quantity: int,
     order_type: str = "MKT",
     reference_price: Optional[float] = None,
-) -> DryRunOrderResult:
-    """注文をシミュレートする（placeOrderは呼ばない）。
+) -> OrderResult:
+    """成行注文を出す（`ENABLE_REAL_ORDERS` が False ならシミュレートするだけ）。
 
     数量制限（MAX_POSITION_SIZE / MAX_ORDER_NOTIONAL_USD）は新規建て(BUY)にのみ
     適用する。決済(SELL)に適用してはならない: 呼び出し側は決済成立を前提に
@@ -144,18 +270,38 @@ async def place_dry_run_order_async(
 
     order = MarketOrder(action, quantity)
 
-    logger.info(
-        "[DRY-RUN] 注文シミュレーション: symbol=%s action=%s qty=%s type=%s "
-        "(placeOrderは呼び出していません)",
-        contract.symbol, action, quantity, order_type,
-    )
-    logger.debug("[DRY-RUN] 構築されたOrderオブジェクト: %s", order)
+    if not ENABLE_REAL_ORDERS:
+        logger.info(
+            "[DRY-RUN] 注文シミュレーション: symbol=%s action=%s qty=%s type=%s "
+            "(placeOrderは呼び出していません)",
+            contract.symbol, action, quantity, order_type,
+        )
+        logger.debug("[DRY-RUN] 構築されたOrderオブジェクト: %s", order)
+        return OrderResult(
+            symbol=contract.symbol,
+            action=action,
+            quantity=quantity,
+            order_type=order_type,
+        )
 
-    return DryRunOrderResult(
+    trade = ib.placeOrder(contract, order)
+    await _await_fill_async(ib, trade, contract.symbol, f"{action}の成行注文")
+
+    fill_price = _fill_price_of(trade)
+    commission = _commission_of(trade)
+    logger.info(
+        "[%s] %s %s株を約定しました: fill=%s commission=%.2f",
+        contract.symbol, action, quantity,
+        f"{fill_price:.2f}" if fill_price is not None else "不明", commission,
+    )
+    return OrderResult(
         symbol=contract.symbol,
         action=action,
         quantity=quantity,
         order_type=order_type,
+        dry_run=False,
+        fill_price=fill_price,
+        commission=commission,
     )
 
 # --- ブラケット注文 -----------------------------------------------------------------
@@ -182,13 +328,18 @@ class BracketOrders:
 
 
 @dataclass
-class DryRunBracketResult:
+class BracketResult:
     symbol: str
     quantity: int
     stop_price: float
     take_profit_price: float
     oca_group: str
     dry_run: bool = True
+    # 実発注時のみ埋まる親注文の約定価格。**ローカルの建値にはこちらを使う。**
+    # 参照価格（発注時の現在値）で記録すると、実際の約定とずれた建値で
+    # 損益・R倍率・トレーリングの基準を計算することになる。
+    fill_price: Optional[float] = None
+    commission: float = 0.0
     orders: Optional[BracketOrders] = field(default=None, repr=False)
 
 
@@ -212,9 +363,8 @@ def build_bracket_orders(
     その僅かな隙間が、まさに防ぎたい「損切りの無い裸のポジション」である。
 
     `parentId` はここでは設定できない。IBKRが親注文へ採番する orderId が
-    placeOrder 実行後にしか決まらないため、実発注を有効化する際に
-    親を place した直後、子へ `order.parentId = parent_trade.order.orderId`
-    を代入してから子を place すること。
+    placeOrder 実行後にしか決まらないため、実発注時は親を place した直後に
+    `place_bracket_order_async` が子へ代入する。
     """
     if quantity <= 0:
         raise ValueError("数量は正の整数である必要があります。")
@@ -248,19 +398,24 @@ def build_bracket_orders(
     )
 
 
-async def place_dry_run_bracket_order_async(
+async def place_bracket_order_async(
     ib: IB,
     contract: Stock,
     quantity: int,
     stop_price: float,
     take_profit_price: float,
     reference_price: float,
-) -> DryRunBracketResult:
-    """新規建てのブラケット注文をシミュレートする（placeOrderは呼ばない）。
+) -> BracketResult:
+    """新規建てのブラケット注文を出す（`ENABLE_REAL_ORDERS` が False ならシミュレート）。
 
     数量制限(MAX_POSITION_SIZE / MAX_ORDER_NOTIONAL_USD)は新規建てなので適用する。
     丸めた数量は子注文にもそのまま反映する必要がある（親より子が多いと、決済後に
     余った売り注文が残る）ため、丸めてから組み立てる。
+
+    実発注時の送信順は「親 → 子(parentId代入) → 最後の子で transmit」。
+    親が約定しなかった場合は **送信済みの子を取り消してから** 例外を投げる。
+    残すと建玉が無いのに売り注文だけが生き、次にその銘柄を建てた瞬間に
+    意図しない決済が起きる。
     """
     if quantity <= 0:
         raise ValueError("数量は正の整数である必要があります。")
@@ -280,37 +435,133 @@ async def place_dry_run_bracket_order_async(
         reference_price=reference_price,
     )
 
-    logger.info(
-        "[DRY-RUN] ブラケット注文シミュレーション: symbol=%s qty=%s "
-        "親=成行買い 損切り=STP@%.2f 利確=LMT@%.2f oca=%s "
-        "(placeOrderは呼び出していません)",
-        contract.symbol, quantity, stop_price, take_profit_price, orders.oca_group,
-    )
-    logger.debug("[DRY-RUN] 構築されたOrderオブジェクト: %s", orders.as_list())
+    if not ENABLE_REAL_ORDERS:
+        logger.info(
+            "[DRY-RUN] ブラケット注文シミュレーション: symbol=%s qty=%s "
+            "親=成行買い 損切り=STP@%.2f 利確=LMT@%.2f oca=%s "
+            "(placeOrderは呼び出していません)",
+            contract.symbol, quantity, stop_price, take_profit_price, orders.oca_group,
+        )
+        logger.debug("[DRY-RUN] 構築されたOrderオブジェクト: %s", orders.as_list())
+        return BracketResult(
+            symbol=contract.symbol,
+            quantity=quantity,
+            stop_price=stop_price,
+            take_profit_price=take_profit_price,
+            oca_group=orders.oca_group,
+            orders=orders,
+        )
 
-    return DryRunBracketResult(
+    parent_trade = ib.placeOrder(contract, orders.parent)
+    child_trades = []
+    try:
+        for child in (orders.stop_loss, orders.take_profit):
+            # parentId は親の orderId が採番された後にしか代入できない。
+            child.parentId = parent_trade.order.orderId
+            child_trades.append(ib.placeOrder(contract, child))
+        await _await_fill_async(ib, parent_trade, contract.symbol, "新規建ての親注文")
+    except Exception:
+        for child_trade in child_trades:
+            ib.cancelOrder(child_trade.order)
+        if child_trades:
+            logger.warning(
+                "[%s] 親注文が約定しなかったため、送信済みの子注文(oca=%s)を取り消しました。",
+                contract.symbol, orders.oca_group,
+            )
+        raise
+
+    fill_price = _fill_price_of(parent_trade)
+    commission = _commission_of(parent_trade)
+    logger.info(
+        "[%s] ブラケットの親注文が約定しました: qty=%s fill=%s commission=%.2f "
+        "損切り=STP@%.2f 利確=LMT@%.2f oca=%s",
+        contract.symbol, quantity,
+        f"{fill_price:.2f}" if fill_price is not None else "不明", commission,
+        stop_price, take_profit_price, orders.oca_group,
+    )
+
+    return BracketResult(
         symbol=contract.symbol,
         quantity=quantity,
         stop_price=stop_price,
         take_profit_price=take_profit_price,
         oca_group=orders.oca_group,
+        dry_run=False,
+        fill_price=fill_price,
+        commission=commission,
         orders=orders,
     )
 
 
-async def cancel_dry_run_bracket_orders_async(ib: IB, symbol: str, oca_group: Optional[str]) -> None:
-    """ブローカー側に残っている待機注文の取り消しをシミュレートする。
+@dataclass(frozen=True)
+class RestingOrderFill:
+    """ブローカー側の待機注文が約定していたことの記録。"""
+
+    order_type: str
+    fill_price: float
+    commission: float
+
+
+def find_filled_resting_exit(ib: IB, oca_group: Optional[str]) -> Optional[RestingOrderFill]:
+    """OCAグループの待機注文が約定していればその内容を返す。
+
+    実発注時の決済検知はこちらを使う。ドライラン中は観測した現在値から
+    推定するしかないが（`strategy.exit_signal.detect_resting_order_exit`）、
+    それは180秒ごとの1点しか見ないため、バーの中で逆指値に触れて戻した
+    動きを取りこぼす。実際の約定が取れるならその推定は要らない。
+    """
+    if not oca_group:
+        return None
+
+    for trade in ib.trades():
+        order = trade.order
+        if getattr(order, "ocaGroup", None) != oca_group:
+            continue
+        if trade.orderStatus.status != _STATUS_FILLED:
+            continue
+
+        fill_price = _fill_price_of(trade)
+        if fill_price is None:
+            # 約定はしているのに値段が読めない。ここで推定を入れると損益が
+            # 静かにずれるため、次のサイクルで読めるまで判断を持ち越す。
+            logger.warning(
+                "待機注文が約定していますが約定価格が読めません: oca=%s type=%s",
+                oca_group, getattr(order, "orderType", None),
+            )
+            return None
+        return RestingOrderFill(
+            order_type=str(getattr(order, "orderType", "")),
+            fill_price=fill_price,
+            commission=_commission_of(trade),
+        )
+
+    return None
+
+
+async def cancel_bracket_orders_async(ib: IB, symbol: str, oca_group: Optional[str]) -> None:
+    """ブローカー側に残っている待機注文を取り消す。
 
     トレーリングストップや大引け前の強制決済のように、ボット側の判断で
     成行決済した場合は、必ずこれを呼んで待機注文を消すこと。残したままだと
     建玉が無いのに売り注文だけが生き続け、次にその銘柄を建てた瞬間に
-    意図しない決済が起きる（ドライラン中は実注文が無いためログのみ）。
+    意図しない決済が起きる。
     """
     if not oca_group:
         return
 
-    logger.info(
-        "[DRY-RUN] 待機注文の取り消しシミュレーション: symbol=%s oca=%s "
-        "(cancelOrderは呼び出していません)",
-        symbol, oca_group,
-    )
+    if not ENABLE_REAL_ORDERS:
+        logger.info(
+            "[DRY-RUN] 待機注文の取り消しシミュレーション: symbol=%s oca=%s "
+            "(cancelOrderは呼び出していません)",
+            symbol, oca_group,
+        )
+        return
+
+    cancelled = 0
+    for trade in ib.openTrades():
+        if getattr(trade.order, "ocaGroup", None) != oca_group:
+            continue
+        ib.cancelOrder(trade.order)
+        cancelled += 1
+
+    logger.info("[%s] 待機注文を取り消しました: oca=%s 件数=%d", symbol, oca_group, cancelled)

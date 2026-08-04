@@ -1,7 +1,8 @@
 """execution/order_manager.py の単体テスト（IB呼び出しはすべてモック化）。"""
 
 import asyncio
-from unittest.mock import MagicMock
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -9,17 +10,20 @@ from execution.order_manager import (
     MAX_ORDER_NOTIONAL_USD,
     MAX_ORDER_PRICE_DEVIATION_PCT,
     MAX_POSITION_SIZE,
+    OrderNotFilledError,
     build_bracket_orders,
-    cancel_dry_run_bracket_orders_async,
-    place_dry_run_bracket_order_async,
-    place_dry_run_order_async,
+    cancel_bracket_orders_async,
+    ensure_orders_are_paper_only,
+    find_filled_resting_exit,
+    place_bracket_order_async,
+    place_market_order_async,
 )
 
 
 def _place(action: str, quantity: int):
     ib = MagicMock()
     contract = MagicMock(symbol="AAPL")
-    return asyncio.run(place_dry_run_order_async(ib, contract, action=action, quantity=quantity))
+    return asyncio.run(place_market_order_async(ib, contract, action=action, quantity=quantity))
 
 
 # --- 最大ロット数制限 -----------------------------------------------------------
@@ -88,7 +92,7 @@ def test_place_order_is_never_called() -> None:
     ib = MagicMock()
     contract = MagicMock(symbol="AAPL")
 
-    asyncio.run(place_dry_run_order_async(ib, contract, action="BUY", quantity=1))
+    asyncio.run(place_market_order_async(ib, contract, action="BUY", quantity=1))
 
     ib.placeOrder.assert_not_called()
 
@@ -174,7 +178,7 @@ def test_dry_run_bracket_clamps_quantity_including_children() -> None:
     contract = MagicMock(symbol="AAPL")
 
     result = asyncio.run(
-        place_dry_run_bracket_order_async(
+        place_bracket_order_async(
             MagicMock(), contract, quantity=MAX_POSITION_SIZE + 500,
             stop_price=95.0, take_profit_price=110.0, reference_price=100.0,
         )
@@ -191,7 +195,7 @@ def test_dry_run_bracket_does_not_call_place_order() -> None:
     contract = MagicMock(symbol="AAPL")
 
     asyncio.run(
-        place_dry_run_bracket_order_async(
+        place_bracket_order_async(
             ib, contract, quantity=5, stop_price=95.0, take_profit_price=110.0,
             reference_price=100.0,
         )
@@ -214,7 +218,7 @@ def test_buy_is_clamped_by_notional_when_share_price_is_high() -> None:
     contract = MagicMock(symbol="AAPL")
 
     result = asyncio.run(
-        place_dry_run_order_async(
+        place_market_order_async(
             MagicMock(), contract, action="BUY", quantity=MAX_POSITION_SIZE,
             reference_price=price,
         )
@@ -229,7 +233,7 @@ def test_sell_is_not_clamped_by_notional() -> None:
     contract = MagicMock(symbol="AAPL")
 
     result = asyncio.run(
-        place_dry_run_order_async(
+        place_market_order_async(
             MagicMock(), contract, action="SELL", quantity=100,
             reference_price=MAX_ORDER_NOTIONAL_USD,  # 1株で上限に達する値段
         )
@@ -244,7 +248,7 @@ def test_bracket_notional_clamp_applies_to_children_too() -> None:
     contract = MagicMock(symbol="AAPL")
 
     result = asyncio.run(
-        place_dry_run_bracket_order_async(
+        place_bracket_order_async(
             MagicMock(), contract, quantity=MAX_POSITION_SIZE,
             stop_price=price * 0.95, take_profit_price=price * 1.10,
             reference_price=price,
@@ -268,7 +272,7 @@ def test_bracket_rejected_when_one_share_exceeds_notional_limit() -> None:
 
     with pytest.raises(ValueError):
         asyncio.run(
-            place_dry_run_bracket_order_async(
+            place_bracket_order_async(
                 MagicMock(), contract, quantity=1,
                 stop_price=price * 0.95, take_profit_price=price * 1.10,
                 reference_price=price,
@@ -321,7 +325,194 @@ def test_bracket_rejects_non_positive_reference_price(reference_price) -> None:
 def test_dry_run_cancel_does_not_call_cancel_order() -> None:
     ib = MagicMock()
 
-    asyncio.run(cancel_dry_run_bracket_orders_async(ib, "AAPL", "OCA_1"))
-    asyncio.run(cancel_dry_run_bracket_orders_async(ib, "AAPL", None))
+    asyncio.run(cancel_bracket_orders_async(ib, "AAPL", "OCA_1"))
+    asyncio.run(cancel_bracket_orders_async(ib, "AAPL", None))
 
     ib.cancelOrder.assert_not_called()
+
+
+# --- 実発注（ペーパー口座） --------------------------------------------------------
+
+# ドライランのままでは、ブラケットのtransmit順序・OCAの連動・実約定価格・手数料・
+# 注文拒否時の挙動が一切検証できない。ペーパー口座はそれを安全に潰すための環境で、
+# ここはその経路の不変条件を固定する。
+
+
+@contextmanager
+def _real_orders_enabled():
+    """実発注を有効にし、約定待ちのsleepを実時間から切り離す。"""
+    async def _no_sleep(_seconds):
+        return None
+
+    with patch("execution.order_manager.ENABLE_REAL_ORDERS", True), \
+        patch("execution.order_manager.asyncio.sleep", new=_no_sleep):
+        yield
+
+
+def _make_trade(status: str = "Filled", avg_fill_price: float = 100.0, commission: float = 0.35,
+                order_id: int = 42, order_type: str = "MKT", oca_group=None):
+    trade = MagicMock()
+    trade.isDone = MagicMock(return_value=True)
+    trade.orderStatus.status = status
+    trade.orderStatus.avgFillPrice = avg_fill_price
+    fill = MagicMock()
+    fill.commissionReport.commission = commission
+    trade.fills = [fill]
+    trade.order.orderId = order_id
+    trade.order.orderType = order_type
+    trade.order.ocaGroup = oca_group
+    return trade
+
+
+def test_paper_port_guard_allows_paper_and_blocks_anything_else() -> None:
+    """実発注が有効なら、接続先はペーパーのポートに限ること。
+
+    許可リストで判定するのは、本番ポートの拒否リストだと .env の打ち間違い
+    （7495等）が素通りするため。
+    """
+    with patch("execution.order_manager.ENABLE_REAL_ORDERS", True):
+        for paper_port in (7497, 4002):
+            ensure_orders_are_paper_only(paper_port)
+        for other_port in (7496, 4001, 7495):
+            with pytest.raises(RuntimeError):
+                ensure_orders_are_paper_only(other_port)
+
+
+def test_guard_is_inert_while_dry_running() -> None:
+    """ドライランならデータ取得だけなので、どのポートでも止めない。"""
+    for port in (7496, 4001, 7497):
+        ensure_orders_are_paper_only(port)
+
+
+def test_real_bracket_sends_parent_first_then_children_with_parent_id() -> None:
+    """親→子の順で送り、子には親のorderIdを代入すること。
+
+    parentId は placeOrder 後にしか決まらない。代入を落とすと、IBKR側で
+    親子関係が成立せず、子が独立した売り注文として生きる。
+    """
+    ib = MagicMock()
+    contract = MagicMock(symbol="AAPL")
+    parent_trade = _make_trade(order_id=99)
+    ib.placeOrder = MagicMock(side_effect=[parent_trade, _make_trade(), _make_trade()])
+
+    with _real_orders_enabled():
+        result = asyncio.run(place_bracket_order_async(
+            ib, contract, quantity=3, stop_price=95.0, take_profit_price=110.0,
+            reference_price=100.0,
+        ))
+
+    sent_orders = [call.args[1] for call in ib.placeOrder.call_args_list]
+    assert sent_orders[0].orderType == "MKT"
+    assert [order.parentId for order in sent_orders[1:]] == [99, 99]
+    # transmit=True は最後の子だけ（親を先に送ると損切りの無い建玉が一瞬できる）。
+    assert [order.transmit for order in sent_orders] == [False, False, True]
+    assert result.dry_run is False
+
+
+def test_real_bracket_reports_the_actual_fill_and_commission() -> None:
+    """建値は参照価格ではなく実約定を返すこと。"""
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(
+        side_effect=[_make_trade(avg_fill_price=101.25, commission=0.35), _make_trade(), _make_trade()]
+    )
+
+    with _real_orders_enabled():
+        result = asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AAPL"), quantity=3, stop_price=95.0, take_profit_price=110.0,
+            reference_price=100.0,
+        ))
+
+    assert result.fill_price == 101.25
+    assert result.commission == 0.35
+
+
+def test_rejected_parent_cancels_the_children_and_raises() -> None:
+    """親が拒否されたら、送信済みの子を取り消して例外にすること。
+
+    子を残すと建玉が無いのに売り注文だけが生き、次にその銘柄を建てた瞬間に
+    意図しない決済が起きる。例外にするのは、呼び出し側に実体の無い建玉を
+    記録させないため。
+    """
+    ib = MagicMock()
+    rejected = _make_trade(status="Inactive")
+    child_a, child_b = _make_trade(), _make_trade()
+    ib.placeOrder = MagicMock(side_effect=[rejected, child_a, child_b])
+
+    with _real_orders_enabled(), pytest.raises(OrderNotFilledError):
+        asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AAPL"), quantity=3, stop_price=95.0, take_profit_price=110.0,
+            reference_price=100.0,
+        ))
+
+    cancelled = [call.args[0] for call in ib.cancelOrder.call_args_list]
+    assert cancelled == [child_a.order, child_b.order]
+
+
+def test_unfilled_market_order_is_cancelled_and_raises() -> None:
+    """約定しないまま時間切れになったら、注文を取り消して例外にすること。"""
+    ib = MagicMock()
+    pending = _make_trade(status="Submitted")
+    pending.isDone = MagicMock(return_value=False)
+    ib.placeOrder = MagicMock(return_value=pending)
+
+    with _real_orders_enabled(), pytest.raises(OrderNotFilledError):
+        asyncio.run(place_market_order_async(
+            ib, MagicMock(symbol="AAPL"), action="SELL", quantity=3,
+        ))
+
+    ib.cancelOrder.assert_called_once_with(pending.order)
+
+
+def test_real_market_order_returns_the_fill() -> None:
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(return_value=_make_trade(avg_fill_price=98.7, commission=0.35))
+
+    with _real_orders_enabled():
+        result = asyncio.run(place_market_order_async(
+            ib, MagicMock(symbol="AAPL"), action="SELL", quantity=3,
+        ))
+
+    assert (result.fill_price, result.commission, result.dry_run) == (98.7, 0.35, False)
+
+
+def test_find_filled_resting_exit_matches_the_oca_group() -> None:
+    """待機注文の約定は、OCAグループで突き合わせて拾うこと。"""
+    ib = MagicMock()
+    other = _make_trade(order_type="STP", oca_group="OTHER")
+    mine = _make_trade(order_type="LMT", oca_group="OCA_1", avg_fill_price=110.0, commission=0.35)
+    ib.trades = MagicMock(return_value=[other, mine])
+
+    fill = find_filled_resting_exit(ib, "OCA_1")
+
+    assert (fill.order_type, fill.fill_price, fill.commission) == ("LMT", 110.0, 0.35)
+
+
+def test_find_filled_resting_exit_ignores_unfilled_and_missing_groups() -> None:
+    ib = MagicMock()
+    ib.trades = MagicMock(return_value=[_make_trade(status="Submitted", oca_group="OCA_1")])
+
+    assert find_filled_resting_exit(ib, "OCA_1") is None
+    assert find_filled_resting_exit(ib, None) is None
+
+
+def test_filled_resting_exit_without_a_readable_price_is_not_reported() -> None:
+    """約定価格が読めないうちは決済扱いにしないこと。
+
+    IBKRは未受信のフィールドをNaNや0で埋める。推定で埋めると損益が静かにずれる。
+    """
+    ib = MagicMock()
+    ib.trades = MagicMock(return_value=[_make_trade(avg_fill_price=0.0, oca_group="OCA_1")])
+
+    assert find_filled_resting_exit(ib, "OCA_1") is None
+
+
+def test_real_cancel_cancels_only_the_matching_oca_group() -> None:
+    ib = MagicMock()
+    mine = _make_trade(oca_group="OCA_1")
+    other = _make_trade(oca_group="OCA_2")
+    ib.openTrades = MagicMock(return_value=[mine, other])
+
+    with _real_orders_enabled():
+        asyncio.run(cancel_bracket_orders_async(ib, "AAPL", "OCA_1"))
+
+    ib.cancelOrder.assert_called_once_with(mine.order)
