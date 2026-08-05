@@ -1015,6 +1015,30 @@ async def _filter_symbols_by_price_band_async(
     return kept
 
 
+def _latest_close_price(daily_df: pd.DataFrame) -> float:
+    return float(daily_df["close"].iloc[-1])
+
+
+def _long_term_moving_average(daily_df: pd.DataFrame) -> float:
+    return float(daily_df["close"].iloc[-STRUGGLING_MA_WINDOW:].mean())
+
+
+def _pct_to_long_term_ma(daily_df: pd.DataFrame) -> float:
+    """終値が長期移動平均まであと何%かを返す（正の値＝あとどれだけ上げれば復帰か）。
+
+    除外の理由だけをログに残しても、その銘柄が復帰間近なのか遠いのかが
+    分からない。**除外は永続化されず毎回やり直されるので**（`main()` は
+    スクリーニングが成功した日以外 `fallback_watchlist` を入れ替えない）、
+    この距離が縮めばその銘柄は自動的に監視へ戻り、押し目が出れば建つ。
+    運用者が「待てば戻る銘柄」と「当面戻らない銘柄」を見分けるための値である。
+    """
+    close = _latest_close_price(daily_df)
+    moving_average = _long_term_moving_average(daily_df)
+    if close <= 0:
+        return 0.0
+    return (moving_average / close - 1.0) * 100.0
+
+
 async def _drop_struggling_symbols_async(
     ib: IB, symbols: List[str], caches: MarketDataCaches, protected: Sequence[str] = (),
 ) -> List[str]:
@@ -1055,16 +1079,21 @@ async def _drop_struggling_symbols_async(
         if len(daily_df) < SWING_MIN_HISTORY_BARS:
             logger.info(
                 "[%s] 日足が%d本しかなく長期トレンドを判定できないため、監視対象から外します"
-                "（本数が揃うまでスイングの新規建てができない）。",
-                symbol, len(daily_df),
+                "（本数が揃うまでスイングの新規建てができない）。"
+                "再エントリーまで残り%d営業日。",
+                symbol, len(daily_df), SWING_MIN_HISTORY_BARS - len(daily_df),
             )
             continue
 
         in_uptrend = is_in_long_term_uptrend(daily_df, STRUGGLING_MA_WINDOW)
         if in_uptrend is False:
             logger.info(
-                "[%s] 終値が%d日移動平均を下回る下降トレンドのため、監視対象から外します。",
+                "[%s] 終値が%d日移動平均を下回る下降トレンドのため、監視対象から外します。"
+                "終値%.2f / MA%d %.2f（あと%+.1f%%で復帰）。",
                 symbol, STRUGGLING_MA_WINDOW,
+                _latest_close_price(daily_df), STRUGGLING_MA_WINDOW,
+                _long_term_moving_average(daily_df),
+                _pct_to_long_term_ma(daily_df),
             )
             continue
         kept.append(symbol)

@@ -50,6 +50,19 @@ _PRICE_BAND_RE = re.compile(
 )
 _EQUITY_RE = re.compile(r"口座資金.*USD\)?を取得しました: (?P<equity>[\d.]+)")
 
+# 監視から外れているが、条件が変われば自動的に戻る銘柄。除外は永続化されず
+# 毎回やり直されるため（main()はスクリーニングが成功した日以外フォールバックの
+# リストを入れ替えない）、これらは「捨てた銘柄」ではなく「順番待ちの銘柄」である。
+# 復帰までの距離を出しておかないと、待てば戻るのか当面戻らないのかが分からない。
+_PENDING_TREND_RE = re.compile(
+    r"^\[(?P<symbol>[^\]]+)\] 終値が\d+日移動平均を下回る.*"
+    r"終値(?P<close>[\d.]+) / MA\d+ (?P<ma>[\d.]+)（あと(?P<gap>[+\-\d.]+)%で復帰）"
+)
+_PENDING_HISTORY_RE = re.compile(
+    r"^\[(?P<symbol>[^\]]+)\] 日足が(?P<bars>\d+)本しかなく.*"
+    r"再エントリーまで残り(?P<remaining>\d+)営業日"
+)
+
 # 新規エントリーが見送られた理由。ログの原文をそのまま照合すると
 # 書式変更で静かに数え漏れるため、判別に足りる最小の部分文字列だけを持つ。
 _SKIP_REASONS: List[Tuple[str, str]] = [
@@ -90,6 +103,8 @@ class DayReport:
     # 「あと何%で閾値だったか」を見るための材料。
     lowest_deviation: Dict[str, float] = field(default_factory=dict)
     excluded_symbols: Dict[str, str] = field(default_factory=dict)
+    # 監視から外れているが条件が変われば自動で戻る銘柄 -> 復帰までの距離。
+    pending_symbols: Dict[str, str] = field(default_factory=dict)
     skip_reasons: Counter = field(default_factory=Counter)
     screening_degraded: List[str] = field(default_factory=list)
     connection_failure_rounds: int = 0
@@ -169,6 +184,22 @@ def build_day_report(
         if band is not None:
             report.excluded_symbols[band.group("symbol")] = (
                 f"{band.group('bound')}外 (株価 {band.group('price')} USD)"
+            )
+            continue
+
+        trend = _PENDING_TREND_RE.match(message)
+        if trend is not None:
+            report.pending_symbols[trend.group("symbol")] = (
+                f"下降トレンド: 終値 {trend.group('close')} / MA {trend.group('ma')}"
+                f" → あと {trend.group('gap')}% で復帰"
+            )
+            continue
+
+        history = _PENDING_HISTORY_RE.match(message)
+        if history is not None:
+            report.pending_symbols[history.group("symbol")] = (
+                f"本数不足: 日足 {history.group('bars')}本"
+                f" → 残り {history.group('remaining')}営業日"
             )
             continue
 
@@ -284,6 +315,12 @@ def format_report(report: DayReport) -> str:
     if report.excluded_symbols:
         lines.append("株価帯で除外:")
         for symbol, reason in sorted(report.excluded_symbols.items()):
+            lines.append(f"  {symbol}: {reason}")
+    if report.pending_symbols:
+        # 「捨てた銘柄」ではなく「順番待ちの銘柄」。条件が変われば翌日には
+        # 自動で監視へ戻るので、距離の近い順に並べて復帰の目安を見せる。
+        lines.append("再エントリー待ち（条件が変われば自動で監視へ戻る）:")
+        for symbol, reason in sorted(report.pending_symbols.items()):
             lines.append(f"  {symbol}: {reason}")
     if report.screening_degraded:
         lines.append("スクリーニングが縮退（固定ウォッチリストで稼働）:")

@@ -84,6 +84,51 @@ def test_silent_degradations_are_surfaced():
     assert report.excluded_symbols["JOBY"].startswith("下限外")
 
 
+def test_pending_symbols_show_how_far_they_are_from_returning():
+    """監視から外れた銘柄の「復帰までの距離」を拾うこと。
+
+    除外は永続化されず毎回やり直されるため（main()はスクリーニングが
+    成功した日以外フォールバックのリストを入れ替えない）、これらは
+    捨てた銘柄ではなく順番待ちの銘柄である。距離が出ていないと、
+    待てば戻るのか当面戻らないのかを運用者が判断できない。
+
+    文字列は main._drop_struggling_symbols_async が実際に出す書式。
+    """
+    lines = _lines(
+        "2026-08-03 22:30:20,000 [INFO] __main__: [SPCX] 日足が36本しかなく長期トレンドを"
+        "判定できないため、監視対象から外します（本数が揃うまでスイングの新規建てが"
+        "できない）。再エントリーまで残り164営業日。",
+        "2026-08-03 22:30:21,000 [INFO] __main__: [RIVN] 終値が200日移動平均を下回る"
+        "下降トレンドのため、監視対象から外します。終値15.76 / MA200 16.10"
+        "（あと+2.2%で復帰）。",
+    )
+
+    report = build_day_report(lines, [], date(2026, 8, 3))
+
+    assert report.pending_symbols["SPCX"] == "本数不足: 日足 36本 → 残り 164営業日"
+    assert report.pending_symbols["RIVN"] == (
+        "下降トレンド: 終値 15.76 / MA 16.10 → あと +2.2% で復帰"
+    )
+    assert "再エントリー待ち" in format_report(report)
+
+
+def test_entry_side_history_warning_is_not_counted_as_pending():
+    """エントリー側の本数不足の警告を、再エントリー待ちとして数えないこと。
+
+    似た書式の行が2箇所から出る。ウォッチリストの除外（＝順番待ち）だけを
+    拾いたいので、区別できなくなると件数が二重になる。
+    """
+    lines = _lines(
+        "2026-08-03 22:30:22,000 [WARNING] __main__: [SPCX] 日足が36本しかなく"
+        "長期トレンド(200本)を判定できないため、スイングの新規建てを見送ります"
+        "（上場から日が浅い銘柄では本数が揃うまでエントリーできません）。",
+    )
+
+    report = build_day_report(lines, [], date(2026, 8, 3))
+
+    assert report.pending_symbols == {}
+
+
 def test_entry_skip_reasons_are_counted():
     lines = _lines(
         "2026-08-03 23:00:00,000 [INFO] __main__: [KO] 本日すでに決済済みのため、"
