@@ -218,6 +218,19 @@ def _message_head(message: str, limit: int = 60) -> str:
     return head[:limit]
 
 
+def _counted_in_order(messages: Iterable[str]) -> List[Tuple[str, int]]:
+    """重複を畳んで「メッセージ, 出現回数」を初出順で返す。
+
+    初出順にするのは、縮退が起きた順序（何が先に落ちたか）が切り分けの
+    材料になるため。回数の多い順に並べ替えるとその情報が消える。
+    """
+    counts = Counter(messages)
+    seen: Dict[str, None] = {}
+    for message in messages:
+        seen.setdefault(message, None)
+    return [(message, counts[message]) for message in seen]
+
+
 def format_report(report: DayReport) -> str:
     lines: List[str] = []
     lines.append(f"===== {report.trading_day} (米国東部時間) の稼働サマリ =====")
@@ -274,8 +287,12 @@ def format_report(report: DayReport) -> str:
             lines.append(f"  {symbol}: {reason}")
     if report.screening_degraded:
         lines.append("スクリーニングが縮退（固定ウォッチリストで稼働）:")
-        for message in report.screening_degraded:
-            lines.append(f"  {message}")
+        # 再試行は SCREENING_RETRY_INTERVAL_SECONDS ごとに走るため、同じ2行が
+        # 1日で20回以上並ぶ。全部出すと「1画面で読む」という本レポートの
+        # 役目が壊れるので、回数を添えて1回にまとめる。
+        for message, count in _counted_in_order(report.screening_degraded):
+            suffix = f"（{count}回）" if count > 1 else ""
+            lines.append(f"  {message}{suffix}")
 
     lines.append("")
     lines.append("--- 稼働 ---")
