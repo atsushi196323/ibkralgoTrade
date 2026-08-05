@@ -37,7 +37,9 @@ from main import (
     POLL_INTERVAL_SECONDS,
     SCREENING_RETRY_INTERVAL_SECONDS,
     RISK_PER_TRADE_PCT,
+    STRUGGLING_MA_WINDOW,
     SWING_MA_WINDOW,
+    SWING_MIN_HISTORY_BARS,
     SWING_STOP_LOSS_PCT,
     WATCHLIST,
     MarketDataCaches,
@@ -67,13 +69,15 @@ def _make_df(closes: list) -> pd.DataFrame:
 def _make_daily_df(*, drop: bool = False) -> pd.DataFrame:
     """スイング（日足）判定用のバー。drop=Trueで買いシグナルが出る形にする。
 
-    本数をSWING_MA_WINDOWから導出しているのは、移動平均期間を変更したときに
+    本数をSWING_MIN_HISTORY_BARSから導出しているのは、必要本数を変更したときに
     「本数不足で日足分岐が丸ごとスキップされ、テストは通るがシグナル判定を
-    一度も通っていない」状態に陥るのを防ぐため。
+    一度も通っていない」状態に陥るのを防ぐため。移動平均が確定する本数
+    (SWING_MA_WINDOW)ではなく新規建てに必要な本数を使うのは、前者だけでは
+    エントリー経路のテストが本数不足で素通りしてしまうからである。
     """
     if drop:
-        return _make_df([100.0] * (SWING_MA_WINDOW - 1) + [80.0])
-    return _make_df([100.0] * SWING_MA_WINDOW)
+        return _make_df([100.0] * (SWING_MIN_HISTORY_BARS - 1) + [80.0])
+    return _make_df([100.0] * SWING_MIN_HISTORY_BARS)
 
 
 def _bracket_result(quantity: int, symbol: str = "AAPL") -> BracketResult:
@@ -2273,7 +2277,7 @@ def test_short_daily_history_is_reported_instead_of_silently_skipped(trade_journ
     """
     ib = MagicMock()
     position_manager = PositionManager()
-    # 移動平均30本に対して10本しか無い日足。
+    # 必要本数(SWING_MIN_HISTORY_BARS)に対して10本しか無い日足。
     short_df = _make_df([100.0] * 10)
 
     with caplog.at_level(logging.WARNING, logger="main"), \
@@ -2303,6 +2307,47 @@ def test_full_daily_history_does_not_warn(trade_journal, caplog) -> None:
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
     assert "日足が" not in caplog.text
+
+
+def test_entry_requires_enough_history_to_judge_the_long_term_trend(trade_journal, caplog) -> None:
+    """移動平均が確定するだけの本数では新規建てしないこと。
+
+    長期トレンドフィルター(STRUGGLING_MA_WINDOW=200本)は本数が足りないと
+    判定不能となり、_drop_struggling_symbols_async はその銘柄を監視対象に
+    残す。エントリー側がSWING_MA_WINDOW(30本)で通ってしまうと、
+    **トレンド判定を一度も受けていない銘柄がそのまま建つ。**
+
+    2026-08-04のペーパー検証で実際に起きた回帰。上場から35営業日のSPCXが
+    MA(30)乖離-16.54%で建った。この乖離は上場直後の値付けの途中経過であって、
+    42銘柄・10年で検証した「平均回帰する押し目」ではない。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    # 移動平均(30本)は確定するがトレンド判定(200本)には届かない本数で、
+    # かつ乖離率が閾値を割る形。フィルターが無ければ買いシグナルが出る。
+    ipo_df = _make_df([100.0] * (SWING_MA_WINDOW * 2 - 1) + [80.0])
+    assert SWING_MA_WINDOW <= len(ipo_df) < SWING_MIN_HISTORY_BARS
+
+    with caplog.at_level(logging.WARNING, logger="main"), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="IPO"))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=ipo_df)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.place_bracket_order_async", new=AsyncMock()) as mock_order:
+        asyncio.run(process_symbol_async(ib, "IPO", position_manager, trade_journal))
+
+    mock_order.assert_not_awaited()
+    assert position_manager.has_position("IPO") is False
+    assert "長期トレンド" in caplog.text
+
+
+def test_swing_entry_history_requirement_matches_the_trend_filter() -> None:
+    """新規建ての必要本数が、長期トレンドフィルターの本数と揃っていること。
+
+    ずれると「監視には残すがトレンド判定は受けていない」銘柄が再びエントリー
+    経路を通る。番人としてここで固定する。
+    """
+    assert SWING_MIN_HISTORY_BARS == STRUGGLING_MA_WINDOW
 
 
 # --- 売買代金の急上昇による銘柄の入れ替え -------------------------------------------
@@ -2457,6 +2502,61 @@ def test_scanner_failure_keeps_the_watchlist_running(tmp_path) -> None:
         ))
 
     assert result == ["HEALTHY"]
+
+
+def test_symbols_without_enough_history_are_dropped_from_the_watchlist(tmp_path) -> None:
+    """本数不足でトレンド判定できない銘柄を監視対象から外すこと。
+
+    `SWING_MIN_HISTORY_BARS` によりどのみち新規建てできないため、残すと
+    監視枠と毎サイクルの価格取得（ペーシング枠）を占めるだけになる。
+    2026-08-04の検証では固定リスト9銘柄のうち3銘柄(SPCX/CBRS/FRVO)がこれで、
+    ザラ場中ずっと枠を消費していた。
+    """
+    ib = MagicMock()
+    store = RankHistoryStore(str(tmp_path / "ranks.json"))
+
+    async def _bars(ib, contract, now=None):
+        if contract.symbol == "IPO":
+            # 移動平均(30本)は確定するがトレンド判定(200本)には届かない本数。
+            return _make_df([100.0] * 50)
+        # 200日移動平均を上回る系列（トレンドの判定自体は通る）。
+        return _make_df([50.0] * SWING_MIN_HISTORY_BARS + [100.0] * 20)
+
+    with patch("data.cache.qualify_stock_async",
+               new=AsyncMock(side_effect=lambda ib, symbol: MagicMock(symbol=symbol))), \
+        patch("data.cache.DailyBarCache.get_async", new=AsyncMock(side_effect=_bars)):
+        result = asyncio.run(main_module._apply_attention_watchlist_async(
+            ib, ["KEEP", "IPO"], 1220.0, MarketDataCaches(), PositionManager(), store,
+        ))
+
+    assert result == ["KEEP"]
+
+
+def test_held_symbols_without_enough_history_stay_in_the_watchlist(tmp_path) -> None:
+    """保有中の銘柄は本数不足でも監視対象に残すこと。
+
+    外すと再エントリーの判断ができなくなる（決済判定自体は保有銘柄との
+    和集合で続くが、監視から消えた銘柄は日足の更新を受けない）。
+    """
+    ib = MagicMock()
+    store = RankHistoryStore(str(tmp_path / "ranks.json"))
+    position_manager = PositionManager()
+    position_manager.open_position(
+        symbol="IPO", entry_price=100.0, quantity=1, risk_per_share=5.0,
+        strategy_type="swing",
+    )
+
+    async def _bars(ib, contract, now=None):
+        return _make_df([100.0] * 50)
+
+    with patch("data.cache.qualify_stock_async",
+               new=AsyncMock(side_effect=lambda ib, symbol: MagicMock(symbol=symbol))), \
+        patch("data.cache.DailyBarCache.get_async", new=AsyncMock(side_effect=_bars)):
+        result = asyncio.run(main_module._apply_attention_watchlist_async(
+            ib, ["IPO"], 1220.0, MarketDataCaches(), position_manager, store,
+        ))
+
+    assert result == ["IPO"]
 
 
 def test_surges_are_ignored_while_the_feature_is_in_observation_mode(tmp_path) -> None:

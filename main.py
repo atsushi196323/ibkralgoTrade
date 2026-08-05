@@ -248,6 +248,24 @@ CONNECTION_FAILURE_ROUNDS_BEFORE_MANUAL_LOGIN: int = 3
 SWING_MA_WINDOW: int = 30
 SWING_THRESHOLD_PCT: float = 5.0
 
+# スイングの新規建てに必要な日足の最低本数。**移動平均が確定する本数
+# (SWING_MA_WINDOW)では足りない。**
+#
+# 長期トレンドフィルター(STRUGGLING_MA_WINDOW=200本)は本数が足りないと
+# Noneを返し、_drop_struggling_symbols_async はその銘柄を監視対象に残す。
+# 残すこと自体は正しい（本数不足は「下降トレンドである」ことを意味しない）
+# が、エントリー側が30本で通ると、**トレンド判定を一度も受けていない銘柄が
+# そのまま建つ**。2026-08-04のペーパー検証で実際に起きており、上場から
+# 35営業日のSPCXがMA(30)乖離-16.54%で建った。この乖離は上場直後の値付けの
+# 途中経過であって、42銘柄・10年で検証した「平均回帰する押し目」ではない。
+# 同じ日のウォッチリストにはCBRS(55本)・FRVO(56本)も居り、同時保有上限に
+# 阻まれただけで条件は同じだった。
+#
+# したがってエントリーは「トレンド判定を実際に受けられる本数」を要求する。
+# 分からないものを有利側に倒さない、という他の判定（価格の鮮度・株価帯）と
+# 同じ向きに揃える。監視から外さないが建てもしない、が正しい扱いである。
+SWING_MIN_HISTORY_BARS: int = STRUGGLING_MA_WINDOW
+
 # 市場全体（指数）の状況によるエントリーの追加条件。日足＝スイング判定にのみ掛かる。
 #
 # **既定は無効（すべてNone）。** 有効化してよいのは、
@@ -458,17 +476,17 @@ async def _detect_buy_signal_async(
         logger.warning("%s のヒストリカルデータが取得できなかったためスキップします。", symbol)
         return None
 
-    if 0 < len(daily_df) < SWING_MA_WINDOW:
+    if 0 < len(daily_df) < SWING_MIN_HISTORY_BARS:
         # 新規上場銘柄では現実に起きる。黙ってスキップすると「シグナルが
         # 出ない銘柄」と区別がつかず、監視枠を占めていることに気付けない。
         logger.warning(
-            "[%s] 日足が%d本しかなく移動平均(%d本)を確定できないため、"
-            "スイング判定をスキップします（上場から日が浅い銘柄では"
+            "[%s] 日足が%d本しかなく長期トレンド(%d本)を判定できないため、"
+            "スイングの新規建てを見送ります（上場から日が浅い銘柄では"
             "本数が揃うまでエントリーできません）。",
-            symbol, len(daily_df), SWING_MA_WINDOW,
+            symbol, len(daily_df), SWING_MIN_HISTORY_BARS,
         )
 
-    if len(daily_df) >= SWING_MA_WINDOW:
+    if len(daily_df) >= SWING_MIN_HISTORY_BARS:
         market_deviation_pct = await _get_market_deviation_pct_async(ib, caches)
         swing_signal = detect_pullback_signal(
             symbol, daily_df, ma_window=SWING_MA_WINDOW, threshold_pct=SWING_THRESHOLD_PCT,
@@ -1010,9 +1028,12 @@ async def _drop_struggling_symbols_async(
     日足は `DailyBarCache` から取るので追加リクエストは発生しない
     （キャッシュの取得期間を300日にしてあるのはこの判定のためでもある）。
 
-    **本数が足りず判定できない銘柄は残す。** 新規上場銘柄は200本に届かないが、
-    それは「下降トレンドである」ことを意味しない。分からないものを外すと、
-    上場直後の銘柄が理由も無く監視から消える。
+    **本数が足りず判定できない銘柄も外す。** かつては「本数不足は下降トレンドを
+    意味しない」として残していたが、`SWING_MIN_HISTORY_BARS` により
+    そうした銘柄はどのみち新規建てできない。残すと、建てられない銘柄が
+    監視枠(`MAX_WATCHLIST_SIZE`)と毎サイクルの価格取得（＝ペーシング枠）を
+    占め続ける——株価帯のフィルターが上限超えの銘柄を外すのと同じ理由である。
+    本数が揃えば翌日の選定で戻ってくるので、締め出しにはならない。
 
     `protected` は保有中の銘柄。外してもポジションの決済判定は続く
     （`run_watchlist_cycle_async` が保有銘柄との和集合を処理する）が、
@@ -1029,6 +1050,14 @@ async def _drop_struggling_symbols_async(
         except Exception:
             logger.exception("[%s] トレンド判定に失敗したため、監視対象に残します。", symbol)
             kept.append(symbol)
+            continue
+
+        if len(daily_df) < SWING_MIN_HISTORY_BARS:
+            logger.info(
+                "[%s] 日足が%d本しかなく長期トレンドを判定できないため、監視対象から外します"
+                "（本数が揃うまでスイングの新規建てができない）。",
+                symbol, len(daily_df),
+            )
             continue
 
         in_uptrend = is_in_long_term_uptrend(daily_df, STRUGGLING_MA_WINDOW)
