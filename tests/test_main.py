@@ -87,10 +87,21 @@ def _make_daily_df(*, drop: bool = False) -> pd.DataFrame:
     return _make_df(base + [100.0] * SWING_MA_WINDOW)
 
 
-def _bracket_result(quantity: int, symbol: str = "AAPL") -> BracketResult:
-    """新規建て時のブラケット注文の戻り値（値段は呼び出し側の検証対象外）。"""
+def _bracket_result(
+    quantity: int,
+    symbol: str = "AAPL",
+    stop_price: float = 76.0,
+    take_profit_price: float = 88.0,
+) -> BracketResult:
+    """新規建て時のブラケット注文の戻り値。
+
+    値段の既定は「現在値80.0でスイングの-5%/+10%」に対応する。呼び出し側は
+    ここで返る値段（＝実際にブローカーへ置いた待機注文の値段。呼値へ丸めた後）を
+    そのままローカルの記録に使うため、0.0のままにすると記録が実態とずれる。
+    """
     return BracketResult(
-        symbol=symbol, quantity=quantity, stop_price=0.0, take_profit_price=0.0,
+        symbol=symbol, quantity=quantity,
+        stop_price=stop_price, take_profit_price=take_profit_price,
         oca_group="OCA_TEST",
     )
 
@@ -1309,7 +1320,7 @@ def test_trailing_stop_cancels_resting_orders_before_selling_at_market(trade_jou
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
-    mock_cancel.assert_awaited_once_with(ib, "AAPL", "OCA_1")
+    mock_cancel.assert_awaited_once_with(ib, "AAPL")
     mock_order.assert_awaited_once_with(ib, contract, action="SELL", quantity=3)
     assert trade_journal.load_trades()[0].reason == "TRAILING_STOP"
 
@@ -1333,7 +1344,7 @@ def test_eod_flatten_cancels_resting_orders_before_selling_at_market(trade_journ
 
         asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
 
-    mock_cancel.assert_awaited_once_with(ib, "AAPL", "OCA_2")
+    mock_cancel.assert_awaited_once_with(ib, "AAPL")
     mock_order.assert_awaited_once_with(ib, contract, action="SELL", quantity=2)
     assert trade_journal.load_trades()[0].reason == "EOD_FLATTEN"
 

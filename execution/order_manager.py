@@ -49,6 +49,47 @@ _STATUS_FILLED: str = "Filled"
 # 約定せずに終わった状態。拒否(Inactive)もここに含まれる。
 _TERMINAL_UNFILLED_STATUSES = frozenset({"Cancelled", "ApiCancelled", "Inactive"})
 
+# 待機注文がブローカー側で生きていると見なせる状態。
+# PreSubmitted は親の約定待ちで保留されている子注文（whyHeld='child'）の状態で、
+# 親が約定すれば Submitted へ移る。どちらも「置かれている」side である。
+_LIVE_ORDER_STATUSES = frozenset({"PreSubmitted", "Submitted", _STATUS_FILLED})
+
+# 米国株の呼値。**丸めずに送ると注文が拒否される。**
+# 2026-08-05のペーパー検証で、損切り 67.55×0.95 = 63.1750 がそのまま送られ、
+# IBKRが `Warning 110（指定価格がこのコントラクトの呼値と一致しません）` を返して
+# 逆指値だけが不成立になった。利確(73.15)はたまたま2桁だったため通り、
+# **損切りの無い建玉が残った**。ib_insyncは110を警告としてしか通知せず、
+# 子注文には状態変化すら来ないため、丸めを欠くと静かに防御だけが消える。
+#
+# 1ドル未満の銘柄は呼値が $0.0001 になるが、監視できる株価帯の下限
+# （main.resolve_min_tradeable_price）は資金$1,220でも$6.10であり該当しない。
+MIN_PRICE_INCREMENT_USD: float = 0.01
+
+# 待機注文の有効期間。**DAYにしてはならない。**
+# スイングは建玉を持ち越すため、DAYだと引けで待機注文が失効し、
+# 翌日の寄り付きまで損切りの無い時間ができる（ブラケットをブローカー側に
+# 置いている意味そのものが消える）。明示しないとIB Gateway側の
+# Order Preset が DAY を上書き適用する（Error 10349 として現れる）。
+_RESTING_ORDER_TIF: str = "GTC"
+
+# 親の約定後、子注文が生きた状態へ移るまで待つ上限（秒）。
+# 送信直後は PendingSubmit で、ブローカーが受理して初めて PreSubmitted/Submitted
+# になる。短すぎると正常な注文を不成立と誤判定して建玉を決済してしまう。
+_CHILD_ORDER_LIVE_TIMEOUT_SECONDS: float = 10.0
+
+# ブラケットの子として置く決済注文の種類（損切りの逆指値・利確の指値）。
+# 待機注文の取り消しと約定検知は、この2種類の売り注文だけを対象にする。
+_RESTING_EXIT_ORDER_TYPES = frozenset({"STP", "LMT"})
+
+
+class RestingOrdersNotLiveError(RuntimeError):
+    """親は約定したが、ブラケットの子注文がブローカー側で生きていない。
+
+    `OrderNotFilledError` と同じく、**呼び出し側にローカル記録を作らせない**
+    ために例外にしている。こちらは建玉ができた後に判明するため、
+    投げる前に建玉を成行で決済してから投げる（`_ensure_children_are_live_async`）。
+    """
+
 
 class OrderNotFilledError(RuntimeError):
     """注文が約定しないまま終了した（拒否・取消・タイムアウト）。
@@ -367,6 +408,22 @@ class BracketResult:
     orders: Optional[BracketOrders] = field(default=None, repr=False)
 
 
+def round_to_tick(price: float) -> float:
+    """待機注文の値段を呼値（MIN_PRICE_INCREMENT_USD）へ切り上げる。
+
+    切り上げに倒すのは、損切りが「予定より広くならない」側だからである。
+    切り下げると逆指値が1呼値ぶん遠くなり、1トレードのリスクが
+    設計値(1%)をわずかに超える。利確側は切り上げでも「予定より早く利確しない」
+    側なので、両方を同じ向きに倒せる。
+
+    除算の誤差を先に丸めてから切り上げる。63.175 / 0.01 は二進浮動小数点では
+    6317.499999... になり、そのまま ceil すると 63.18 ではなく 63.18 を経ずに
+    1呼値ずれる（63.175 のように呼値のちょうど半分の値は実際に出る）。
+    """
+    ticks = math.ceil(round(price / MIN_PRICE_INCREMENT_USD, 6))
+    return round(ticks * MIN_PRICE_INCREMENT_USD, 2)
+
+
 def build_bracket_orders(
     symbol: str,
     quantity: int,
@@ -401,6 +458,11 @@ def build_bracket_orders(
         )
     validate_resting_order_prices(symbol, reference_price, stop_price, take_profit_price)
 
+    # 呼値へ丸めてから組み立てる。丸めないとIBKRが Warning 110 を返して
+    # その注文だけが不成立になる（MIN_PRICE_INCREMENT_USD の説明を参照）。
+    stop_price = round_to_tick(stop_price)
+    take_profit_price = round_to_tick(take_profit_price)
+
     parent = MarketOrder(ACTION_BUY, quantity)
     parent.transmit = False
 
@@ -409,11 +471,13 @@ def build_bracket_orders(
     stop_loss = StopOrder(ACTION_SELL, quantity, stop_price)
     stop_loss.ocaGroup = oca_group
     stop_loss.ocaType = _OCA_TYPE_REDUCE_WITH_OVERFILL_PROTECTION
+    stop_loss.tif = _RESTING_ORDER_TIF
     stop_loss.transmit = False
 
     take_profit = LimitOrder(ACTION_SELL, quantity, take_profit_price)
     take_profit.ocaGroup = oca_group
     take_profit.ocaType = _OCA_TYPE_REDUCE_WITH_OVERFILL_PROTECTION
+    take_profit.tif = _RESTING_ORDER_TIF
     # 最後の1件だけ transmit=True。ここで初めてグループ全体が市場へ送られる。
     take_profit.transmit = True
 
@@ -458,6 +522,13 @@ async def place_bracket_order_async(
         take_profit_price=take_profit_price,
         reference_price=reference_price,
     )
+    # 実約定価格へ移すための値幅（比率）は、呼値へ丸める前の値段から取る。
+    stop_ratio = stop_price / reference_price
+    take_profit_ratio = take_profit_price / reference_price
+    # 呼値へ丸めた後の値段を以降の記録に使う。引数の値のまま返すと、
+    # positions.json に「ブローカーに置いていない値段」が残る。
+    stop_price = orders.stop_loss.auxPrice
+    take_profit_price = orders.take_profit.lmtPrice
 
     if not ENABLE_REAL_ORDERS:
         logger.info(
@@ -496,6 +567,19 @@ async def place_bracket_order_async(
 
     fill_price = _fill_price_of(parent_trade)
     commission = _commission_of(parent_trade)
+
+    # 子注文の値段は、参照価格ではなく**実約定価格**を基準に置き直す。
+    stop_price, take_profit_price = _reprice_children_to_fill(
+        ib, contract, orders, reference_price, fill_price, stop_ratio, take_profit_ratio,
+    )
+
+    # 親が約定した = 建玉ができた時点で、子注文が本当にブローカー側で生きているかを
+    # 確かめる。送信が受理されたことと、注文が板に置かれたことは別である
+    # （呼値違反・値幅制限・プリセットによる拒否は、ib_insyncからは警告としてしか
+    # 見えず、子注文の状態には何も来ないことがある）。
+    await _ensure_children_are_live_async(
+        ib, contract, child_trades, quantity, orders.oca_group,
+    )
     logger.info(
         "[%s] ブラケットの親注文が約定しました: qty=%s fill=%s commission=%.2f "
         "損切り=STP@%.2f 利確=LMT@%.2f oca=%s",
@@ -517,6 +601,180 @@ async def place_bracket_order_async(
     )
 
 
+def _reprice_children_to_fill(
+    ib: IB,
+    contract: Stock,
+    orders: BracketOrders,
+    reference_price: float,
+    fill_price: Optional[float],
+    stop_ratio: float,
+    take_profit_ratio: float,
+) -> tuple:
+    """子注文の値段を、参照価格ではなく実約定価格を基準に置き直す。
+
+    **参照価格は遅延データ由来で、実約定と数%ずれる。** 2026-08-05の
+    ペーパー検証では参照価格66.50に対し実約定が67.44（+1.4%）で、
+    意図した -5%/+10% のはずの待機注文が、実際の建値から見ると
+    **-6.3%/+8.5%** の位置に置かれていた。損切りが遠い側にずれるため、
+    1トレードのリスクが設計値(1%)を超える。
+
+    そのうえ、この日はBot側のポーリング判定（建値-5%）の方が先に発動した。
+    ブローカー側に待機注文を置く意味は「プロセスが落ちていても効く」ことに
+    あるので、その注文が実勢とずれた位置にあると防御の主役がBot側へ移り、
+    設計の前提が崩れる。
+
+    値幅は参照価格に対する比率として保つ（呼び出し側の -5%/+10% という意図を
+    そのまま実約定価格へ移す）。**比率は呼値へ丸める前の値段から取る。**
+    丸めた後の値段から取ると、丸めが二重に効いて1呼値ぶんずれる。
+
+    **修正時は transmit=True にすること。** グループは既に送信済みなので、
+    Falseのままだと修正が市場へ届かない。
+    """
+    stop_price = orders.stop_loss.auxPrice
+    take_profit_price = orders.take_profit.lmtPrice
+    if fill_price is None or fill_price <= 0 or reference_price <= 0:
+        return stop_price, take_profit_price
+
+    new_stop = round_to_tick(fill_price * stop_ratio)
+    new_take_profit = round_to_tick(fill_price * take_profit_ratio)
+    if new_stop == stop_price and new_take_profit == take_profit_price:
+        return stop_price, take_profit_price
+
+    orders.stop_loss.auxPrice = new_stop
+    orders.take_profit.lmtPrice = new_take_profit
+    for child in (orders.stop_loss, orders.take_profit):
+        child.transmit = True
+        ib.placeOrder(contract, child)
+
+    logger.info(
+        "[%s] 実約定(%.2f)に合わせて待機注文を置き直しました: "
+        "損切り %.2f -> %.2f / 利確 %.2f -> %.2f（参照価格は %.2f）",
+        contract.symbol, fill_price,
+        stop_price, new_stop, take_profit_price, new_take_profit, reference_price,
+    )
+    return new_stop, new_take_profit
+
+
+async def place_resting_exit_orders_async(
+    ib: IB,
+    contract: Stock,
+    quantity: int,
+    stop_price: float,
+    take_profit_price: float,
+    reference_price: float,
+) -> str:
+    """既にある建玉に対して、待機決済注文（損切りSTP＋利確LMT）を置き直す。
+
+    親の成行買いを伴わない点だけがブラケットと違う。使うのは次の2つの場面で、
+    どちらも**建玉があるのに待機注文が無い**状態を解消するためのものである。
+
+    - ボット側の成行決済が失敗したとき（取り消し済みの待機注文を戻す）
+    - 起動時・サイクル開始時に、建玉に対応する待機注文が見つからないとき
+      （待機注文はDAYだと引けで失効し、IBKR側の都合で取り消されることもある）
+
+    戻り値はOCAグループ名。**IBKRはブラケットの子のocaGroupを親のpermIdへ
+    書き換える**ため、この名前で後から照合してはならない（`_is_resting_exit_order`）。
+    """
+    if quantity <= 0:
+        raise ValueError("数量は正の整数である必要があります。")
+
+    # 数量のクランプは掛けない。決済(SELL)に適用すると、ブローカー側に建玉が
+    # 残ったままローカルの追跡だけが消える（「9. 開発時の禁止事項」）。
+    orders = build_bracket_orders(
+        symbol=contract.symbol, quantity=quantity,
+        stop_price=stop_price, take_profit_price=take_profit_price,
+        reference_price=reference_price,
+    )
+    stop_loss, take_profit = orders.stop_loss, orders.take_profit
+    # 親が無いので、最初の1件も含めて独立した注文として送る。
+    stop_loss.transmit = True
+    stop_loss.parentId = 0
+    take_profit.parentId = 0
+
+    if not ENABLE_REAL_ORDERS:
+        logger.info(
+            "[DRY-RUN] 待機注文の再設置シミュレーション: symbol=%s qty=%s "
+            "損切り=STP@%.2f 利確=LMT@%.2f (placeOrderは呼び出していません)",
+            contract.symbol, quantity, stop_loss.auxPrice, take_profit.lmtPrice,
+        )
+        return orders.oca_group
+
+    child_trades = [ib.placeOrder(contract, order) for order in (stop_loss, take_profit)]
+    await _ensure_children_are_live_async(
+        ib, contract, child_trades, quantity, orders.oca_group, flatten_on_failure=False,
+    )
+    logger.info(
+        "[%s] 待機注文を置き直しました: qty=%s 損切り=STP@%.2f 利確=LMT@%.2f",
+        contract.symbol, quantity, stop_loss.auxPrice, take_profit.lmtPrice,
+    )
+    return orders.oca_group
+
+
+async def _ensure_children_are_live_async(
+    ib: IB,
+    contract: Stock,
+    child_trades: List,
+    quantity: int,
+    oca_group: str,
+    flatten_on_failure: bool = True,
+) -> None:
+    """子注文（損切り・利確）がブローカー側で生きているか確かめる。
+
+    生きていなければ **建玉をその場で成行決済し**、`RestingOrdersNotLiveError` を
+    投げる。呼び出し側はローカルにポジションを記録しないので、ブローカーにも
+    ローカルにも建玉が残らない状態へ揃う。
+
+    `flatten_on_failure=False` は、既にある建玉へ待機注文を置き直す場面
+    （`place_resting_exit_orders_async`）で使う。そちらは決済に失敗した直後に
+    呼ばれうるので、ここで再び成行決済を試みると同じ失敗を繰り返すだけになる。
+    決済せずに例外を投げ、無防備であることを呼び出し側に知らせる。
+
+    残す選択肢を採らないのは、損切りの無い建玉を持つことがこのプロジェクトで
+    最も避けたい状態だからである（「決済の置き場所」）。片方だけ生きている場合も
+    同様に扱う: 利確だけが残った建玉は、下方向に無防備なまま持ち越される。
+
+    2026-08-05のペーパー検証で、呼値に合わない逆指値(63.175)がIBKR側で不成立に
+    なり、利確だけが生きた建玉が実際に発生した。当時この検証は無く、
+    `positions.json` には存在しない損切り値段が記録されていた。
+    """
+    deadline = asyncio.get_event_loop().time() + _CHILD_ORDER_LIVE_TIMEOUT_SECONDS
+    while True:
+        dead = [t for t in child_trades if t.orderStatus.status not in _LIVE_ORDER_STATUSES]
+        if not dead:
+            return
+        if asyncio.get_event_loop().time() >= deadline:
+            break
+        await asyncio.sleep(_ORDER_STATUS_POLL_INTERVAL_SECONDS)
+
+    detail = ", ".join(
+        f"{t.order.orderType}@{t.order.auxPrice or t.order.lmtPrice}(status={t.orderStatus.status})"
+        for t in dead
+    )
+    if not flatten_on_failure:
+        logger.error(
+            "[%s] 待機注文を置き直せませんでした(oca=%s): %s。"
+            "**建玉が損切りの無い状態で残っています。**",
+            contract.symbol, oca_group, detail,
+        )
+        raise RestingOrdersNotLiveError(
+            f"[{contract.symbol}] 待機注文が成立しませんでした（{detail}）。"
+            "建玉は無防備なまま残っています。"
+        )
+
+    logger.error(
+        "[%s] 待機注文がブローカー側で生きていません(oca=%s): %s。"
+        "損切りの無い建玉を残さないため、建玉を成行で決済します。",
+        contract.symbol, oca_group, detail,
+    )
+    for child_trade in child_trades:
+        ib.cancelOrder(child_trade.order)
+    await place_market_order_async(ib, contract, ACTION_SELL, quantity)
+    raise RestingOrdersNotLiveError(
+        f"[{contract.symbol}] ブラケットの子注文が成立しませんでした（{detail}）。"
+        "建玉は成行で決済済みです。"
+    )
+
+
 @dataclass(frozen=True)
 class RestingOrderFill:
     """ブローカー側の待機注文が約定していたことの記録。"""
@@ -526,20 +784,59 @@ class RestingOrderFill:
     commission: float
 
 
-def find_filled_resting_exit(ib: IB, oca_group: Optional[str]) -> Optional[RestingOrderFill]:
-    """OCAグループの待機注文が約定していればその内容を返す。
+def _is_resting_exit_order(trade, symbol: str) -> bool:
+    """その注文が、この銘柄の建玉に対する待機決済注文か。
+
+    **OCAグループ名で突き合わせてはならない。** ブラケットの子注文の
+    `ocaGroup` は、こちらが付けた名前(`BRACKET_AAPL_...`)のままではなく
+    **IBKR側で親のpermId(例 `1171471109`)へ書き換えられる**（2026-08-05に実測）。
+    名前で照合すると一致が0件になり、取り消しも約定検知も静かに不発になる。
+
+    銘柄で突き合わせるのは、`PositionManager` が1銘柄1建玉しか持たないため
+    曖昧さが無いからである。新規建ての親(BUY)を拾わないよう、売りの
+    待機注文（逆指値・指値）に限る。
+    """
+    order = trade.order
+    contract = getattr(trade, "contract", None)
+    if getattr(contract, "symbol", None) != symbol:
+        return False
+    if getattr(order, "action", None) != ACTION_SELL:
+        return False
+    return getattr(order, "orderType", None) in _RESTING_EXIT_ORDER_TYPES
+
+
+async def find_symbols_with_live_resting_exits_async(ib: IB) -> set:
+    """待機決済注文がブローカー側で生きている銘柄の集合を返す。
+
+    **`ib.openTrades()` ではなく `reqAllOpenOrdersAsync()` を使う。** 前者は
+    このクライアントIDが出した注文しか含まないため、他のクライアント（手動の
+    修復・別プロセス）が置いた注文を「無い」と誤判定し、二重に置いてしまう。
+    建玉3株に対して売り注文が6株ぶん並ぶと、IBKRは超過分を空売りと見なして
+    注文を拒否する（2026-08-05に `Error 201` として実測）。
+    """
+    trades = await ib.reqAllOpenOrdersAsync()
+    return {
+        trade.contract.symbol
+        for trade in trades
+        if _is_resting_exit_order(trade, getattr(trade.contract, "symbol", ""))
+        and trade.orderStatus.status in _LIVE_ORDER_STATUSES
+    }
+
+
+def find_filled_resting_exit(ib: IB, symbol: str) -> Optional[RestingOrderFill]:
+    """その銘柄の待機注文が約定していればその内容を返す。
 
     実発注時の決済検知はこちらを使う。ドライラン中は観測した現在値から
     推定するしかないが（`strategy.exit_signal.detect_resting_order_exit`）、
     それは180秒ごとの1点しか見ないため、バーの中で逆指値に触れて戻した
     動きを取りこぼす。実際の約定が取れるならその推定は要らない。
     """
-    if not oca_group:
+    if not symbol:
         return None
 
     for trade in ib.trades():
         order = trade.order
-        if getattr(order, "ocaGroup", None) != oca_group:
+        if not _is_resting_exit_order(trade, symbol):
             continue
         if trade.orderStatus.status != _STATUS_FILLED:
             continue
@@ -549,8 +846,8 @@ def find_filled_resting_exit(ib: IB, oca_group: Optional[str]) -> Optional[Resti
             # 約定はしているのに値段が読めない。ここで推定を入れると損益が
             # 静かにずれるため、次のサイクルで読めるまで判断を持ち越す。
             logger.warning(
-                "待機注文が約定していますが約定価格が読めません: oca=%s type=%s",
-                oca_group, getattr(order, "orderType", None),
+                "[%s] 待機注文が約定していますが約定価格が読めません: type=%s",
+                symbol, getattr(order, "orderType", None),
             )
             return None
         return RestingOrderFill(
@@ -562,30 +859,34 @@ def find_filled_resting_exit(ib: IB, oca_group: Optional[str]) -> Optional[Resti
     return None
 
 
-async def cancel_bracket_orders_async(ib: IB, symbol: str, oca_group: Optional[str]) -> None:
-    """ブローカー側に残っている待機注文を取り消す。
+async def cancel_bracket_orders_async(ib: IB, symbol: str) -> None:
+    """その銘柄の待機注文を取り消す。
 
     トレーリングストップや大引け前の強制決済のように、ボット側の判断で
     成行決済した場合は、必ずこれを呼んで待機注文を消すこと。残したままだと
     建玉が無いのに売り注文だけが生き続け、次にその銘柄を建てた瞬間に
     意図しない決済が起きる。
+
+    突き合わせを銘柄で行う理由は `_is_resting_exit_order` を参照。
+    ブローカー同期で取り込んだ建玉のように、こちらがOCAグループ名を
+    知らない場合でも取り消せる。
     """
-    if not oca_group:
+    if not symbol:
         return
 
     if not ENABLE_REAL_ORDERS:
         logger.info(
-            "[DRY-RUN] 待機注文の取り消しシミュレーション: symbol=%s oca=%s "
+            "[DRY-RUN] 待機注文の取り消しシミュレーション: symbol=%s "
             "(cancelOrderは呼び出していません)",
-            symbol, oca_group,
+            symbol,
         )
         return
 
     cancelled = 0
     for trade in ib.openTrades():
-        if getattr(trade.order, "ocaGroup", None) != oca_group:
+        if not _is_resting_exit_order(trade, symbol):
             continue
         ib.cancelOrder(trade.order)
         cancelled += 1
 
-    logger.info("[%s] 待機注文を取り消しました: oca=%s 件数=%d", symbol, oca_group, cancelled)
+    logger.info("[%s] 待機注文を取り消しました: 件数=%d", symbol, cancelled)

@@ -31,8 +31,10 @@ from execution.order_manager import (
     cancel_bracket_orders_async,
     ensure_orders_are_paper_only,
     find_filled_resting_exit,
+    find_symbols_with_live_resting_exits_async,
     place_bracket_order_async,
     place_market_order_async,
+    place_resting_exit_orders_async,
 )
 from execution.position_manager import (
     DEFAULT_STATE_PATH,
@@ -635,8 +637,6 @@ async def _process_entry_async(
     if quantity <= 0:
         return
 
-    risk_per_share = price * exit_params.stop_loss_pct / 100.0
-
     # 損切りと利確はブローカー側に置く（ブラケット注文）。ボットのプロセスが
     # 落ちていても、TWSとの接続が切れていても、ポーリングを待たずに約定する。
     stop_price = resolve_stop_price(price, exit_params.stop_loss_pct)
@@ -657,11 +657,16 @@ async def _process_entry_async(
     # 建値は実約定を優先する。参照価格で記録すると、損益・R倍率・トレーリングの
     # 基準がすべて実際の約定とずれる。
     entry_price = order_result.fill_price if order_result.fill_price is not None else price
+    # 値段は実際にブローカーへ置いた待機注文のもの（呼値へ丸めた後）を記録する。
+    # R倍率の分母も同じ値から取る。発注前の理論値で持つと、決済側の判定・記録が
+    # ブローカーに置かれている注文とずれる。
+    risk_per_share = max(entry_price - order_result.stop_price, 0.0)
     position_manager.open_position(
         symbol, entry_price=entry_price, quantity=order_result.quantity,
         risk_per_share=risk_per_share,
         strategy_type=strategy_type,
-        stop_price=stop_price, take_profit_price=take_profit_price,
+        stop_price=order_result.stop_price,
+        take_profit_price=order_result.take_profit_price,
         oca_group=order_result.oca_group,
         entry_commission=order_result.commission,
     )
@@ -775,7 +780,7 @@ async def _process_exit_async(
     #    （観測した現在値が待機注文の値段に届いたか）は180秒ごとの1点しか
     #    見ないため、ザラ場で逆指値に触れて戻した動きを取りこぼす。
     if ENABLE_REAL_ORDERS:
-        resting_fill = find_filled_resting_exit(ib, position.oca_group)
+        resting_fill = find_filled_resting_exit(ib, symbol)
         if resting_fill is not None:
             reason = (
                 REASON_TAKE_PROFIT if resting_fill.order_type == "LMT" else REASON_STOP_LOSS
@@ -837,10 +842,7 @@ async def _process_exit_async(
         logger.info(
             "[%s] デイトレードポジションが大引け前の強制決済時刻に達したため決済します。", symbol,
         )
-        await cancel_bracket_orders_async(ib, symbol, position.oca_group)
-        exit_result = await place_market_order_async(
-            ib, contract, action="SELL", quantity=position.quantity,
-        )
+        exit_result = await _market_exit_async(ib, contract, position, price)
         exit_price = exit_result.fill_price if exit_result.fill_price is not None else price
         pnl_pct = (exit_price - position.entry_price) / position.entry_price * 100.0
         closed_position = position_manager.close_position(symbol)
@@ -866,10 +868,7 @@ async def _process_exit_async(
     if not result.should_sell:
         return
 
-    await cancel_bracket_orders_async(ib, symbol, position.oca_group)
-    exit_result = await place_market_order_async(
-        ib, contract, action="SELL", quantity=position.quantity,
-    )
+    exit_result = await _market_exit_async(ib, contract, position, price)
     # 決済価格も実約定を優先する。判定に使った観測価格と実際の約定は
     # 成行のスリッページのぶんだけずれる。
     exit_price = exit_result.fill_price if exit_result.fill_price is not None else price
@@ -879,6 +878,94 @@ async def _process_exit_async(
         ib, trade_journal, closed_position, exit_price, result.reason, pnl_pct,
         exit_commission=exit_result.commission,
     )
+
+
+async def _market_exit_async(ib: IB, contract, position, reference_price: float):
+    """ボット側の判断で成行決済する（トレーリング・大引け）。
+
+    **待機注文を先に取り消すのは不変条件だが、その直後に成行が失敗すると
+    建玉だけが無防備で残る。** 2026-08-05のペーパー検証で実際に起きており、
+    成行売りが60秒以内に約定せず取り消された後、次のサイクル（5分後）まで
+    損切りの無い状態が続いた。約定しなかった理由が続くほどこの時間は伸びる。
+
+    そのため失敗したら待機注文を置き直してから例外を上へ返す。呼び出し側
+    （`run_watchlist_cycle_async`）は銘柄単位の例外を握り潰して次のサイクルで
+    再試行するので、その間も建玉は保護されている。
+    """
+    await cancel_bracket_orders_async(ib, contract.symbol)
+    try:
+        return await place_market_order_async(
+            ib, contract, action="SELL", quantity=position.quantity,
+        )
+    except Exception:
+        logger.exception(
+            "[%s] 成行決済に失敗しました。取り消した待機注文を置き直します。", contract.symbol,
+        )
+        await _restore_resting_exit_orders_async(ib, contract, position, reference_price)
+        raise
+
+
+async def _restore_resting_exit_orders_async(
+    ib: IB, contract, position, reference_price: float,
+) -> None:
+    """建玉に対する待機注文（損切り・利確）を置き直す。
+
+    値段は建てたときの記録をそのまま使う。ここで現在値から計算し直すと、
+    値下がりした局面で損切りが下へずれて、当初のリスク設計から離れる。
+
+    **失敗しても例外を上げない。** これは復旧のための処理であり、ここで
+    投げると呼び出し元の本来のエラー（決済の失敗）が置き換わって、何が
+    起きたのか分からなくなる。無防備であることはログのERRORで残る。
+    """
+    if position.stop_price <= 0 or position.take_profit_price <= 0:
+        # ブローカー同期で取り込んだ建玉には待機注文の値段が無い。
+        logger.warning(
+            "[%s] 待機注文の値段が記録されていないため置き直せません。", contract.symbol,
+        )
+        return
+    try:
+        await place_resting_exit_orders_async(
+            ib, contract, quantity=position.quantity,
+            stop_price=position.stop_price,
+            take_profit_price=position.take_profit_price,
+            reference_price=reference_price,
+        )
+    except Exception:
+        logger.exception(
+            "[%s] 待機注文の置き直しに失敗しました。建玉が無防備なまま残っています。",
+            contract.symbol,
+        )
+
+
+async def _restore_missing_resting_orders_async(
+    ib: IB, position_manager: PositionManager, caches: MarketDataCaches,
+) -> None:
+    """建玉があるのに待機注文が無い銘柄へ、待機注文を置き直す。
+
+    待機注文は放っておいても消える。IB Gateway側のOrder Presetが有効期間を
+    DAYへ上書きすると引けで失効し（2026-08-05に `Error 10349` として実測）、
+    IBKR側の都合で取り消されることもある。**消えたことは通知されない**ので、
+    毎サイクル突き合わせる以外に気付く方法が無い。
+
+    置き直しは冪等である（生きている注文がある銘柄は対象外になる）ため、
+    通常のサイクルでは `reqAllOpenOrders` 1回で終わる。ヒストリカルデータの
+    リクエストではないのでペーシング枠（「6.1」）も消費しない。
+    """
+    if not ENABLE_REAL_ORDERS or not position_manager.open_symbols():
+        return
+
+    protected = await find_symbols_with_live_resting_exits_async(ib)
+    for symbol in position_manager.open_symbols():
+        if symbol in protected:
+            continue
+        position = position_manager.get_position(symbol)
+        logger.warning(
+            "[%s] 建玉があるのに待機注文がブローカー側にありません。置き直します。", symbol,
+        )
+        contract = await caches.contracts.get_async(ib, symbol)
+        await _restore_resting_exit_orders_async(
+            ib, contract, position, reference_price=position.entry_price,
+        )
 
 
 async def process_symbol_async(
@@ -900,6 +987,13 @@ async def run_watchlist_cycle_async(
     caches = caches if caches is not None else MarketDataCaches()
 
     await position_manager.sync_with_broker_async(ib)
+
+    # 建玉と待機注文の突き合わせは、決済判定より先に行う。待機注文が消えている
+    # 間に決済判定へ入ると、その銘柄の処理が終わるまで無防備な時間が延びる。
+    try:
+        await _restore_missing_resting_orders_async(ib, position_manager, caches)
+    except Exception:
+        logger.exception("待機注文の突き合わせに失敗しました。決済判定は継続します。")
 
     # スクリーニング結果でウォッチリストが日次で入れ替わっても、既に保有中の
     # ポジションは（ウォッチリストから外れていても）決済判定を継続する必要が

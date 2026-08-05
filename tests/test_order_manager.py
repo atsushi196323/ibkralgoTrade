@@ -2,7 +2,7 @@
 
 import asyncio
 from contextlib import contextmanager
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -11,12 +11,15 @@ from execution.order_manager import (
     MAX_ORDER_PRICE_DEVIATION_PCT,
     MAX_POSITION_SIZE,
     OrderNotFilledError,
+    RestingOrdersNotLiveError,
     build_bracket_orders,
     cancel_bracket_orders_async,
     ensure_orders_are_paper_only,
     find_filled_resting_exit,
+    find_symbols_with_live_resting_exits_async,
     place_bracket_order_async,
     place_market_order_async,
+    place_resting_exit_orders_async,
 )
 
 
@@ -325,8 +328,8 @@ def test_bracket_rejects_non_positive_reference_price(reference_price) -> None:
 def test_dry_run_cancel_does_not_call_cancel_order() -> None:
     ib = MagicMock()
 
-    asyncio.run(cancel_bracket_orders_async(ib, "AAPL", "OCA_1"))
-    asyncio.run(cancel_bracket_orders_async(ib, "AAPL", None))
+    asyncio.run(cancel_bracket_orders_async(ib, "AAPL"))
+    asyncio.run(cancel_bracket_orders_async(ib, ""))
 
     ib.cancelOrder.assert_not_called()
 
@@ -350,7 +353,8 @@ def _real_orders_enabled():
 
 
 def _make_trade(status: str = "Filled", avg_fill_price: float = 100.0, commission: float = 0.35,
-                order_id: int = 42, order_type: str = "MKT", oca_group=None):
+                order_id: int = 42, order_type: str = "MKT", oca_group=None,
+                symbol: str = "AAPL", action: str = "SELL"):
     trade = MagicMock()
     trade.isDone = MagicMock(return_value=True)
     trade.orderStatus.status = status
@@ -361,6 +365,8 @@ def _make_trade(status: str = "Filled", avg_fill_price: float = 100.0, commissio
     trade.order.orderId = order_id
     trade.order.orderType = order_type
     trade.order.ocaGroup = oca_group
+    trade.order.action = action
+    trade.contract.symbol = symbol
     return trade
 
 
@@ -412,9 +418,12 @@ def test_real_bracket_sends_parent_first_then_children_with_parent_id() -> None:
 def test_real_bracket_reports_the_actual_fill_and_commission() -> None:
     """建値は参照価格ではなく実約定を返すこと。"""
     ib = MagicMock()
-    ib.placeOrder = MagicMock(
-        side_effect=[_make_trade(avg_fill_price=101.25, commission=0.35), _make_trade(), _make_trade()]
-    )
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(avg_fill_price=101.25, commission=0.35),
+        _make_trade(), _make_trade(),
+        # 実約定に合わせた置き直しのぶん。
+        _make_trade(), _make_trade(),
+    ])
 
     with _real_orders_enabled():
         result = asyncio.run(place_bracket_order_async(
@@ -476,23 +485,36 @@ def test_real_market_order_returns_the_fill() -> None:
 
 
 def test_find_filled_resting_exit_matches_the_oca_group() -> None:
-    """待機注文の約定は、OCAグループで突き合わせて拾うこと。"""
+    """待機注文の約定は、銘柄で突き合わせて拾うこと。
+
+    OCAグループ名では突き合わせられない。ブラケットの子注文の ocaGroup は
+    IBKR側で親のpermIdへ書き換えられるため（2026-08-05に実測）、こちらが
+    付けた名前と一致しない。
+    """
     ib = MagicMock()
-    other = _make_trade(order_type="STP", oca_group="OTHER")
-    mine = _make_trade(order_type="LMT", oca_group="OCA_1", avg_fill_price=110.0, commission=0.35)
+    other = _make_trade(order_type="STP", symbol="MSFT")
+    mine = _make_trade(order_type="LMT", avg_fill_price=110.0, commission=0.35)
     ib.trades = MagicMock(return_value=[other, mine])
 
-    fill = find_filled_resting_exit(ib, "OCA_1")
+    fill = find_filled_resting_exit(ib, "AAPL")
 
     assert (fill.order_type, fill.fill_price, fill.commission) == ("LMT", 110.0, 0.35)
 
 
-def test_find_filled_resting_exit_ignores_unfilled_and_missing_groups() -> None:
+def test_find_filled_resting_exit_ignores_unfilled_and_other_symbols() -> None:
     ib = MagicMock()
-    ib.trades = MagicMock(return_value=[_make_trade(status="Submitted", oca_group="OCA_1")])
+    ib.trades = MagicMock(return_value=[_make_trade(status="Submitted")])
 
-    assert find_filled_resting_exit(ib, "OCA_1") is None
-    assert find_filled_resting_exit(ib, None) is None
+    assert find_filled_resting_exit(ib, "AAPL") is None
+    assert find_filled_resting_exit(ib, "") is None
+
+
+def test_find_filled_resting_exit_ignores_the_entry_order() -> None:
+    """新規建ての親(BUY成行)を決済の約定として拾ってはならない。"""
+    ib = MagicMock()
+    ib.trades = MagicMock(return_value=[_make_trade(order_type="MKT", action="BUY")])
+
+    assert find_filled_resting_exit(ib, "AAPL") is None
 
 
 def test_filled_resting_exit_without_a_readable_price_is_not_reported() -> None:
@@ -501,18 +523,256 @@ def test_filled_resting_exit_without_a_readable_price_is_not_reported() -> None:
     IBKRは未受信のフィールドをNaNや0で埋める。推定で埋めると損益が静かにずれる。
     """
     ib = MagicMock()
-    ib.trades = MagicMock(return_value=[_make_trade(avg_fill_price=0.0, oca_group="OCA_1")])
+    ib.trades = MagicMock(return_value=[_make_trade(avg_fill_price=0.0, order_type="STP")])
 
-    assert find_filled_resting_exit(ib, "OCA_1") is None
+    assert find_filled_resting_exit(ib, "AAPL") is None
 
 
-def test_real_cancel_cancels_only_the_matching_oca_group() -> None:
+def test_real_cancel_cancels_only_the_resting_orders_of_that_symbol() -> None:
+    """OCAグループ名が書き換えられていても取り消せること（銘柄で突き合わせる）。"""
     ib = MagicMock()
-    mine = _make_trade(oca_group="OCA_1")
-    other = _make_trade(oca_group="OCA_2")
-    ib.openTrades = MagicMock(return_value=[mine, other])
+    mine = _make_trade(order_type="STP", oca_group="1171471109")
+    other_symbol = _make_trade(order_type="STP", symbol="MSFT")
+    entry_order = _make_trade(order_type="MKT", action="BUY")
+    ib.openTrades = MagicMock(return_value=[mine, other_symbol, entry_order])
 
     with _real_orders_enabled():
-        asyncio.run(cancel_bracket_orders_async(ib, "AAPL", "OCA_1"))
+        asyncio.run(cancel_bracket_orders_async(ib, "AAPL"))
 
     ib.cancelOrder.assert_called_once_with(mine.order)
+
+
+# --- 待機注文の値段の丸めと生存確認 -------------------------------------------------
+
+
+def test_resting_order_prices_are_rounded_to_the_tick() -> None:
+    """呼値($0.01)に合わない値段のまま送ってはならない。
+
+    2026-08-05のペーパー検証で、損切り 63.175 がそのまま送られてIBKRが
+    Warning 110 を返し、**逆指値だけが不成立になった**（利確はたまたま2桁で通り、
+    損切りの無い建玉が残った）。ib_insyncは110を警告としてしか通知せず、
+    子注文の状態にも何も来ないため、丸めを欠くと静かに防御だけが消える。
+    """
+    orders = build_bracket_orders(
+        symbol="AAPL", quantity=3,
+        stop_price=63.175, take_profit_price=73.1549, reference_price=66.5,
+    )
+
+    assert orders.stop_loss.auxPrice == pytest.approx(63.18)
+    assert orders.take_profit.lmtPrice == pytest.approx(73.16)
+
+
+def test_tick_rounding_never_widens_the_stop() -> None:
+    """丸めは切り上げ側へ倒すこと（損切りが予定より遠くならない側）。
+
+    切り下げると逆指値が1呼値ぶん遠くなり、1トレードのリスクが設計値(1%)を
+    わずかに超える。
+    """
+    orders = build_bracket_orders(
+        symbol="AAPL", quantity=1,
+        stop_price=94.991, take_profit_price=110.001, reference_price=100.0,
+    )
+
+    assert orders.stop_loss.auxPrice >= 94.991
+    assert orders.take_profit.lmtPrice >= 110.001
+
+
+def test_resting_children_are_good_till_cancelled() -> None:
+    """子注文の有効期間はGTCであること。
+
+    DAYだと引けで待機注文が失効し、持ち越すスイングの建玉が翌日の寄り付きまで
+    無防備になる。明示しないとIB Gateway側のOrder PresetがDAYを上書きする
+    （実測: Error 10349）。
+    """
+    orders = build_bracket_orders(
+        symbol="AAPL", quantity=1,
+        stop_price=95.0, take_profit_price=110.0, reference_price=100.0,
+    )
+
+    assert orders.stop_loss.tif == "GTC"
+    assert orders.take_profit.tif == "GTC"
+
+
+def test_bracket_result_reports_the_prices_actually_placed() -> None:
+    """戻り値の値段は丸めた後のものであること。
+
+    呼び出し側(main)はこれをそのまま positions.json へ記録するため、丸める前の
+    値を返すと「ブローカーに置いていない値段」で決済判定・R倍率を計算する。
+    """
+    ib = MagicMock()
+    # 参照価格どおりに約定した場合（置き直しは起きない）。
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(avg_fill_price=66.5), _make_trade(), _make_trade(),
+    ])
+
+    with _real_orders_enabled():
+        result = asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AAPL"), quantity=3,
+            stop_price=63.175, take_profit_price=73.1549, reference_price=66.5,
+        ))
+
+    assert result.stop_price == pytest.approx(63.18)
+    assert result.take_profit_price == pytest.approx(73.16)
+
+
+def test_position_is_flattened_when_a_child_order_is_not_live() -> None:
+    """子注文がブローカー側で生きていなければ、建玉を成行で決済して例外にすること。
+
+    送信が受理されたことと、注文が板に置かれたことは別である。片方だけ生きた
+    状態（例: 利確だけ）で残すと、下方向に無防備な建玉を持ち越すことになる。
+    例外にするのは、呼び出し側にローカル記録を作らせないため。
+    """
+    ib = MagicMock()
+    parent = _make_trade(order_id=99)
+    dead_stop = _make_trade(status="Inactive")
+    live_take_profit = _make_trade(status="PreSubmitted")
+    exit_trade = _make_trade()
+    ib.placeOrder = MagicMock(side_effect=[parent, dead_stop, live_take_profit, exit_trade])
+
+    with _real_orders_enabled(), \
+        patch("execution.order_manager._CHILD_ORDER_LIVE_TIMEOUT_SECONDS", 0.0), \
+        pytest.raises(RestingOrdersNotLiveError):
+        asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AAPL"), quantity=3,
+            stop_price=95.0, take_profit_price=110.0, reference_price=100.0,
+        ))
+
+    # 生き残っている子注文も取り消す（建玉が無いのに売り注文だけが残るため）。
+    cancelled = [call.args[0] for call in ib.cancelOrder.call_args_list]
+    assert dead_stop.order in cancelled and live_take_profit.order in cancelled
+    # 建玉は成行で手仕舞う。
+    exit_order = ib.placeOrder.call_args_list[3].args[1]
+    assert exit_order.action == "SELL"
+    assert exit_order.totalQuantity == 3
+
+
+def test_live_children_do_not_trigger_a_flatten() -> None:
+    """子注文が生きていれば決済しないこと（誤検知で建玉を失わない）。"""
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(order_id=99),
+        _make_trade(status="PreSubmitted"),
+        _make_trade(status="Submitted"),
+    ])
+
+    with _real_orders_enabled():
+        result = asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AAPL"), quantity=3,
+            stop_price=95.0, take_profit_price=110.0, reference_price=100.0,
+        ))
+
+    assert result.dry_run is False
+    ib.cancelOrder.assert_not_called()
+    assert ib.placeOrder.call_count == 3
+
+
+# --- 実約定価格に合わせた置き直し ---------------------------------------------------
+
+
+def test_children_are_repriced_from_the_actual_fill() -> None:
+    """待機注文は参照価格ではなく実約定価格を基準に置き直すこと。
+
+    2026-08-05のペーパー検証では、参照価格66.50（遅延データ）に対し実約定が
+    67.44だった。置き直さないと、意図した -5%/+10% の待機注文が実際の建値から
+    見て -6.3%/+8.5% の位置に残り、1トレードのリスクが設計値を超える。
+    """
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(avg_fill_price=67.44), _make_trade(), _make_trade(),
+        _make_trade(), _make_trade(),
+    ])
+
+    with _real_orders_enabled():
+        result = asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AMBQ"), quantity=3,
+            stop_price=66.5 * 0.95, take_profit_price=66.5 * 1.10, reference_price=66.5,
+        ))
+
+    # 実約定の -5% / +10%（呼値へ切り上げ）になっていること。
+    assert result.stop_price == pytest.approx(64.07, abs=0.01)
+    assert result.take_profit_price == pytest.approx(74.19, abs=0.01)
+
+    # 置き直しは修正として送る。グループは送信済みなので transmit=True が要る。
+    repriced = [call.args[1] for call in ib.placeOrder.call_args_list[3:]]
+    assert [order.transmit for order in repriced] == [True, True]
+
+
+def test_children_are_not_repriced_when_the_fill_matches_the_reference() -> None:
+    """値段が変わらないなら注文を触らないこと（無駄な修正要求を出さない）。"""
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(avg_fill_price=100.0), _make_trade(), _make_trade(),
+    ])
+
+    with _real_orders_enabled():
+        asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AAPL"), quantity=3,
+            stop_price=95.0, take_profit_price=110.0, reference_price=100.0,
+        ))
+
+    assert ib.placeOrder.call_count == 3
+
+
+# --- 待機注文の置き直し -------------------------------------------------------------
+
+
+def test_resting_exit_orders_can_be_placed_without_a_parent() -> None:
+    """既にある建玉へ、損切り・利確をOCAで置き直せること。"""
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(status="Submitted"), _make_trade(status="Submitted"),
+    ])
+
+    with _real_orders_enabled():
+        asyncio.run(place_resting_exit_orders_async(
+            ib, MagicMock(symbol="AAPL"), quantity=3,
+            stop_price=95.0, take_profit_price=110.0, reference_price=100.0,
+        ))
+
+    sent = [call.args[1] for call in ib.placeOrder.call_args_list]
+    assert [order.orderType for order in sent] == ["STP", "LMT"]
+    # 親が無いので、どちらも独立した注文として送信される。
+    assert [order.transmit for order in sent] == [True, True]
+    assert [order.parentId for order in sent] == [0, 0]
+    assert sent[0].ocaGroup == sent[1].ocaGroup
+
+
+def test_failed_restore_does_not_flatten_the_position() -> None:
+    """置き直しに失敗しても成行決済しないこと。
+
+    この経路は決済が失敗した直後に呼ばれうるので、ここで再び成行を試みても
+    同じ失敗を繰り返すだけになる。無防備であることを例外で知らせる。
+    """
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(status="Inactive"), _make_trade(status="Submitted"),
+    ])
+
+    with _real_orders_enabled(), \
+        patch("execution.order_manager._CHILD_ORDER_LIVE_TIMEOUT_SECONDS", 0.0), \
+        pytest.raises(RestingOrdersNotLiveError):
+        asyncio.run(place_resting_exit_orders_async(
+            ib, MagicMock(symbol="AAPL"), quantity=3,
+            stop_price=95.0, take_profit_price=110.0, reference_price=100.0,
+        ))
+
+    # 成行売り(MKT)は出していない。
+    assert [call.args[1].orderType for call in ib.placeOrder.call_args_list] == ["STP", "LMT"]
+
+
+def test_live_resting_exits_are_looked_up_across_all_clients() -> None:
+    """待機注文の有無は reqAllOpenOrders で見ること。
+
+    openTrades() は自分のクライアントIDの注文しか含まないため、他クライアントが
+    置いた注文を「無い」と誤判定して二重に置く。建玉を超える売り注文はIBKRが
+    空売りと見なして拒否する（実測 Error 201）。
+    """
+    ib = MagicMock()
+    live = _make_trade(status="PreSubmitted", order_type="STP")
+    filled = _make_trade(status="Filled", order_type="STP", symbol="MSFT")
+    ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[live, filled])
+
+    symbols = asyncio.run(find_symbols_with_live_resting_exits_async(ib))
+
+    assert symbols == {"AAPL", "MSFT"}
+    ib.openTrades.assert_not_called()
