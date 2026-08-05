@@ -6,7 +6,7 @@ import math
 import signal
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from ib_insync import IB, Stock
@@ -193,6 +193,28 @@ ATTENTION_CONFIG: AttentionConfig = AttentionConfig(
 # 独立した機能である。** こちらは日足キャッシュだけで判定でき、追加の
 # IBKRリクエストも購読権限も要らないため、観測モードでも有効にしている。
 DROP_STRUGGLING_SYMBOLS: bool = True
+
+# 建てられない銘柄（下降トレンド・本数不足）を監視対象に残すか。
+#
+# **既定でTrue。** 安全弁はエントリー側(ENTRY_REQUIRES_LONG_TERM_UPTREND /
+# SWING_MIN_HISTORY_BARS)に移してあるので、監視に残しても建たない。残す利点は
+# 乖離率と復帰までの距離が毎サイクル記録され、**トレンドが上向いた瞬間に
+# その場でエントリー判定へ入れる**こと。外していると復帰の判定が1日1回の
+# ウォッチリスト更新まで遅れる。
+#
+# 監視枠を食う点は「6.1 ペーシング制限」の不変条件
+#     MAX_WATCHLIST_SIZE × (600 / POLL_INTERVAL_SECONDS) ≦ 60
+# で頭打ちになる。現状は20銘柄・300秒＝40件/10分なので、固定リスト15銘柄を
+# 全部残しても収まる。**枠を超える場合はFalseにして落とすこと。**
+KEEP_UNTRADEABLE_SYMBOLS_IN_WATCHLIST: bool = True
+
+# 押し目シグナルが出ても、終値が長期移動平均を下回る銘柄は建てないか。
+#
+# もともとウォッチリストの出入りで表現していた条件を、エントリーの直前へ
+# 移したもの。**判定の場所を変えただけで、建つ建たないの結果は変わらない。**
+# 監視に残す（上記）ようにしたため、ここで止めないと下降トレンドの銘柄が
+# そのまま建つ。
+ENTRY_REQUIRES_LONG_TERM_UPTREND: bool = True
 
 # 下降トレンドの銘柄をウォッチリストから外すときの移動平均日数。
 # 銘柄選定のトレンドフィルター(SCREENER_TREND_MA_WINDOW)と同じ物差しを使う。
@@ -493,8 +515,24 @@ async def _detect_buy_signal_async(
             market_deviation_pct=market_deviation_pct, market_filter=SWING_MARKET_FILTER,
         )
         if swing_signal.should_buy:
-            logger.info("[%s] スイング(日足)のプルバックシグナルで買い判定しました。", symbol)
-            return swing_signal, STRATEGY_TYPE_SWING
+            # トレンド判定はここで行う。ウォッチリストから外して判定するより
+            # 後段だが、**シグナルが出た銘柄にしかログが出ない**ぶん、
+            # 「押し目は来たが下降トレンドなので見送った」という判断の記録が
+            # 埋もれない。毎サイクル全銘柄について出すと1日数百行になる。
+            if (
+                ENTRY_REQUIRES_LONG_TERM_UPTREND
+                and is_in_long_term_uptrend(daily_df, STRUGGLING_MA_WINDOW) is not True
+            ):
+                logger.info(
+                    "[%s] 押し目シグナルは出ましたが、終値が%d日移動平均を下回るため"
+                    "新規建てを見送ります。終値%.2f / MA%d %.2f（あと%+.1f%%で解除）。",
+                    symbol, STRUGGLING_MA_WINDOW,
+                    _latest_close_price(daily_df), STRUGGLING_MA_WINDOW,
+                    _long_term_moving_average(daily_df), _pct_to_long_term_ma(daily_df),
+                )
+            else:
+                logger.info("[%s] スイング(日足)のプルバックシグナルで買い判定しました。", symbol)
+                return swing_signal, STRATEGY_TYPE_SWING
 
     if ENABLE_DAY_TRADING and len(intraday_df) >= INTRADAY_MA_WINDOW:
         intraday_signal = detect_pullback_signal(
@@ -1039,10 +1077,24 @@ def _pct_to_long_term_ma(daily_df: pd.DataFrame) -> float:
     return (moving_average / close - 1.0) * 100.0
 
 
-async def _drop_struggling_symbols_async(
+@dataclass
+class WatchlistScreen:
+    """トレンド・本数の判定結果。
+
+    監視と売買可否を**別の集合として返す**。監視に残す銘柄でも建てられない
+    ことがあるため（`KEEP_UNTRADEABLE_SYMBOLS_IN_WATCHLIST`）、1つのリストでは
+    表現できない。注目銘柄の引き継ぎは `untradeable` を見て打ち切る——
+    引き継ぎ続けると、下降トレンドの銘柄が記録に残ったまま毎日組み入れられる。
+    """
+
+    monitored: List[str]
+    untradeable: Set[str] = field(default_factory=set)
+
+
+async def _screen_watchlist_symbols_async(
     ib: IB, symbols: List[str], caches: MarketDataCaches, protected: Sequence[str] = (),
-) -> List[str]:
-    """明確な下降トレンドの銘柄を監視対象から外す。
+) -> WatchlistScreen:
+    """明確な下降トレンドの銘柄と、本数が足りない銘柄を判定する。
 
     判定は銘柄選定と同じ「終値が長期移動平均(`STRUGGLING_MA_WINDOW`日)を
     下回っているか」で、`strategy.screener.is_in_long_term_uptrend` を共有する。
@@ -1052,18 +1104,23 @@ async def _drop_struggling_symbols_async(
     日足は `DailyBarCache` から取るので追加リクエストは発生しない
     （キャッシュの取得期間を300日にしてあるのはこの判定のためでもある）。
 
-    **本数が足りず判定できない銘柄も外す。** かつては「本数不足は下降トレンドを
-    意味しない」として残していたが、`SWING_MIN_HISTORY_BARS` により
-    そうした銘柄はどのみち新規建てできない。残すと、建てられない銘柄が
-    監視枠(`MAX_WATCHLIST_SIZE`)と毎サイクルの価格取得（＝ペーシング枠）を
-    占め続ける——株価帯のフィルターが上限超えの銘柄を外すのと同じ理由である。
-    本数が揃えば翌日の選定で戻ってくるので、締め出しにはならない。
+    **既定では外さず、復帰までの距離を記録して監視に残す**
+    (`KEEP_UNTRADEABLE_SYMBOLS_IN_WATCHLIST`)。建てさせない役目は
+    エントリー側(`ENTRY_REQUIRES_LONG_TERM_UPTREND` /
+    `SWING_MIN_HISTORY_BARS`)へ移してあるので、残しても建たない。
+    残す利点は、乖離率と復帰までの距離が毎サイクル記録され、
+    **トレンドが上向いた瞬間にその場でエントリー判定へ入れる**こと。
+    外していると、復帰の判定が1日1回のウォッチリスト更新まで遅れる。
+
+    枠を超える場合はフラグをFalseにして落とす。その場合も本数が揃うか
+    トレンドが戻れば翌日の更新で戻ってくるので、締め出しにはならない。
 
     `protected` は保有中の銘柄。外してもポジションの決済判定は続く
     （`run_watchlist_cycle_async` が保有銘柄との和集合を処理する）が、
     再エントリーの判断ができなくなるため残す。
     """
     kept: List[str] = []
+    untradeable: Set[str] = set()
     for symbol in symbols:
         if symbol in protected:
             kept.append(symbol)
@@ -1076,29 +1133,41 @@ async def _drop_struggling_symbols_async(
             kept.append(symbol)
             continue
 
+        # 監視に残す場合は「外します」と書けない。建てられない状態であることと
+        # 復帰までの距離は、残す場合こそ毎サイクル読みたい情報である。
+        disposition = (
+            "監視は継続します（新規建てはエントリー側で見送ります）"
+            if KEEP_UNTRADEABLE_SYMBOLS_IN_WATCHLIST else "監視対象から外します"
+        )
+
         if len(daily_df) < SWING_MIN_HISTORY_BARS:
             logger.info(
-                "[%s] 日足が%d本しかなく長期トレンドを判定できないため、監視対象から外します"
-                "（本数が揃うまでスイングの新規建てができない）。"
+                "[%s] 日足が%d本しかなく長期トレンドを判定できないため、%s。"
                 "再エントリーまで残り%d営業日。",
-                symbol, len(daily_df), SWING_MIN_HISTORY_BARS - len(daily_df),
+                symbol, len(daily_df), disposition,
+                SWING_MIN_HISTORY_BARS - len(daily_df),
             )
+            untradeable.add(symbol)
+            if KEEP_UNTRADEABLE_SYMBOLS_IN_WATCHLIST:
+                kept.append(symbol)
             continue
 
         in_uptrend = is_in_long_term_uptrend(daily_df, STRUGGLING_MA_WINDOW)
         if in_uptrend is False:
             logger.info(
-                "[%s] 終値が%d日移動平均を下回る下降トレンドのため、監視対象から外します。"
+                "[%s] 終値が%d日移動平均を下回る下降トレンドのため、%s。"
                 "終値%.2f / MA%d %.2f（あと%+.1f%%で復帰）。",
-                symbol, STRUGGLING_MA_WINDOW,
+                symbol, STRUGGLING_MA_WINDOW, disposition,
                 _latest_close_price(daily_df), STRUGGLING_MA_WINDOW,
                 _long_term_moving_average(daily_df),
                 _pct_to_long_term_ma(daily_df),
             )
-            continue
+            untradeable.add(symbol)
+            if not KEEP_UNTRADEABLE_SYMBOLS_IN_WATCHLIST:
+                continue
         kept.append(symbol)
 
-    return kept
+    return WatchlistScreen(monitored=kept, untradeable=untradeable)
 
 
 async def _scan_turnover_ranks_async(
@@ -1150,20 +1219,27 @@ async def _apply_attention_watchlist_async(
     carried = store.load_attention_symbols() if ENABLE_ATTENTION_WATCHLIST else []
     combined = list(dict.fromkeys([*watchlist, *carried]))
 
-    kept = (
-        await _drop_struggling_symbols_async(ib, combined, caches, protected)
-        if DROP_STRUGGLING_SYMBOLS else combined
+    screen = (
+        await _screen_watchlist_symbols_async(ib, combined, caches, protected)
+        if DROP_STRUGGLING_SYMBOLS else WatchlistScreen(monitored=combined)
     )
     # 引き継ぎで枠を超えることがある。渡されたウォッチリストが先に並んでいるので、
     # 前から切ればそちらが優先される。
-    kept = kept[:MAX_WATCHLIST_SIZE]
+    kept = screen.monitored[:MAX_WATCHLIST_SIZE]
     if not ENABLE_ATTENTION_WATCHLIST:
         return kept
 
     # 引き継ぎの記録は、スキャンの成否より前に更新しておく。ここを後回しにすると、
     # スキャンが失敗した日に「下降トレンドで落とした銘柄」が記録に残り続け、
     # 翌日また組み入れては落とすことを繰り返す。
-    surviving_carried = [symbol for symbol in kept if symbol in carried]
+    #
+    # **監視に残していても、建てられない銘柄は引き継がない。** 引き継ぎは
+    # 「押し目が出るまで持ち続ける」ための仕組みなので、建てられない銘柄を
+    # 残すと枠を占めたまま毎日組み入れ直すことになる。
+    surviving_carried = [
+        symbol for symbol in kept
+        if symbol in carried and symbol not in screen.untradeable
+    ]
     if carried:
         logger.info("前日までの注目銘柄を引き継ぎました: %s", surviving_carried)
     store.save_attention_symbols(surviving_carried)

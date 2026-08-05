@@ -74,10 +74,17 @@ def _make_daily_df(*, drop: bool = False) -> pd.DataFrame:
     一度も通っていない」状態に陥るのを防ぐため。移動平均が確定する本数
     (SWING_MA_WINDOW)ではなく新規建てに必要な本数を使うのは、前者だけでは
     エントリー経路のテストが本数不足で素通りしてしまうからである。
+
+    **前半を安値にしてあるのは、終値を200日移動平均より上に置くため。**
+    平坦な系列だと終値と長期移動平均が一致し、
+    `ENTRY_REQUIRES_LONG_TERM_UPTREND` が下降トレンドと判定して
+    エントリー経路のテストが丸ごと素通りする。
     """
+    base = [50.0] * (SWING_MIN_HISTORY_BARS - SWING_MA_WINDOW)
     if drop:
-        return _make_df([100.0] * (SWING_MIN_HISTORY_BARS - 1) + [80.0])
-    return _make_df([100.0] * SWING_MIN_HISTORY_BARS)
+        # 直近30本の平均に対して約-19%。押し目シグナルが出る形。
+        return _make_df(base + [100.0] * (SWING_MA_WINDOW - 1) + [80.0])
+    return _make_df(base + [100.0] * SWING_MA_WINDOW)
 
 
 def _bracket_result(quantity: int, symbol: str = "AAPL") -> BracketResult:
@@ -2341,6 +2348,54 @@ def test_entry_requires_enough_history_to_judge_the_long_term_trend(trade_journa
     assert "長期トレンド" in caplog.text
 
 
+def test_downtrend_symbol_is_monitored_but_not_bought(trade_journal, caplog) -> None:
+    """監視は続けるが、長期移動平均を下回る間は建てないこと。
+
+    下降トレンドの判定をウォッチリストの出入りからエントリー直前へ移した。
+    監視に残す以上、ここで止めないと下降トレンドの銘柄がそのまま建つ。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    # 直近30本の平均を大きく割る押し目だが、終値は200日平均を下回る。
+    closes = [200.0] * (SWING_MIN_HISTORY_BARS - SWING_MA_WINDOW) \
+        + [100.0] * (SWING_MA_WINDOW - 1) + [80.0]
+    down_df = _make_df(closes)
+
+    with caplog.at_level(logging.INFO, logger="main"), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="FADED"))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=down_df)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.place_bracket_order_async", new=AsyncMock()) as mock_order:
+        asyncio.run(process_symbol_async(ib, "FADED", position_manager, trade_journal))
+
+    mock_order.assert_not_awaited()
+    assert position_manager.has_position("FADED") is False
+    assert "押し目シグナルは出ましたが" in caplog.text
+
+
+def test_the_same_pullback_is_bought_once_the_trend_turns_up(trade_journal) -> None:
+    """トレンドが上向いたら、同じ押し目で建つこと。
+
+    見送りが恒久的な除外になっていないことを確かめる。上の銘柄と乖離率は
+    同じで、終値が200日平均を上回る点だけが違う。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="RECOVERED"))), \
+        patch("data.cache.get_historical_bars_async",
+              new=AsyncMock(return_value=_make_daily_df(drop=True))), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(80.0))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.place_bracket_order_async",
+              new=AsyncMock(return_value=_bracket_result(1, "RECOVERED"))) as mock_order:
+        asyncio.run(process_symbol_async(ib, "RECOVERED", position_manager, trade_journal))
+
+    mock_order.assert_awaited_once()
+    assert position_manager.has_position("RECOVERED") is True
+
+
 def test_swing_entry_history_requirement_matches_the_trend_filter() -> None:
     """新規建ての必要本数が、長期トレンドフィルターの本数と揃っていること。
 
@@ -2414,14 +2469,33 @@ def test_surging_symbol_is_added_to_the_watchlist(tmp_path) -> None:
     assert mock_scan.await_count == 2
 
 
-def test_symbol_below_its_long_term_average_is_dropped(tmp_path) -> None:
-    """下降トレンドの銘柄を監視対象から外すこと。"""
+def test_symbol_below_its_long_term_average_stays_monitored(tmp_path) -> None:
+    """下降トレンドの銘柄も監視対象に残すこと。
+
+    建てさせない役目はエントリー側(ENTRY_REQUIRES_LONG_TERM_UPTREND)へ
+    移してあるので、監視に残しても建たない。残すのは、トレンドが上向いた
+    その瞬間にエントリー判定へ入れるため。外すと復帰の判定が
+    1日1回のウォッチリスト更新まで遅れる。
+    """
     history = [{"OLD": 1} for _ in range(10)]
     result, _, _ = _run_attention(
         watchlist=["HEALTHY", "STRUGGLING"], ranks=[], history=history,
         prices={"HEALTHY": 100.0, "STRUGGLING": 80.0}, ma_below=("STRUGGLING",),
         tmp_path=tmp_path,
     )
+
+    assert result == ["HEALTHY", "STRUGGLING"]
+
+
+def test_struggling_symbols_can_be_dropped_when_the_watchlist_is_tight(tmp_path) -> None:
+    """枠が足りない場合はフラグで落とせること（監視枠の逃げ道を残す）。"""
+    history = [{"OLD": 1} for _ in range(10)]
+    with patch("main.KEEP_UNTRADEABLE_SYMBOLS_IN_WATCHLIST", False):
+        result, _, _ = _run_attention(
+            watchlist=["HEALTHY", "STRUGGLING"], ranks=[], history=history,
+            prices={"HEALTHY": 100.0, "STRUGGLING": 80.0}, ma_below=("STRUGGLING",),
+            tmp_path=tmp_path,
+        )
 
     assert result == ["HEALTHY"]
 
@@ -2501,16 +2575,16 @@ def test_scanner_failure_keeps_the_watchlist_running(tmp_path) -> None:
             PositionManager(), store,
         ))
 
-    assert result == ["HEALTHY"]
+    assert result == ["HEALTHY", "STRUGGLING"]
 
 
-def test_symbols_without_enough_history_are_dropped_from_the_watchlist(tmp_path) -> None:
-    """本数不足でトレンド判定できない銘柄を監視対象から外すこと。
+def test_symbols_without_enough_history_stay_monitored(tmp_path) -> None:
+    """本数不足の銘柄も監視対象に残すこと。
 
-    `SWING_MIN_HISTORY_BARS` によりどのみち新規建てできないため、残すと
-    監視枠と毎サイクルの価格取得（ペーシング枠）を占めるだけになる。
-    2026-08-04の検証では固定リスト9銘柄のうち3銘柄(SPCX/CBRS/FRVO)がこれで、
-    ザラ場中ずっと枠を消費していた。
+    新規建ては `SWING_MIN_HISTORY_BARS` がエントリー側で止めるので、
+    監視に残しても建たない。残すのは本数が揃うまでの経過を追えるようにする
+    ためで、2026-08-04の検証で固定リストの3銘柄(SPCX/CBRS/FRVO)が
+    黙って消えていたのがこれにあたる。
     """
     ib = MagicMock()
     store = RankHistoryStore(str(tmp_path / "ranks.json"))
@@ -2529,7 +2603,7 @@ def test_symbols_without_enough_history_are_dropped_from_the_watchlist(tmp_path)
             ib, ["KEEP", "IPO"], 1220.0, MarketDataCaches(), PositionManager(), store,
         ))
 
-    assert result == ["KEEP"]
+    assert result == ["KEEP", "IPO"]
 
 
 def test_held_symbols_without_enough_history_stay_in_the_watchlist(tmp_path) -> None:
@@ -2580,7 +2654,8 @@ def test_surges_are_ignored_while_the_feature_is_in_observation_mode(tmp_path) -
             PositionManager(), store,
         ))
 
-    assert result == ["KEEP"]
+    # SURGE が入らないことが要点。下降トレンドの STRUGGLING は監視に残る。
+    assert result == ["KEEP", "STRUGGLING"]
     # スキャナーは呼ばない（購読が無い口座で無駄なリクエストを出さない）。
     mock_scan.assert_not_awaited()
 
@@ -2615,6 +2690,10 @@ def test_a_carried_symbol_that_turns_down_is_not_carried_again(tmp_path) -> None
     """引き継いだ銘柄が下降トレンドに入ったら、その日限りで引き継ぎを止めること。
 
     残すと、翌日また同じ銘柄を組み入れて落とすことを繰り返す。
+
+    **監視に残ることと引き継ぐことは別である。** 監視は継続してよいが、
+    引き継ぎは「押し目が出るまで持ち続ける」ための仕組みなので、
+    建てられない銘柄を引き継ぐと枠を占めたまま毎日組み入れ直すことになる。
     """
     ib = MagicMock()
     store = RankHistoryStore(str(tmp_path / "ranks.json"))
@@ -2631,7 +2710,7 @@ def test_a_carried_symbol_that_turns_down_is_not_carried_again(tmp_path) -> None
             ib, ["KEEP"], 1220.0, MarketDataCaches(), PositionManager(), store,
         ))
 
-    assert result == ["KEEP"]
+    assert result == ["KEEP", "FADED"]
     assert store.load_attention_symbols() == []
 
 
