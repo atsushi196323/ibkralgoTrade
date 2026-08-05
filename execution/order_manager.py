@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 #
 # 有効にしても株数(MAX_POSITION_SIZE)と金額(MAX_ORDER_NOTIONAL_USD)の
 # クランプは外さない。
-ENABLE_REAL_ORDERS: bool = False
+ENABLE_REAL_ORDERS: bool = True
 
 # 実発注を許可するポート（ペーパー取引）。TWS=7497 / IB Gateway=4002。
 # **許可リストで判定する。** 本番ポート(7496/4001)の拒否リストにすると、
