@@ -66,6 +66,26 @@ _PENDING_HISTORY_RE = re.compile(
     r"再エントリーまで残り(?P<remaining>\d+)営業日"
 )
 
+# 注文層の出来事。ペーパーでの実発注検証はここが主目的なので、成功した経路も
+# 拾う（WARNING/ERRORの集計だけでは「正しく動いた」ことが記録に残らない）。
+_BRACKET_FILL_RE = re.compile(
+    r"^\[(?P<symbol>[^\]]+)\] ブラケットの親注文が約定しました: "
+    r"qty=(?P<qty>\d+) fill=(?P<fill>[\d.]+|不明) commission=(?P<commission>[\d.]+) "
+    r"損切り=STP@(?P<stop>[\d.]+) 利確=LMT@(?P<take_profit>[\d.]+)"
+)
+_REPRICE_RE = re.compile(
+    r"^\[(?P<symbol>[^\]]+)\] 実約定\((?P<fill>[\d.]+)\)に合わせて待機注文を置き直しました: "
+    r"損切り [\d.]+ -> (?P<stop>[\d.]+) / 利確 [\d.]+ -> (?P<take_profit>[\d.]+)"
+    r"（参照価格は (?P<reference>[\d.]+)）"
+)
+_RESTORE_RE = re.compile(
+    r"^\[(?P<symbol>[^\]]+)\] 待機注文を置き直しました: qty=(?P<qty>\d+)"
+)
+_CANCEL_CONFIRMED_RE = re.compile(r"^\[(?P<symbol>[^\]]+)\] 待機注文の取り消しが確定しました")
+_TIF_DOWNGRADE_RE = re.compile(
+    r"^\[(?P<symbol>[^\]]+)\] 待機注文の有効期間が (?P<tif>[A-Z]+) になっています"
+)
+
 # 新規エントリーが見送られた理由。ログの原文をそのまま照合すると
 # 書式変更で静かに数え漏れるため、判別に足りる最小の部分文字列だけを持つ。
 _SKIP_REASONS: List[Tuple[str, str]] = [
@@ -115,6 +135,13 @@ class DayReport:
     warnings: Counter = field(default_factory=Counter)
     errors: Counter = field(default_factory=Counter)
     trades: List[TradeRecord] = field(default_factory=list)
+    # 注文層の出来事。ペーパーでの実発注検証が現フェーズの主目的であり、
+    # 「正しく動いた」ことは WARNING/ERROR の集計には現れないため個別に持つ。
+    bracket_fills: List[dict] = field(default_factory=list)
+    repricings: List[dict] = field(default_factory=list)
+    restored_resting_orders: Counter = field(default_factory=Counter)
+    cancels_confirmed: Counter = field(default_factory=Counter)
+    tif_downgrades: Dict[str, str] = field(default_factory=dict)
 
 
 def parse_log_lines(
@@ -226,6 +253,44 @@ def build_day_report(
             )
             continue
 
+        bracket = _BRACKET_FILL_RE.match(message)
+        if bracket is not None:
+            report.bracket_fills.append({
+                "symbol": bracket.group("symbol"),
+                "quantity": int(bracket.group("qty")),
+                "fill": bracket.group("fill"),
+                "commission": float(bracket.group("commission")),
+                "stop": float(bracket.group("stop")),
+                "take_profit": float(bracket.group("take_profit")),
+            })
+            continue
+
+        reprice = _REPRICE_RE.match(message)
+        if reprice is not None:
+            report.repricings.append({
+                "symbol": reprice.group("symbol"),
+                "fill": float(reprice.group("fill")),
+                "reference": float(reprice.group("reference")),
+                "stop": float(reprice.group("stop")),
+                "take_profit": float(reprice.group("take_profit")),
+            })
+            continue
+
+        restore = _RESTORE_RE.match(message)
+        if restore is not None:
+            report.restored_resting_orders[restore.group("symbol")] += 1
+            continue
+
+        cancelled = _CANCEL_CONFIRMED_RE.match(message)
+        if cancelled is not None:
+            report.cancels_confirmed[cancelled.group("symbol")] += 1
+            continue
+
+        downgrade = _TIF_DOWNGRADE_RE.match(message)
+        if downgrade is not None:
+            report.tif_downgrades[downgrade.group("symbol")] = downgrade.group("tif")
+            continue
+
         equity = _EQUITY_RE.search(message)
         if equity is not None:
             report.account_equity = float(equity.group("equity"))
@@ -330,6 +395,52 @@ def format_report(report: DayReport) -> str:
             lines.append("  シグナル判定の行が1件も無い（＝監視サイクルが回っていない）。")
         for label, count in report.skip_reasons.most_common():
             lines.append(f"  見送り: {label} ({count}回)")
+
+    lines.append("")
+    lines.append("--- 注文層 ---")
+    if report.bracket_fills:
+        for fill in report.bracket_fills:
+            lines.append(
+                f"  {fill['symbol']}: {fill['quantity']}株 @ {fill['fill']} "
+                f"手数料 {fill['commission']:.2f} USD / "
+                f"損切り STP@{fill['stop']:.2f} 利確 LMT@{fill['take_profit']:.2f}"
+            )
+    else:
+        lines.append("  ブラケットの約定: なし")
+
+    # 参照価格と実約定のずれは、遅延データ(15分)がそのまま待機注文の位置の
+    # ずれになる量である。設計上の損切り幅(-5%)からどれだけ離れていたかを
+    # 見るための材料で、大きいほどBot側のポーリング判定が先に発動しやすくなる。
+    for reprice in report.repricings:
+        drift = (reprice["fill"] - reprice["reference"]) / reprice["reference"] * 100.0
+        lines.append(
+            f"  {reprice['symbol']}: 実約定 {reprice['fill']:.2f} で置き直し"
+            f"（参照価格 {reprice['reference']:.2f} との差 {drift:+.2f}%）"
+            f" → STP@{reprice['stop']:.2f} / LMT@{reprice['take_profit']:.2f}"
+        )
+
+    if report.restored_resting_orders:
+        detail = ", ".join(
+            f"{symbol}×{count}" for symbol, count in sorted(report.restored_resting_orders.items())
+        )
+        lines.append(f"  消えた待機注文の置き直し: {detail}")
+    if report.cancels_confirmed:
+        detail = ", ".join(
+            f"{symbol}×{count}" for symbol, count in sorted(report.cancels_confirmed.items())
+        )
+        lines.append(f"  取り消しの確定: {detail}")
+    if report.tif_downgrades:
+        detail = ", ".join(f"{symbol}={tif}" for symbol, tif in sorted(report.tif_downgrades.items()))
+        lines.append(
+            f"  **有効期間がGTC以外へ上書きされた: {detail}**"
+            " → IB Gateway の Global Configuration → Presets → Stocks を GTC にすること"
+            "（引けで失効し、翌朝まで損切りの無い時間ができる）"
+        )
+    elif report.bracket_fills:
+        # 「GTCで置かれている」と断定しない。**検知の行が無いことは、上書きが
+        # 無かったことと同じではない。** この検知は2026-08-06に入れたものなので、
+        # それ以前のログには上書きされていた日(8/5の tif='DAY')でも行が出ない。
+        lines.append("  有効期間の上書き: 検知なし")
 
     lines.append("")
     lines.append("--- 監視銘柄 ---")

@@ -230,7 +230,7 @@ scripts/
   check_screener.py         スキャナー・PER取得の購読権限を切り分ける診断CLI
   fetch_bars.py             検証用の日足をCSVへ保存する（yfinance、IBKR接続不要）
   rank_turnover.py          売買代金ランキングの日次記録（yfinance、観測専用）
-  daily_report.py           1取引日の稼働サマリ（bot.log + trade_journal.csv を読む）
+  daily_report.py           1取引日の稼働サマリ（bot.log + trade_journal.csv を読む。注文層の結果もここに出る）
   is_us_trading_day.py      その日が米国の取引日かを終了コードで返す（launchdの祝日判定用）
   start_bot.sh              Botの起動（祝日なら起動しない。launchdが平日22:15に呼ぶ）
   after_close.sh            引け後の締め（Bot停止 → ランキング記録 → サマリ出力）

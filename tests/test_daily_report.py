@@ -244,3 +244,78 @@ def test_last_closed_trading_day_skips_weekends():
 def test_last_closed_trading_day_skips_holidays():
     """休場日を数えないこと。2026-01-01(元日)は休場。"""
     assert last_closed_trading_day(_et(2026, 1, 1, 17)) == date(2025, 12, 31)
+
+
+def test_the_order_layer_section_reports_a_successful_bracket():
+    """成功した注文層の経路もサマリに残すこと。
+
+    ペーパーでの実発注検証は「注文層が正しく動いたか」を見るのが目的なので、
+    WARNING/ERROR の集計だけでは何も記録されない日が「正常」と区別できない。
+    """
+    lines = _lines(
+        "2026-08-06 22:31:00,000 [INFO] execution.order_manager: "
+        "[INTC] ブラケットの親注文が約定しました: qty=2 fill=101.06 commission=1.00 "
+        "損切り=STP@95.34 利確=LMT@111.05 oca=BRACKET_INTC_4535805584",
+        "2026-08-06 22:31:01,000 [INFO] execution.order_manager: "
+        "[INTC] 実約定(101.06)に合わせて待機注文を置き直しました: "
+        "損切り 95.00 -> 96.01 / 利確 110.00 -> 111.17（参照価格は 100.00）",
+    )
+
+    report = build_day_report(lines, [], date(2026, 8, 6))
+
+    assert report.bracket_fills[0]["symbol"] == "INTC"
+    assert report.bracket_fills[0]["quantity"] == 2
+    assert report.bracket_fills[0]["commission"] == 1.00
+    assert report.repricings[0]["fill"] == 101.06
+    assert report.repricings[0]["reference"] == 100.00
+
+    text = format_report(report)
+    assert "--- 注文層 ---" in text
+    # 参照価格と実約定のずれ(+1.06%)が、待機注文の位置のずれそのものになる。
+    assert "+1.06%" in text
+    assert "有効期間の上書き: 検知なし" in text
+
+
+def test_a_tif_downgrade_is_called_out_with_the_fix():
+    """有効期間の上書きは、直し方(Presets)まで添えて出すこと。
+
+    直せるのはGatewayのGUIだけなので、サマリに現象だけ書いても行動に移せない。
+    """
+    lines = _lines(
+        "2026-08-06 22:31:00,000 [INFO] execution.order_manager: "
+        "[INTC] ブラケットの親注文が約定しました: qty=2 fill=101.06 commission=1.00 "
+        "損切り=STP@95.34 利確=LMT@111.05 oca=BRACKET_INTC_1",
+        "2026-08-06 22:36:00,000 [WARNING] execution.order_manager: "
+        "[INTC] 待機注文の有効期間が DAY になっています（GTC で発注したはずのもの）。"
+        "IB Gateway の Order Preset による上書きで、引けで失効するため翌朝まで"
+        "損切りの無い時間ができます。"
+        "Global Configuration → Presets → Stocks の Time in Force を GTC にしてください。",
+    )
+
+    report = build_day_report(lines, [], date(2026, 8, 6))
+
+    assert report.tif_downgrades == {"INTC": "DAY"}
+    text = format_report(report)
+    assert "INTC=DAY" in text and "Presets" in text
+    assert "有効期間の上書き: 検知なし" not in text
+
+
+def test_the_tif_warning_the_bot_emits_is_the_one_the_report_parses(caplog):
+    """サマリの照合パターンが、実際に出る行と一致していること。
+
+    書式を変えた瞬間に照合が0件になり、**上書きされていないのと区別がつかなくなる**。
+    文字列をテスト側へ写すとその変更に追随できないので、本物のロガーが出した行を
+    そのまま解析へ通す。
+    """
+    import logging as _logging
+
+    from execution import order_manager
+
+    order_manager._TIF_DOWNGRADE_WARNED.clear()
+    with caplog.at_level(_logging.WARNING, logger="execution.order_manager"):
+        order_manager._warn_about_tif_downgrades({"INTC": {"DAY"}})
+
+    emitted = caplog.records[0].getMessage()
+    lines = _lines(f"2026-08-06 22:36:00,000 [WARNING] execution.order_manager: {emitted}")
+
+    assert build_day_report(lines, [], date(2026, 8, 6)).tif_downgrades == {"INTC": "DAY"}
