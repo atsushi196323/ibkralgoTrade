@@ -601,7 +601,7 @@ async def place_bracket_order_async(
     commission = _commission_of(parent_trade)
 
     # 子注文の値段は、参照価格ではなく**実約定価格**を基準に置き直す。
-    stop_price, take_profit_price = _reprice_children_to_fill(
+    stop_price, take_profit_price = await _reprice_children_to_fill_async(
         ib, contract, orders, reference_price, fill_price, stop_ratio, take_profit_ratio,
     )
 
@@ -633,7 +633,7 @@ async def place_bracket_order_async(
     )
 
 
-def _reprice_children_to_fill(
+async def _reprice_children_to_fill_async(
     ib: IB,
     contract: Stock,
     orders: BracketOrders,
@@ -661,6 +661,19 @@ def _reprice_children_to_fill(
 
     **修正時は transmit=True にすること。** グループは既に送信済みなので、
     Falseのままだと修正が市場へ届かない。
+
+    **修正の前に、IBKRが書き換えた `ocaGroup` を取り込むこと。** IBKRは子注文の
+    OCAグループ名をこちらが付けた名前から親のpermIdへ書き換えるが、こちら側の
+    `Order` は送信時の名前を保持したままである。その状態で修正を送ると、
+    IBKRは**OCAグループを変更しようとしている**と解釈して
+    `Error 10326（OCAグループの見直しはできません）` で修正ごと拒否する。
+
+    **修正が板に届いたことは、ブローカーから読み直して確かめること。** 10326は
+    ib_insyncからは警告としてしか見えず、拒否されても元の注文はそのまま生き続ける
+    ため、`_ensure_children_are_live_async` の生存確認は通ってしまう。確かめずに
+    新しい値段を返すと、`positions.json` に**ブローカーが持っていない値段**が残る
+    （2026-08-06にINTCで実測。ログは 93.38 -> 92.09 と記録したが、板は 93.38 の
+    ままだった）。届かなかった場合は板にある実際の値段を返す。
     """
     stop_price = orders.stop_loss.auxPrice
     take_profit_price = orders.take_profit.lmtPrice
@@ -672,11 +685,26 @@ def _reprice_children_to_fill(
     if new_stop == stop_price and new_take_profit == take_profit_price:
         return stop_price, take_profit_price
 
+    await _adopt_broker_oca_group_async(ib, contract.symbol, orders)
+
     orders.stop_loss.auxPrice = new_stop
     orders.take_profit.lmtPrice = new_take_profit
     for child in (orders.stop_loss, orders.take_profit):
         child.transmit = True
         ib.placeOrder(contract, child)
+
+    live_stop, live_take_profit = await _read_back_resting_prices_async(ib, contract.symbol)
+    applied_stop = live_stop if live_stop is not None else new_stop
+    applied_take_profit = live_take_profit if live_take_profit is not None else new_take_profit
+    if applied_stop != new_stop or applied_take_profit != new_take_profit:
+        logger.warning(
+            "[%s] 実約定(%.2f)に合わせた待機注文の置き直しが板に届いていません: "
+            "損切り %.2f（要求 %.2f）/ 利確 %.2f（要求 %.2f）。"
+            "実際に置かれている値段で記録します。",
+            contract.symbol, fill_price,
+            applied_stop, new_stop, applied_take_profit, new_take_profit,
+        )
+        return applied_stop, applied_take_profit
 
     logger.info(
         "[%s] 実約定(%.2f)に合わせて待機注文を置き直しました: "
@@ -685,6 +713,66 @@ def _reprice_children_to_fill(
         stop_price, new_stop, take_profit_price, new_take_profit, reference_price,
     )
     return new_stop, new_take_profit
+
+
+async def _adopt_broker_oca_group_async(ib: IB, symbol: str, orders: BracketOrders) -> None:
+    """IBKR側で書き換えられたOCAグループ名を、こちらの子注文へ取り込む。
+
+    取り込まないまま修正を送ると `Error 10326` で拒否される（この関数の
+    呼び出し元のdocstringを参照）。読めなければ何もしない——修正が拒否される
+    可能性は残るが、それは読み直しの検証(`_read_back_resting_prices_async`)が
+    捕まえる。ここで推測した名前を入れる方が危険である。
+
+    **突き合わせは銘柄＋注文種別で行う**（`_is_resting_exit_order` と同じ方針）。
+    permIdで引かないのは、ローカルの `Order` にpermIdが載るのがブローカーからの
+    状態更新を受けた後で、置き直しの時点で 0 のままでありうるためである。
+    `PositionManager` は1銘柄1建玉なので、STPとLMTはそれぞれ1件に定まる。
+    """
+    try:
+        trades = await ib.reqAllOpenOrdersAsync()
+    except Exception:
+        logger.warning("[%s] OCAグループ名の読み直しに失敗しました。", symbol, exc_info=True)
+        return
+
+    by_order_type = {
+        trade.order.orderType: trade.order
+        for trade in trades
+        if _is_resting_exit_order(trade, symbol)
+    }
+    for child in (orders.stop_loss, orders.take_profit):
+        live_order = by_order_type.get(child.orderType)
+        if live_order is None:
+            continue
+        live_group = getattr(live_order, "ocaGroup", "") or ""
+        if live_group and live_group != child.ocaGroup:
+            child.ocaGroup = live_group
+
+
+async def _read_back_resting_prices_async(ib: IB, symbol: str) -> tuple:
+    """その銘柄の待機注文の値段を、ブローカーから読み直して返す（STP, LMT）。
+
+    読めなかった側は None を返す。呼び出し側は「確かめられなかった」ことを
+    「一致した」として扱ってはならない。
+    """
+    stop_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
+    try:
+        trades = await ib.reqAllOpenOrdersAsync()
+    except Exception:
+        logger.warning("[%s] 待機注文の値段の読み直しに失敗しました。", symbol, exc_info=True)
+        return stop_price, take_profit_price
+
+    for trade in trades:
+        if not _is_resting_exit_order(trade, symbol):
+            continue
+        if trade.orderStatus.status not in _LIVE_ORDER_STATUSES:
+            continue
+        order = trade.order
+        if order.orderType == "STP":
+            stop_price = float(order.auxPrice)
+        elif order.orderType == "LMT":
+            take_profit_price = float(order.lmtPrice)
+    return stop_price, take_profit_price
 
 
 async def place_resting_exit_orders_async(

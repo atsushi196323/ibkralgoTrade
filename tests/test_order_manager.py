@@ -762,6 +762,81 @@ def test_children_are_repriced_from_the_actual_fill() -> None:
     assert [order.transmit for order in repriced] == [True, True]
 
 
+def _resting_trade(order_type: str, price: float, perm_id: int, oca_group: str,
+                   symbol: str = "AMBQ"):
+    """ブローカーが返す待機注文（読み直し用）。"""
+    trade = _make_trade(
+        status="Submitted", order_type=order_type, oca_group=oca_group,
+        symbol=symbol, action="SELL",
+    )
+    trade.order.permId = perm_id
+    trade.order.auxPrice = price if order_type == "STP" else 0.0
+    trade.order.lmtPrice = price if order_type == "LMT" else 0.0
+    return trade
+
+
+def test_the_reprice_adopts_the_oca_group_ibkr_rewrote() -> None:
+    """置き直しの修正には、IBKRが書き換えた側のOCAグループ名を付けること。
+
+    IBKRは子注文の `ocaGroup` をこちらが付けた名前から親のpermIdへ書き換えるが、
+    こちらの `Order` は送信時の名前を保持したままである。その名前のまま修正を
+    送ると、IBKRはOCAグループの変更と解釈して `Error 10326` で修正ごと拒否する
+    （2026-08-06にINTCで実測。板の値段は参照価格ベースのまま残った）。
+    """
+    ib = MagicMock()
+    stop_trade = _make_trade(order_type="STP")
+    stop_trade.order.permId = 501
+    take_profit_trade = _make_trade(order_type="LMT")
+    take_profit_trade.order.permId = 502
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(avg_fill_price=67.44), stop_trade, take_profit_trade,
+        _make_trade(), _make_trade(),
+    ])
+    # ブローカー側ではグループ名が親のpermIdへ書き換わっており、値段は修正後の値。
+    ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[
+        _resting_trade("STP", 64.07, perm_id=501, oca_group="267089215"),
+        _resting_trade("LMT", 74.19, perm_id=502, oca_group="267089215"),
+    ])
+
+    with _real_orders_enabled():
+        asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AMBQ"), quantity=3,
+            stop_price=66.5 * 0.95, take_profit_price=66.5 * 1.10, reference_price=66.5,
+        ))
+
+    repriced = [call.args[1] for call in ib.placeOrder.call_args_list[3:]]
+    assert [order.ocaGroup for order in repriced] == ["267089215", "267089215"]
+
+
+def test_a_reprice_that_never_reached_the_book_is_recorded_at_the_broker_price() -> None:
+    """修正が板に届かなかったら、要求した値段ではなく板の値段を記録すること。
+
+    10326による拒否はib_insyncからは警告としてしか見えず、拒否されても元の注文は
+    生き続けるため生存確認は通る。確かめずに新しい値段を返すと、positions.json に
+    ブローカーが持っていない値段が残り、Bot側の損切り判定・R倍率・置き直しの基準が
+    すべてそこからずれる。
+    """
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(avg_fill_price=67.44), _make_trade(order_type="STP"),
+        _make_trade(order_type="LMT"), _make_trade(), _make_trade(),
+    ])
+    # 修正を送った後も、板は参照価格ベースの値段のまま。
+    ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[
+        _resting_trade("STP", 63.18, perm_id=501, oca_group="267089215"),
+        _resting_trade("LMT", 73.15, perm_id=502, oca_group="267089215"),
+    ])
+
+    with _real_orders_enabled():
+        result = asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AMBQ"), quantity=3,
+            stop_price=66.5 * 0.95, take_profit_price=66.5 * 1.10, reference_price=66.5,
+        ))
+
+    assert result.stop_price == pytest.approx(63.18, abs=0.01)
+    assert result.take_profit_price == pytest.approx(73.15, abs=0.01)
+
+
 def test_children_are_not_repriced_when_the_fill_matches_the_reference() -> None:
     """値段が変わらないなら注文を触らないこと（無駄な修正要求を出さない）。"""
     ib = MagicMock()
