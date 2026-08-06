@@ -11,6 +11,7 @@ from core.market_hours import (
     is_japan_regular_trading_hours,
     is_regular_trading_hours,
     is_us_market_holiday,
+    is_us_trading_day,
 )
 
 ET = ZoneInfo("America/New_York")
@@ -218,3 +219,34 @@ def test_is_day_trade_flatten_time_converts_timezone_aware_datetime_to_eastern()
     utc_time = datetime(2026, 7, 22, 19, 55, tzinfo=ZoneInfo("UTC"))
 
     assert is_day_trade_flatten_time(utc_time) is True
+
+
+@pytest.mark.parametrize(
+    "trading_day",
+    [
+        date(2026, 8, 6),   # 木曜
+        date(2026, 8, 7),   # 金曜
+        date(2026, 8, 10),  # 月曜
+    ],
+)
+def test_is_us_trading_day_accepts_ordinary_weekdays(trading_day) -> None:
+    assert is_us_trading_day(trading_day) is True
+
+
+@pytest.mark.parametrize(
+    "closed_day",
+    [
+        date(2026, 8, 8),   # 土曜
+        date(2026, 8, 9),   # 日曜
+        date(2026, 9, 7),   # レイバーデー（月曜の祝日）
+        date(2026, 11, 26),  # サンクスギビング（木曜の祝日）
+        date(2026, 7, 3),   # 独立記念日(7/4 土)の振替休場（金曜）
+    ],
+)
+def test_is_us_trading_day_rejects_weekends_and_holidays(closed_day) -> None:
+    """祝日はlaunchdでは表現できないため、この判定が起動の可否そのものになる。
+
+    振替休場(7/3)を含めているのは、移動祝日の計算を自前でやらず
+    `holidays` パッケージへ委譲していることの確認でもある。
+    """
+    assert is_us_trading_day(closed_day) is False

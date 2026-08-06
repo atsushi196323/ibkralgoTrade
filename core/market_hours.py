@@ -61,6 +61,19 @@ def is_us_market_holiday(check_date: Optional[date] = None) -> bool:
     return target in _US_MARKET_HOLIDAYS
 
 
+def is_us_trading_day(check_date: Optional[date] = None) -> bool:
+    """その日にNYSE/Nasdaqのレギュラーセッションがあるか（土日・祝日でないか）。
+
+    `is_regular_trading_hours` と違い**時刻を見ない**。launchdは日付でしか
+    ジョブを絞れず、祝日を除外するキーも持たないため、起動の可否は
+    「その日が取引日か」だけで判定する必要がある（`scripts/is_us_trading_day.py`）。
+    """
+    target = check_date if check_date is not None else datetime.now(US_EASTERN).date()
+    if target.weekday() >= 5:
+        return False
+    return not is_us_market_holiday(target)
+
+
 def is_japan_market_holiday(check_date: Optional[date] = None) -> bool:
     """東証の休場日（祝日・年末年始休場）か判定する。"""
     target = check_date if check_date is not None else datetime.now(JST).date()
