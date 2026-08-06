@@ -17,7 +17,7 @@ from execution.order_manager import (
     cancel_bracket_orders_async,
     ensure_orders_are_paper_only,
     find_filled_resting_exit,
-    find_symbols_with_live_resting_exits_async,
+    find_resting_exit_protection_async,
     place_bracket_order_async,
     place_market_order_async,
     place_resting_exit_orders_async,
@@ -830,11 +830,45 @@ def test_live_resting_exits_are_looked_up_across_all_clients() -> None:
     空売りと見なして拒否する（実測 Error 201）。
     """
     ib = MagicMock()
-    live = _make_trade(status="PreSubmitted", order_type="STP")
+    stop = _make_trade(status="PreSubmitted", order_type="STP")
+    take_profit = _make_trade(status="Submitted", order_type="LMT")
     filled = _make_trade(status="Filled", order_type="STP", symbol="MSFT")
-    ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[live, filled])
+    ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[stop, take_profit, filled])
 
-    symbols = asyncio.run(find_symbols_with_live_resting_exits_async(ib))
+    protection = asyncio.run(find_resting_exit_protection_async(ib))
 
-    assert symbols == {"AAPL", "MSFT"}
+    assert protection["AAPL"].is_complete is True
+    assert protection["MSFT"].is_complete is True
     ib.openTrades.assert_not_called()
+
+
+def test_a_position_with_only_one_live_child_is_not_protected() -> None:
+    """片方だけ生きている建玉を「保護あり」と数えないこと。
+
+    2026-08-05の実測では、呼値違反で逆指値だけが不成立になり、利確だけが生きた
+    建玉が残った。片方でもあれば保護ありとすると、この下方向に無防備な状態を
+    毎サイクル見逃し続ける。
+    """
+    ib = MagicMock()
+    ib.reqAllOpenOrdersAsync = AsyncMock(
+        return_value=[_make_trade(status="Submitted", order_type="LMT")]
+    )
+
+    protection = asyncio.run(find_resting_exit_protection_async(ib))
+
+    assert protection["AAPL"].is_complete is False
+    assert protection["AAPL"].live_order_types == frozenset({"LMT"})
+
+
+def test_a_filled_resting_exit_counts_as_complete() -> None:
+    """待機注文が約定していれば置き直しの対象にしないこと。
+
+    約定していれば建玉はもう閉じており、OCAの相方もIBKR側が取り消す。
+    ここで置き直すと、建玉が無いのに売り注文だけが並ぶ。
+    """
+    ib = MagicMock()
+    ib.reqAllOpenOrdersAsync = AsyncMock(
+        return_value=[_make_trade(status="Filled", order_type="STP")]
+    )
+
+    assert asyncio.run(find_resting_exit_protection_async(ib))["AAPL"].is_complete is True

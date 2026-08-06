@@ -2823,3 +2823,119 @@ def test_sigterm_is_converted_to_keyboard_interrupt():
     """
     with pytest.raises(KeyboardInterrupt):
         main_module._raise_keyboard_interrupt_on_sigterm(signal.SIGTERM, None)
+
+
+# --- 建玉と待機注文の突き合わせ ------------------------------------------------------
+
+
+def _protection(live=(), filled=False):
+    from execution.order_manager import RestingExitProtection
+
+    return RestingExitProtection(live_order_types=frozenset(live), has_filled_exit=filled)
+
+
+def _position_manager_with_one_open_position() -> PositionManager:
+    manager = PositionManager()
+    manager.open_position(
+        "AAPL", entry_price=100.0, quantity=3, risk_per_share=5.0,
+        stop_price=95.0, take_profit_price=110.0, strategy_type=STRATEGY_TYPE_SWING,
+    )
+    return manager
+
+
+def test_restore_skips_symbols_whose_bracket_is_fully_live() -> None:
+    """両方が生きている銘柄は触らないこと（置き直しは冪等）。"""
+    ib = MagicMock()
+    manager = _position_manager_with_one_open_position()
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch(
+            "main.find_resting_exit_protection_async",
+            new=AsyncMock(return_value={"AAPL": _protection(live=("STP", "LMT"))}),
+        ), \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()) as mock_cancel, \
+        patch("main.place_resting_exit_orders_async", new=AsyncMock()) as mock_place:
+
+        asyncio.run(main_module._restore_missing_resting_orders_async(
+            ib, manager, main_module.MarketDataCaches(),
+        ))
+
+    mock_cancel.assert_not_awaited()
+    mock_place.assert_not_awaited()
+
+
+def test_restore_places_the_bracket_again_when_nothing_is_live() -> None:
+    ib = MagicMock()
+    contract = MagicMock(symbol="AAPL")
+    manager = _position_manager_with_one_open_position()
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("main.find_resting_exit_protection_async", new=AsyncMock(return_value={})), \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()) as mock_cancel, \
+        patch("main.place_resting_exit_orders_async", new=AsyncMock()) as mock_place:
+
+        asyncio.run(main_module._restore_missing_resting_orders_async(
+            ib, manager, main_module.MarketDataCaches(),
+        ))
+
+    mock_cancel.assert_not_awaited()
+    mock_place.assert_awaited_once()
+
+
+def test_restore_cancels_the_surviving_child_before_replacing_the_bracket() -> None:
+    """片方だけ生きている建玉は、残りを消してから置き直すこと。
+
+    2026-08-05の実測では呼値違反で逆指値だけが不成立になり、利確だけが生きた
+    建玉が残った（＝下方向に無防備）。片方でもあれば保護ありと数えると
+    この状態を毎サイクル見逃す。かといって消さずに両方を置き直すと、建玉を
+    超える売り注文が並び、IBKRが超過分を空売りと見なして拒否する。
+    """
+    ib = MagicMock()
+    contract = MagicMock(symbol="AAPL")
+    manager = _position_manager_with_one_open_position()
+    calls = []
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch(
+            "main.find_resting_exit_protection_async",
+            new=AsyncMock(return_value={"AAPL": _protection(live=("LMT",))}),
+        ), \
+        patch(
+            "main.cancel_bracket_orders_async",
+            new=AsyncMock(side_effect=lambda *a, **k: calls.append("cancel")),
+        ), \
+        patch(
+            "main.place_resting_exit_orders_async",
+            new=AsyncMock(side_effect=lambda *a, **k: calls.append("place")),
+        ):
+
+        asyncio.run(main_module._restore_missing_resting_orders_async(
+            ib, manager, main_module.MarketDataCaches(),
+        ))
+
+    assert calls == ["cancel", "place"]
+
+
+def test_restore_skips_symbols_whose_resting_exit_already_filled() -> None:
+    """待機注文が約定済みの銘柄へ置き直さないこと。
+
+    約定していれば建玉はもう閉じており（決済の記録は _process_exit_async が行う）、
+    ここで置き直すと建玉が無いのに売り注文だけが並ぶ。
+    """
+    ib = MagicMock()
+    manager = _position_manager_with_one_open_position()
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch(
+            "main.find_resting_exit_protection_async",
+            new=AsyncMock(return_value={"AAPL": _protection(filled=True)}),
+        ), \
+        patch("main.place_resting_exit_orders_async", new=AsyncMock()) as mock_place:
+
+        asyncio.run(main_module._restore_missing_resting_orders_async(
+            ib, manager, main_module.MarketDataCaches(),
+        ))
+
+    mock_place.assert_not_awaited()

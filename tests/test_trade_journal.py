@@ -243,6 +243,41 @@ def test_summarize_trade_records_ignores_none_r_multiple_in_average() -> None:
     assert stats.avg_r_multiple == pytest.approx(2.0)
 
 
+def test_summarize_trade_records_is_net_of_commission() -> None:
+    """集計は手数料控除後で行うこと。
+
+    グロスでプラス・ネットでマイナスのトレードを勝ちとして数えると、勝率も
+    プロフィットファクターも同時に楽観へ寄る。往復手数料が約定代金の1%を
+    占める小口座では、利幅の薄いトレードは符号ごと変わる（2026-08-05の実測:
+    AMBQ 3株・約定代金$203でグロス -13.18 / 手数料 2.00 / ネット -15.19）。
+
+    `backtest/` の成績はコスト込みで出しているので、ライブ側をグロスで
+    集計すると、実運用と検証を比べる指標そのものが別物になる。
+    """
+    from execution.trade_journal import TradeRecord
+
+    trades = [
+        # グロス +0.50 だが往復手数料 0.70 でネットは -0.20（＝負け）。
+        TradeRecord(
+            symbol="AAPL", entry_price=100.0, exit_price=100.5, quantity=1,
+            reason="TAKE_PROFIT", pnl=0.5, pnl_pct=0.5, r_multiple=0.1,
+            closed_at="2026-01-01", commission=0.7,
+        ),
+        TradeRecord(
+            symbol="AMBQ", entry_price=67.44, exit_price=63.38, quantity=3,
+            reason="STOP_LOSS", pnl=-12.18, pnl_pct=-6.02, r_multiple=-1.2,
+            closed_at="2026-01-02", commission=2.0,
+        ),
+    ]
+
+    stats = summarize_trade_records(trades)
+
+    assert stats.win_rate_pct == 0.0
+    assert stats.total_pnl == pytest.approx(-0.2 - 14.18)
+    # 勝ちが1件も無いのでプロフィットファクターは0（infではない）。
+    assert stats.profit_factor == 0.0
+
+
 # --- compute_daily_pnl (サーキットブレーカーの判定基準) ----------------------------
 
 

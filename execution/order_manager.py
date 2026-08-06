@@ -16,7 +16,7 @@ import asyncio
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from ib_insync import IB, LimitOrder, MarketOrder, Order, Stock, StopOrder
 
@@ -831,8 +831,29 @@ def _is_resting_exit_order(trade, symbol: str) -> bool:
     return getattr(order, "orderType", None) in _RESTING_EXIT_ORDER_TYPES
 
 
-async def find_symbols_with_live_resting_exits_async(ib: IB) -> set:
-    """待機決済注文がブローカー側で生きている銘柄の集合を返す。
+@dataclass(frozen=True)
+class RestingExitProtection:
+    """ある銘柄の建玉が、ブローカー側の待機注文でどこまで守られているか。"""
+
+    live_order_types: frozenset
+    # 待機注文の**約定**が観測できたか。約定していれば建玉はもう閉じており、
+    # OCAの相方もIBKR側が取り消す。置き直しの対象にしてはならない。
+    has_filled_exit: bool
+
+    @property
+    def is_complete(self) -> bool:
+        """損切りと利確の両方が置かれているか（＝置き直しが不要か）。
+
+        **片方だけでは守られていない。** 2026-08-05の実測では、呼値違反で
+        逆指値だけが不成立になり、利確だけが生きた建玉が残った。片方でも
+        生きていれば「保護あり」と数えると、この**下方向に無防備な建玉**を
+        毎サイクル見逃し続ける。
+        """
+        return self.has_filled_exit or _RESTING_EXIT_ORDER_TYPES <= self.live_order_types
+
+
+async def find_resting_exit_protection_async(ib: IB) -> Dict[str, RestingExitProtection]:
+    """銘柄ごとに、待機決済注文がブローカー側でどう置かれているかを返す。
 
     **`ib.openTrades()` ではなく `reqAllOpenOrdersAsync()` を使う。** 前者は
     このクライアントIDが出した注文しか含まないため、他のクライアント（手動の
@@ -841,11 +862,25 @@ async def find_symbols_with_live_resting_exits_async(ib: IB) -> set:
     注文を拒否する（2026-08-05に `Error 201` として実測）。
     """
     trades = await ib.reqAllOpenOrdersAsync()
+
+    live: Dict[str, set] = {}
+    filled: set = set()
+    for trade in trades:
+        symbol = getattr(trade.contract, "symbol", "")
+        if not _is_resting_exit_order(trade, symbol):
+            continue
+        status = trade.orderStatus.status
+        if status == _STATUS_FILLED:
+            filled.add(symbol)
+        elif status in _LIVE_ORDER_STATUSES:
+            live.setdefault(symbol, set()).add(trade.order.orderType)
+
     return {
-        trade.contract.symbol
-        for trade in trades
-        if _is_resting_exit_order(trade, getattr(trade.contract, "symbol", ""))
-        and trade.orderStatus.status in _LIVE_ORDER_STATUSES
+        symbol: RestingExitProtection(
+            live_order_types=frozenset(live.get(symbol, ())),
+            has_filled_exit=symbol in filled,
+        )
+        for symbol in set(live) | filled
     }
 
 

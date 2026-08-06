@@ -81,6 +81,12 @@ class Position:
     # 織り込むため、建玉と一緒に持ち越す（決済時には決済側の手数料しか
     # 分からない）。ドライラン中と、ブローカー同期で取り込んだ建玉は0.0。
     entry_commission: float = 0.0
+    # entry_price が実約定価格か（＝手数料を含まない純粋な約定値か）。
+    # **IBKRの avgCost は手数料込みである**（2026-08-05の実測: 実約定 67.44 に
+    # 対し avgCost 67.77333635 = 67.44 + 手数料1.00/3株）。ブローカー同期が
+    # これで entry_price を上書きすると、entry_commission と二重に手数料を
+    # 引くことになる。このフラグが立っている建玉は同期で建値を上書きしない。
+    entry_price_is_fill: bool = False
 
 
 class PositionManager:
@@ -247,6 +253,7 @@ class PositionManager:
         stop_price: float = 0.0, take_profit_price: float = 0.0,
         oca_group: Optional[str] = None,
         entry_commission: float = 0.0,
+        entry_price_is_fill: bool = False,
         now: Optional[datetime] = None,
     ) -> Position:
         if entry_price <= 0:
@@ -272,6 +279,7 @@ class PositionManager:
             take_profit_price=take_profit_price,
             oca_group=oca_group,
             entry_commission=entry_commission,
+            entry_price_is_fill=entry_price_is_fill,
         )
         self._positions[symbol] = position
 
@@ -413,8 +421,13 @@ class PositionManager:
                     highest_price=entry_price,
                 )
             else:
-                existing.entry_price = entry_price
                 existing.quantity = quantity
+                if existing.entry_price_is_fill:
+                    # 実約定価格を持っている建玉は上書きしない。avgCost は
+                    # 手数料込みなので、上書きすると entry_commission と合わせて
+                    # 手数料を二重に引くことになる（`Position.entry_price_is_fill`）。
+                    continue
+                existing.entry_price = entry_price
                 existing.highest_price = max(existing.highest_price, entry_price)
 
         self._broker_confirmed_symbols = confirmed

@@ -35,7 +35,7 @@ from execution.order_manager import (
     cancel_bracket_orders_async,
     ensure_orders_are_paper_only,
     find_filled_resting_exit,
-    find_symbols_with_live_resting_exits_async,
+    find_resting_exit_protection_async,
     place_bracket_order_async,
     place_market_order_async,
     place_resting_exit_orders_async,
@@ -673,6 +673,7 @@ async def _process_entry_async(
         take_profit_price=order_result.take_profit_price,
         oca_group=order_result.oca_group,
         entry_commission=order_result.commission,
+        entry_price_is_fill=order_result.fill_price is not None,
     )
 
 
@@ -979,21 +980,36 @@ async def _restore_missing_resting_orders_async(
     IBKR側の都合で取り消されることもある。**消えたことは通知されない**ので、
     毎サイクル突き合わせる以外に気付く方法が無い。
 
-    置き直しは冪等である（生きている注文がある銘柄は対象外になる）ため、
+    **片方だけ生きている状態も「消えている」として扱う。** 同じ日に呼値違反で
+    逆指値だけが不成立になり、利確だけが生きた建玉が残っている（＝下方向に
+    無防備）。片方でもあれば保護ありと数えると、この状態を毎サイクル見逃す。
+
+    置き直しは冪等である（両方が生きている銘柄は対象外になる）ため、
     通常のサイクルでは `reqAllOpenOrders` 1回で終わる。ヒストリカルデータの
     リクエストではないのでペーシング枠（「6.1」）も消費しない。
     """
     if not ENABLE_REAL_ORDERS or not position_manager.open_symbols():
         return
 
-    protected = await find_symbols_with_live_resting_exits_async(ib)
+    protection = await find_resting_exit_protection_async(ib)
     for symbol in position_manager.open_symbols():
-        if symbol in protected:
+        state = protection.get(symbol)
+        if state is not None and state.is_complete:
             continue
+
         position = position_manager.get_position(symbol)
-        logger.warning(
-            "[%s] 建玉があるのに待機注文がブローカー側にありません。置き直します。", symbol,
-        )
+        if state is not None and state.live_order_types:
+            # 残っている片方を先に消す。消さずに両方を置き直すと、建玉を超える
+            # 売り注文が並び、IBKRが超過分を空売りと見なして拒否する。
+            logger.warning(
+                "[%s] 待機注文が片方(%s)しか生きていません。取り消してから置き直します。",
+                symbol, "/".join(sorted(state.live_order_types)),
+            )
+            await cancel_bracket_orders_async(ib, symbol)
+        else:
+            logger.warning(
+                "[%s] 建玉があるのに待機注文がブローカー側にありません。置き直します。", symbol,
+            )
         contract = await caches.contracts.get_async(ib, symbol)
         await _restore_resting_exit_orders_async(
             ib, contract, position, reference_price=position.entry_price,

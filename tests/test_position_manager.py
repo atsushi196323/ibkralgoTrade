@@ -241,6 +241,45 @@ def test_sync_overwrites_existing_position_with_broker_values() -> None:
     assert position.quantity == 8
 
 
+def test_sync_does_not_overwrite_a_fill_based_entry_price() -> None:
+    """実約定価格を持つ建玉の建値を、avgCost で上書きしないこと。
+
+    **IBKRの avgCost は手数料込みである。** 2026-08-05の実測では、実約定 67.44 に
+    対し avgCost=67.77333635（= 67.44 + 手数料1.00 ÷ 3株）が返っていた。
+    これで上書きすると、`entry_commission` として別に引く手数料と二重計上になる。
+    実測のトレードでは実現損益が -14.18 のところ -15.19 と記録されていた。
+
+    数量はブローカー側を正とする（部分約定で変わりうるため）。
+    """
+    manager = PositionManager()
+    manager.open_position(
+        "AMBQ", entry_price=67.44, quantity=3, entry_commission=1.0,
+        entry_price_is_fill=True,
+    )
+    ib = _make_mock_ib([_make_broker_position("AMBQ", 3, 67.77333635)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    position = manager.get_position("AMBQ")
+    assert position.entry_price == pytest.approx(67.44)
+    assert position.quantity == 3
+
+
+def test_sync_updates_quantity_even_when_the_entry_price_is_kept() -> None:
+    """建値を守っても、数量はブローカー側で更新すること。"""
+    manager = PositionManager()
+    manager.open_position(
+        "AAPL", entry_price=100.0, quantity=5, entry_price_is_fill=True,
+    )
+    ib = _make_mock_ib([_make_broker_position("AAPL", 8, 105.0)])
+
+    asyncio.run(manager.sync_with_broker_async(ib))
+
+    position = manager.get_position("AAPL")
+    assert position.entry_price == pytest.approx(100.0)
+    assert position.quantity == 8
+
+
 def test_sync_preserves_highest_price_above_broker_avg_cost() -> None:
     manager = PositionManager()
     manager.open_position("AAPL", entry_price=100.0, quantity=5)

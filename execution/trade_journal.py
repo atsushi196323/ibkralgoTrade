@@ -180,24 +180,42 @@ class TradeJournal:
 
 
 def summarize_trade_records(trades: List[TradeRecord]) -> TradeStats:
+    """トレード記録を集計する。**すべて手数料控除後の純損益で計算する。**
+
+    `TradeRecord.pnl` は手数料を引く前の値で、手数料は別列に持っている
+    （`net_pnl_usd`）。グロスで集計すると3つが同時に楽観へ寄る:
+
+    - `total_pnl` が往復手数料のぶんだけ多い
+    - **グロスでプラス・ネットでマイナスのトレードが勝ちとして数えられる**
+    - プロフィットファクターがその両方の影響を受ける
+
+    小口座ではこの差が大きい。2026-08-05の実測（AMBQ 3株・約定代金$203）は
+    グロス -13.18 に対し往復手数料 2.00 で、ネットは -15.19 だった。
+    往復手数料が約定代金の1%を占めるため、**利幅の薄いトレードは符号ごと
+    変わりうる**。
+
+    加えて `backtest/` の成績はコスト込みで出している（`backtest/costs.py`）。
+    ライブ側をグロスで集計すると、実運用と検証を比べる指標そのものが
+    別物になり、実資金へ進む判断の材料にならない。
+    """
     num_trades = len(trades)
     if num_trades == 0:
         return TradeStats(
             num_trades=0, win_rate_pct=0.0, total_pnl=0.0, profit_factor=0.0, avg_r_multiple=None,
         )
 
-    wins = [t for t in trades if t.pnl > 0]
-    losses = [t for t in trades if t.pnl <= 0]
+    wins = [t for t in trades if t.net_pnl_usd > 0]
+    losses = [t for t in trades if t.net_pnl_usd <= 0]
 
     win_rate_pct = len(wins) / num_trades * 100.0
-    total_pnl = sum(t.pnl for t in trades)
+    total_pnl = sum(t.net_pnl_usd for t in trades)
 
-    gross_profit = sum(t.pnl for t in wins)
-    gross_loss = -sum(t.pnl for t in losses)
-    if gross_loss > 0:
-        profit_factor = gross_profit / gross_loss
+    net_profit = sum(t.net_pnl_usd for t in wins)
+    net_loss = -sum(t.net_pnl_usd for t in losses)
+    if net_loss > 0:
+        profit_factor = net_profit / net_loss
     else:
-        profit_factor = float("inf") if gross_profit > 0 else 0.0
+        profit_factor = float("inf") if net_profit > 0 else 0.0
 
     r_values = [t.r_multiple for t in trades if t.r_multiple is not None]
     avg_r_multiple = (sum(r_values) / len(r_values)) if r_values else None
