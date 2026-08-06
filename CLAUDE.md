@@ -15,7 +15,7 @@
 - 株数(`MAX_POSITION_SIZE` 40株)と金額(`MAX_ORDER_NOTIONAL_USD` 5,000ドル)のクランプは**有効のまま**
 - 建値・決済価格・手数料は実際の `Fill` から取り、待機注文の約定もブローカー側から読む（`find_filled_resting_exit`）。約定しなかった注文の扱い・`parentId`・拒否時の記録は「9. 開発時の禁止事項」に不変条件としてまとめてある
 - **移行時に `logs/positions.json` のドライラン期間の想定ポジションを消すこと。** ブローカーが持っていない建玉へ成行決済を出すと売り建てになる。`PositionManager.is_confirmed_by_broker` がERRORを出して決済を見送るが、その銘柄は監視枠を占め続け、`MAX_CONCURRENT_POSITIONS`（2）を埋めると新規建てが一切起きない。2026-08-05の移行時にはSPCX・AMBQの2件がこれに該当し、両方消してから有効にした
-- **テストは `conftest.py` の autouse fixture でドライラン側に固定してある。** `ENABLE_REAL_ORDERS` は運用の設定であってテストの検証対象ではない。既定値に乗せたままにすると、フラグを立てた瞬間にドライランの挙動を確かめるテストが本物の発注経路へ入る（移行時に実際に40件落ちた）。実発注の経路を見るテストは個別に `patch(..., True)` すること
+- **テストは `conftest.py` の autouse fixture でドライラン側に固定してある。** `ENABLE_REAL_ORDERS` は運用の設定であってテストの検証対象ではない。既定値に乗せたままにすると、フラグを立てた瞬間にドライランの挙動を確かめるテストが本物の発注経路へ入る（移行時に実際に40件落ちた）。実発注の経路を見るテストは個別に `patch(..., True)` すること。**固定は `execution.order_manager` と `main` の両方に掛ける。** `main` は import 時にこのフラグを値で束ねるため、片方だけだと `main.ENABLE_REAL_ORDERS` が実際の設定値のまま残り、`tests/test_logging_setup.py` の `importlib.reload(main)` が走った後だけ挙動が変わる。**同じテストの結果が実行順で変わり、実発注側を検証しているつもりのテストが黙ってドライラン側を通る**（2026-08-06に実測。`pytest tests/test_main.py -k trailing_stop_cancels` 単体では落ち、全体実行では通る状態だった）
 
 **次の段階（実資金）へ進む条件:** `logs/trade_journal.csv` に実約定・実手数料を伴う往復が数件記録され、transmit順序とOCAの取消連動がブローカー側の挙動として確認できること。
 

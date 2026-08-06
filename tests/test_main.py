@@ -1393,11 +1393,8 @@ def test_market_exit_is_skipped_when_the_cancellation_does_not_confirm(trade_jou
     )
     position_manager.update_highest_price("AAPL", 108.0)
 
-    # 取り消しと成行の順序はドライラン/実発注で変わらない。実発注側で走らせると
-    # ブローカー同期の確認（is_confirmed_by_broker）が先に効いて、取り消しまで
-    # 到達しない。
-    with patch("main.ENABLE_REAL_ORDERS", False), \
-        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+    # 取り消しと成行の順序はドライラン/実発注で変わらない（conftestでドライラン固定）。
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.get_current_price_async", new=AsyncMock(return_value=102.0)), \
         patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(102.0))), \
         patch("main.place_market_order_async", new=AsyncMock()) as mock_order, \

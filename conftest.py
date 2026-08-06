@@ -17,8 +17,18 @@ def _dry_run_orders_by_default(monkeypatch):
 
     実発注の経路を見るテストは `patch("execution.order_manager.ENABLE_REAL_ORDERS", True)`
     で個別に上書きすること（`tests/test_order_manager.py` がそうしている）。
+
+    **`main` 側も固定する。** `main` はこのフラグを import 時に値で束ねるため、
+    order_manager だけ固定しても `main.ENABLE_REAL_ORDERS` は実際の設定値
+    （現在True）のまま残る。そうなると同じテストの結果が実行順で変わる:
+    `tests/test_logging_setup.py` が `importlib.reload(main)` を行うと、その時点で
+    main はドライラン側の値を焼き込み、以降のテストだけ挙動が変わっていた
+    （実際に `pytest tests/test_main.py -k trailing_stop_cancels` 単体では落ち、
+    全体実行では通る状態になっていた）。実発注側を検証するテストが、順序次第で
+    黙ってドライラン側を通ることになるため、ここで両方を固定する。
     """
     monkeypatch.setattr("execution.order_manager.ENABLE_REAL_ORDERS", False)
+    monkeypatch.setattr("main.ENABLE_REAL_ORDERS", False)
 
 
 @pytest.fixture(autouse=True)
