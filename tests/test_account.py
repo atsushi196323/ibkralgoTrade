@@ -5,7 +5,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from execution.account import get_account_equity_async, get_settled_cash_async
+from execution.account import (
+    get_account_equity_async,
+    get_settled_cash_async,
+    get_usd_to_base_rate_async,
+)
 
 
 def _make_account_value(tag: str, value: str, currency: str = "USD"):
@@ -141,3 +145,56 @@ def test_settled_cash_can_be_zero() -> None:
     )
 
     assert asyncio.run(get_settled_cash_async(ib)) == pytest.approx(0.0)
+
+
+def test_usd_to_base_rate_is_read_from_the_account_summary() -> None:
+    """為替の購読が無くても円換算レートが取れること。
+
+    IDEALPROのUSD.JPYはマーケットデータの追加購読が要り、この口座では
+    3経路とも失敗する（2026-08-06に Error 10089 / 162 として実測。
+    ジャーナルの usd_jpy_rate が空のまま記録されていた）。
+    """
+    ib = MagicMock()
+    ib.accountSummaryAsync = AsyncMock(
+        return_value=_make_jpy_based_summary()
+        + [_make_account_value("ExchangeRate", "160.0533448", currency="USD")]
+    )
+
+    assert asyncio.run(get_usd_to_base_rate_async(ib)) == pytest.approx(160.0533448)
+
+
+def test_usd_to_base_rate_is_not_reported_for_a_different_base_currency() -> None:
+    """基準通貨が円でなければNoneを返すこと。
+
+    基準通貨がドルの口座ではExchangeRateが1.0前後になり、それを円換算に
+    使うと損益が約160分の1で記録される。通貨の取り違えは例外もログも出さずに
+    桁だけを狂わせるため、分からない場合は記録しない側へ倒す。
+    """
+    ib = MagicMock()
+    ib.accountSummaryAsync = AsyncMock(
+        return_value=[
+            _make_account_value("NetLiquidation", "1220.00", currency="USD"),
+            _make_account_value("ExchangeRate", "1.0", currency="USD"),
+        ]
+    )
+
+    assert asyncio.run(get_usd_to_base_rate_async(ib)) is None
+
+
+def test_usd_to_base_rate_returns_none_when_the_tag_is_missing() -> None:
+    ib = MagicMock()
+    ib.accountSummaryAsync = AsyncMock(return_value=_make_jpy_based_summary())
+
+    assert asyncio.run(get_usd_to_base_rate_async(ib)) is None
+
+
+@pytest.mark.parametrize("value", ["", "0", "-160.0"])
+def test_usd_to_base_rate_rejects_unusable_values(value) -> None:
+    """解釈できない値・正でない値をレートとして採用しないこと。"""
+    ib = MagicMock()
+    ib.accountSummaryAsync = AsyncMock(
+        return_value=_make_jpy_based_summary()
+        + [_make_account_value("ExchangeRate", value, currency="USD")]
+    )
+
+    assert asyncio.run(get_usd_to_base_rate_async(ib)) is None

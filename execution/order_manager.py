@@ -81,6 +81,19 @@ _CHILD_ORDER_LIVE_TIMEOUT_SECONDS: float = 10.0
 # 待機注文の取り消しと約定検知は、この2種類の売り注文だけを対象にする。
 _RESTING_EXIT_ORDER_TYPES = frozenset({"STP", "LMT"})
 
+# 取り消し要求がまだブローカー側で終わっていない状態。
+# `_LIVE_ORDER_STATUSES` と別に持つのは、あちらが Filled を「置かれている側」
+# として含んでいるため。取り消しの完了待ちで Filled を待ち続けると、
+# 待機注文が約定して建玉が消えた場面でタイムアウトまで止まる。
+_PENDING_CANCEL_STATUSES = frozenset(
+    {"ApiPending", "PendingSubmit", "PreSubmitted", "Submitted", "PendingCancel"}
+)
+
+# 取り消しがブローカー側で確定するまで待つ上限（秒）。
+# 実測では cancelOrder から Cancelled まで約0.6秒かかっており、
+# 10秒はその十数倍にあたる。
+_ORDER_CANCEL_TIMEOUT_SECONDS: float = 10.0
+
 
 class RestingOrdersNotLiveError(RuntimeError):
     """親は約定したが、ブラケットの子注文がブローカー側で生きていない。
@@ -88,6 +101,19 @@ class RestingOrdersNotLiveError(RuntimeError):
     `OrderNotFilledError` と同じく、**呼び出し側にローカル記録を作らせない**
     ために例外にしている。こちらは建玉ができた後に判明するため、
     投げる前に建玉を成行で決済してから投げる（`_ensure_children_are_live_async`）。
+    """
+
+
+class RestingOrderCancelTimeoutError(RuntimeError):
+    """待機注文の取り消しがブローカー側で確定しなかった。
+
+    **投げた側は成行決済へ進んではならない。** 建玉と同数の売り注文が
+    生きたまま成行の売りを重ねると、IBKRは超過分を空売りと見なして拒否する
+    （2026-08-05に `Error 201` として実測。この口座は評価額が証拠金取引の
+    最低額 200,000 JPY を下回るため即座に弾かれた）。
+
+    取り消せていないということは待機注文がまだ建玉を守っているということでも
+    あるので、次のサイクルへ持ち越すのが安全側である。
     """
 
 
@@ -870,6 +896,15 @@ async def cancel_bracket_orders_async(ib: IB, symbol: str) -> None:
     突き合わせを銘柄で行う理由は `_is_resting_exit_order` を参照。
     ブローカー同期で取り込んだ建玉のように、こちらがOCAグループ名を
     知らない場合でも取り消せる。
+
+    **取り消しの完了を待ってから返す。** `cancelOrder` は要求を投げるだけで、
+    ブローカー側が `Cancelled` にするまでの間、注文はまだ板に生きている。
+    2026-08-05の実測では、取り消し要求の1ミリ秒後に出した成行売りが
+    「建玉3株 + 生きている売りLMT 3株 + 売り成行3株」＝売り超過と見なされ、
+    `Error 201` で拒否された（取り消しが確定したのはその0.4秒後）。
+
+    Raises:
+        RestingOrderCancelTimeoutError: 取り消しが確定しなかった場合。
     """
     if not symbol:
         return
@@ -882,11 +917,53 @@ async def cancel_bracket_orders_async(ib: IB, symbol: str) -> None:
         )
         return
 
-    cancelled = 0
-    for trade in ib.openTrades():
-        if not _is_resting_exit_order(trade, symbol):
-            continue
+    targets = await _find_cancellable_resting_orders_async(ib, symbol)
+    for trade in targets:
         ib.cancelOrder(trade.order)
-        cancelled += 1
 
-    logger.info("[%s] 待機注文を取り消しました: 件数=%d", symbol, cancelled)
+    logger.info("[%s] 待機注文の取り消しを要求しました: 件数=%d", symbol, len(targets))
+    if not targets:
+        return
+
+    await _await_cancellation_async(ib, symbol)
+    logger.info("[%s] 待機注文の取り消しが確定しました。", symbol)
+
+
+async def _find_cancellable_resting_orders_async(ib: IB, symbol: str) -> List:
+    """その銘柄の、まだ取り消しが終わっていない待機注文を返す。
+
+    **`ib.openTrades()` ではなく `reqAllOpenOrdersAsync()` を使う。** 前者は
+    このクライアントIDが出した注文しか含まないため、他のクライアント（手動の
+    修復・別プロセス）が置いた注文を取り消し損ねる。そのまま成行を重ねると
+    売り超過になり `Error 201` で拒否される（`find_symbols_with_live_resting_exits_async`
+    と同じ理由）。
+    """
+    trades = await ib.reqAllOpenOrdersAsync()
+    return [
+        trade
+        for trade in trades
+        if _is_resting_exit_order(trade, symbol)
+        and trade.orderStatus.status in _PENDING_CANCEL_STATUSES
+    ]
+
+
+async def _await_cancellation_async(ib: IB, symbol: str) -> None:
+    """待機注文がブローカー側から消えるまで待つ。
+
+    ブローカーへ問い合わせ直すのは、他のクライアントが出した注文の状態が
+    こちらの `Trade` オブジェクトへ必ず反映されるとは限らないため。
+    ヒストリカルデータのリクエストではないのでペーシング枠（「6.1」）は
+    消費しない。
+    """
+    waited = 0.0
+    while waited < _ORDER_CANCEL_TIMEOUT_SECONDS:
+        await asyncio.sleep(_ORDER_STATUS_POLL_INTERVAL_SECONDS)
+        waited += _ORDER_STATUS_POLL_INTERVAL_SECONDS
+        if not await _find_cancellable_resting_orders_async(ib, symbol):
+            return
+
+    raise RestingOrderCancelTimeoutError(
+        f"[{symbol}] 待機注文の取り消しが {_ORDER_CANCEL_TIMEOUT_SECONDS:.0f} 秒以内に"
+        "確定しませんでした。生きている売り注文へ成行の売りを重ねると"
+        "売り超過として拒否されるため、決済を次のサイクルへ持ち越します。"
+    )

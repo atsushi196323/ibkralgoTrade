@@ -23,7 +23,11 @@ from data.market_data import (
     get_intraday_bars_async,
     get_usd_jpy_rate_async,
 )
-from execution.account import get_account_equity_async, get_settled_cash_async
+from execution.account import (
+    get_account_equity_async,
+    get_settled_cash_async,
+    get_usd_to_base_rate_async,
+)
 from execution.order_manager import (
     ENABLE_REAL_ORDERS,
     MAX_ORDER_NOTIONAL_USD,
@@ -719,6 +723,29 @@ async def _clamp_quantity_to_settled_cash_async(
     return quantity
 
 
+async def _resolve_usd_jpy_rate_async(ib: IB) -> Optional[float]:
+    """円換算レートを、為替のマーケットデータ → 口座サマリーの順に取る。
+
+    IDEALPROのUSD.JPYはマーケットデータの追加購読が要るため、購読の無い
+    口座では3経路とも失敗し、ジャーナルの usd_jpy_rate が空のまま残る
+    （2026-08-06に実測）。空欄でも稼働は続くが、確定申告用CSVの円換算が
+    その年ぶんだけ埋まらない。口座サマリーのレートは購読なしで読める。
+
+    どちらも取れなければNone。**推定値で埋めない**——記録が無いことは
+    集計側が扱えるが（円換算合計から除外される）、間違ったレートは
+    後から見分けられない。
+    """
+    rate = await get_usd_jpy_rate_async(ib)
+    if rate is not None:
+        return rate
+
+    try:
+        return await get_usd_to_base_rate_async(ib)
+    except Exception:
+        logger.exception("口座サマリーからの為替レート取得に失敗しました。")
+        return None
+
+
 async def _record_closed_trade(
     ib: IB, trade_journal: TradeJournal, closed_position: Position, exit_price: float, reason: str, pnl_pct: float,
     exit_commission: float = 0.0,
@@ -732,7 +759,7 @@ async def _record_closed_trade(
     # 往復ぶんを記録する。建て側の手数料は決済時には分からないので、
     # 建玉と一緒に持ち越したものを使う。ドライラン中は実約定が無いため両方0。
     commission = closed_position.entry_commission + exit_commission
-    usd_jpy_rate = await get_usd_jpy_rate_async(ib)
+    usd_jpy_rate = await _resolve_usd_jpy_rate_async(ib)
 
     trade_journal.record_trade(
         symbol=closed_position.symbol,
@@ -891,6 +918,11 @@ async def _market_exit_async(ib: IB, contract, position, reference_price: float)
     そのため失敗したら待機注文を置き直してから例外を上へ返す。呼び出し側
     （`run_watchlist_cycle_async`）は銘柄単位の例外を握り潰して次のサイクルで
     再試行するので、その間も建玉は保護されている。
+
+    **取り消しは try の外に置く。** 取り消しが確定しなかった場合
+    （`RestingOrderCancelTimeoutError`）は待機注文がまだ生きているので、
+    置き直しに入ると同じ建玉に売り注文が二重に並ぶ。そのまま次のサイクルへ
+    持ち越す方が安全である。
     """
     await cancel_bracket_orders_async(ib, contract.symbol)
     try:

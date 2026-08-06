@@ -19,6 +19,7 @@ from execution.order_manager import (
     BracketResult,
     OrderNotFilledError,
     OrderResult,
+    RestingOrderCancelTimeoutError,
     RestingOrderFill,
 )
 from data.rank_history import RankHistoryStore
@@ -423,6 +424,56 @@ def test_process_symbol_closes_position_on_exit_signal(trade_journal) -> None:
     assert stats.num_trades == 1
     assert stats.win_rate_pct == 0.0
     assert stats.avg_r_multiple == pytest.approx(-2.0)
+
+
+def test_exchange_rate_falls_back_to_the_account_summary(trade_journal) -> None:
+    """為替の購読が無い口座でも円換算レートを記録すること。
+
+    IDEALPROのUSD.JPYは追加購読が要るため3経路とも失敗し、2026-08-06の実測では
+    usd_jpy_rate が空のまま記録されていた。稼働は続くが確定申告用CSVの円換算が
+    その年ぶん埋まらない。口座サマリーのレートは購読なしで読める。
+    """
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position("AAPL", entry_price=100.0, quantity=3, risk_per_share=5.0)
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=None)), \
+        patch("main.get_usd_to_base_rate_async", new=AsyncMock(return_value=160.05)) as mock_rate, \
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())):
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    mock_rate.assert_awaited_once_with(ib)
+    assert trade_journal.load_trades()[0].usd_jpy_rate == pytest.approx(160.05)
+
+
+def test_exchange_rate_is_left_empty_when_no_source_has_it(trade_journal) -> None:
+    """どちらの経路でも取れなければ未記録のままにすること（推定で埋めない）。
+
+    記録が無いことは集計側が扱える（円換算合計から除外される）が、
+    間違ったレートは後から見分けられない。
+    """
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position("AAPL", entry_price=100.0, quantity=3, risk_per_share=5.0)
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=90.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(90.0))), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=None)), \
+        patch("main.get_usd_to_base_rate_async", new=AsyncMock(side_effect=ValueError("boom"))), \
+        patch("main.place_market_order_async", new=AsyncMock(return_value=_order_result())):
+
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    trade = trade_journal.load_trades()[0]
+    assert trade.usd_jpy_rate is None
+    assert trade.net_pnl_jpy is None
 
 
 def test_process_symbol_records_none_r_multiple_when_risk_per_share_unknown(trade_journal) -> None:
@@ -1323,6 +1374,47 @@ def test_trailing_stop_cancels_resting_orders_before_selling_at_market(trade_jou
     mock_cancel.assert_awaited_once_with(ib, "AAPL")
     mock_order.assert_awaited_once_with(ib, contract, action="SELL", quantity=3)
     assert trade_journal.load_trades()[0].reason == "TRAILING_STOP"
+
+
+def test_market_exit_is_skipped_when_the_cancellation_does_not_confirm(trade_journal) -> None:
+    """待機注文を取り消せなかったら、成行売りも置き直しもしないこと。
+
+    生きている売り注文へ成行の売りを重ねると売り超過になり、IBKRが空売りと
+    見なして拒否する（実測 Error 201）。置き直しに進めば同じ建玉に売り注文が
+    二重に並ぶ。取り消せていないということは待機注文がまだ建玉を守っている
+    ということでもあるので、次のサイクルへ持ち越すのが安全側である。
+    """
+    contract = MagicMock(symbol="AAPL")
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=3, risk_per_share=5.0,
+        stop_price=95.0, take_profit_price=110.0, oca_group="OCA_1",
+    )
+    position_manager.update_highest_price("AAPL", 108.0)
+
+    # 取り消しと成行の順序はドライラン/実発注で変わらない。実発注側で走らせると
+    # ブローカー同期の確認（is_confirmed_by_broker）が先に効いて、取り消しまで
+    # 到達しない。
+    with patch("main.ENABLE_REAL_ORDERS", False), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=102.0)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(102.0))), \
+        patch("main.place_market_order_async", new=AsyncMock()) as mock_order, \
+        patch("main.place_resting_exit_orders_async", new=AsyncMock()) as mock_restore, \
+        patch(
+            "main.cancel_bracket_orders_async",
+            new=AsyncMock(side_effect=RestingOrderCancelTimeoutError("timeout")),
+        ):
+
+        with pytest.raises(RestingOrderCancelTimeoutError):
+            asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    mock_order.assert_not_awaited()
+    mock_restore.assert_not_awaited()
+    # 建玉はローカルにも残る（売れていないのに閉じない）。
+    assert position_manager.has_position("AAPL")
+    assert trade_journal.load_trades() == []
 
 
 def test_eod_flatten_cancels_resting_orders_before_selling_at_market(trade_journal) -> None:

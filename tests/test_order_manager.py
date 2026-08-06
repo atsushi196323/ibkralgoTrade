@@ -11,6 +11,7 @@ from execution.order_manager import (
     MAX_ORDER_PRICE_DEVIATION_PCT,
     MAX_POSITION_SIZE,
     OrderNotFilledError,
+    RestingOrderCancelTimeoutError,
     RestingOrdersNotLiveError,
     build_bracket_orders,
     cancel_bracket_orders_async,
@@ -529,17 +530,78 @@ def test_filled_resting_exit_without_a_readable_price_is_not_reported() -> None:
 
 
 def test_real_cancel_cancels_only_the_resting_orders_of_that_symbol() -> None:
-    """OCAグループ名が書き換えられていても取り消せること（銘柄で突き合わせる）。"""
+    """OCAグループ名が書き換えられていても取り消せること（銘柄で突き合わせる）。
+
+    照会は reqAllOpenOrders で行う。openTrades() は自分のクライアントIDの注文
+    しか含まず、他クライアントが置いた注文を取り消し損ねる。
+    """
     ib = MagicMock()
-    mine = _make_trade(order_type="STP", oca_group="1171471109")
-    other_symbol = _make_trade(order_type="STP", symbol="MSFT")
-    entry_order = _make_trade(order_type="MKT", action="BUY")
-    ib.openTrades = MagicMock(return_value=[mine, other_symbol, entry_order])
+    mine = _make_trade(status="Submitted", order_type="STP", oca_group="1171471109")
+    other_symbol = _make_trade(status="Submitted", order_type="STP", symbol="MSFT")
+    entry_order = _make_trade(status="Submitted", order_type="MKT", action="BUY")
+    # 1回目は取り消し対象を返し、2回目（確認）は消えている。
+    ib.reqAllOpenOrdersAsync = AsyncMock(
+        side_effect=[[mine, other_symbol, entry_order], [other_symbol, entry_order]]
+    )
 
     with _real_orders_enabled():
         asyncio.run(cancel_bracket_orders_async(ib, "AAPL"))
 
     ib.cancelOrder.assert_called_once_with(mine.order)
+    ib.openTrades.assert_not_called()
+
+
+def test_real_cancel_waits_until_the_cancellation_is_confirmed() -> None:
+    """取り消しが確定するまで返らないこと。
+
+    `cancelOrder` は要求を投げるだけで、ブローカーが `Cancelled` にするまで
+    注文は板に生きている。2026-08-05の実測では、要求の1ミリ秒後に出した
+    成行売りが「建玉3株 + 生きている売りLMT 3株 + 売り成行3株」＝売り超過と
+    見なされ `Error 201` で拒否された（取り消しの確定はその0.4秒後）。
+    """
+    ib = MagicMock()
+    pending = _make_trade(status="PendingCancel", order_type="LMT")
+    ib.reqAllOpenOrdersAsync = AsyncMock(
+        side_effect=[[pending], [pending], [pending], []]
+    )
+
+    with _real_orders_enabled():
+        asyncio.run(cancel_bracket_orders_async(ib, "AAPL"))
+
+    # 消えるまで問い合わせ直している（初回の照会 + 確認3回）。
+    assert ib.reqAllOpenOrdersAsync.await_count == 4
+
+
+def test_real_cancel_raises_when_the_cancellation_never_confirms() -> None:
+    """確定しないまま時間切れになったら例外にすること。
+
+    握り潰して成行へ進むと、生きている売り注文へ売りを重ねて売り超過になる。
+    取り消せていない＝待機注文がまだ建玉を守っている、でもあるので、
+    決済を次のサイクルへ持ち越す方が安全である。
+    """
+    ib = MagicMock()
+    stuck = _make_trade(status="PendingCancel", order_type="STP")
+    ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[stuck])
+
+    with _real_orders_enabled(), pytest.raises(RestingOrderCancelTimeoutError):
+        asyncio.run(cancel_bracket_orders_async(ib, "AAPL"))
+
+
+def test_real_cancel_does_not_wait_when_there_is_nothing_to_cancel() -> None:
+    """既に消えている待機注文を待ち続けないこと。
+
+    ブローカー側で失効・約定済みの銘柄でここに滞留すると、決済判定が
+    そのぶん遅れる。
+    """
+    ib = MagicMock()
+    filled = _make_trade(status="Filled", order_type="STP")
+    ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[filled])
+
+    with _real_orders_enabled():
+        asyncio.run(cancel_bracket_orders_async(ib, "AAPL"))
+
+    ib.cancelOrder.assert_not_called()
+    assert ib.reqAllOpenOrdersAsync.await_count == 1
 
 
 # --- 待機注文の値段の丸めと生存確認 -------------------------------------------------
