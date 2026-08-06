@@ -154,6 +154,8 @@
 | `com.user.ibkralgotrade` | 22:15 | Botを起動（寄り付き22:30の15分前に接続を確立しておく） |
 | `com.user.ibkralgotrade.afterclose` | 06:05 | `scripts/after_close.sh`（Bot停止 → 売買代金ランキング記録 → 稼働サマリ） |
 
+**引け後のサマリは「その取引日のログが存在するか」も判定する**（`scripts/daily_report.last_closed_trading_day`）。`--date` を省略したときの対象日は**ログに書かれている最新の取引日**なので、ボットが起動しなかった日は前日のサマリがそのまま出て、正常な日と区別がつかない。2026-08-06に `com.user.ibkralgotrade` が launchd 側で `disabled` になっていたのを取りこぼしたのがこの穴である（plistは存在するのに `launchctl list` に無い状態で、ファイルを見るだけでは気付けない）。直近の引けた取引日より古ければ、サマリの先頭に警告と確認コマンドを出す。
+
 **06:05 なのは、夏時間で17:05 ET・冬時間で16:05 ETとなり、年間を通じて必ず引け(16:00 ET)の後になるため。** 05:05にすると冬時間の間はザラ場の最中に停止することになる。停止に **SIGTERM** を使い、`main.py` がこれを `KeyboardInterrupt` へ変換して `disconnect_async()` まで通す（`_raise_keyboard_interrupt_on_sigterm`）。SIGINTにしないのは、シェルがバックグラウンドで起動した子プロセスのSIGINTを `SIG_IGN` にする場合があるため（実測でcaffeinate配下のプロセスが無視した）。
 
 引け後にBotを止めるのは、IB Gatewayのログアウト（08:00 JST）以降に再接続の失敗ログだけが積み上がり、翌日のサマリが読みにくくなるためである。実測では8/4の `bot.log` 1560行のうち67回ぶんの接続試行がこれだった。

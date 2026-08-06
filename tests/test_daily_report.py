@@ -5,12 +5,13 @@
 実際のログ行と同じ書式の文字列で押さえる。
 """
 
-from datetime import date, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from execution.trade_journal import TradeRecord
 from scripts.daily_report import (
     build_day_report,
     format_report,
+    last_closed_trading_day,
     latest_trading_day,
     parse_log_lines,
 )
@@ -207,3 +208,39 @@ def test_malformed_lines_are_skipped_without_raising():
 
 def test_latest_trading_day_is_none_for_an_empty_log():
     assert latest_trading_day([]) is None
+
+
+# --- 起動しなかった日を見逃さないための判定 ------------------------------------------
+
+# `latest_trading_day` はログに書かれている最新の取引日しか返さないため、
+# 起動しなかった日は前日のサマリがそのまま出て正常な日と区別できない。
+# 2026-08-06に launchd の起動ジョブが disabled になっていたのを取りこぼした穴。
+
+US_EASTERN_TZ = timezone(timedelta(hours=-4))  # 夏時間のET
+
+
+def _et(year, month, day, hour, minute=0):
+    return datetime(year, month, day, hour, minute, tzinfo=US_EASTERN_TZ)
+
+
+def test_last_closed_trading_day_waits_for_the_close():
+    """引け前は当日を『引けた日』に数えないこと。
+
+    数えると、まだ動いている最中のセッションを『ログが無い＝起動していない』と
+    誤警告する。
+    """
+    # 2026-08-06(木) の 15:00 ET はまだ場中。
+    assert last_closed_trading_day(_et(2026, 8, 6, 15)) == date(2026, 8, 5)
+    assert last_closed_trading_day(_et(2026, 8, 6, 17)) == date(2026, 8, 6)
+
+
+def test_last_closed_trading_day_skips_weekends():
+    """土日は取引日として数えないこと（引け後ジョブは日本時間の朝に走る）。"""
+    # 2026-08-08(土) / 09(日) から見た直近の引けた日は 07(金)。
+    assert last_closed_trading_day(_et(2026, 8, 8, 17)) == date(2026, 8, 7)
+    assert last_closed_trading_day(_et(2026, 8, 9, 17)) == date(2026, 8, 7)
+
+
+def test_last_closed_trading_day_skips_holidays():
+    """休場日を数えないこと。2026-01-01(元日)は休場。"""
+    assert last_closed_trading_day(_et(2026, 1, 1, 17)) == date(2025, 12, 31)

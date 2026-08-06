@@ -25,13 +25,16 @@ import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime, tzinfo
+from datetime import date, datetime, timedelta, tzinfo
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
-from core.market_hours import US_EASTERN
+from core.market_hours import MARKET_CLOSE, US_EASTERN, is_us_market_holiday
 from execution.trade_journal import DEFAULT_JOURNAL_PATH, TradeJournal, TradeRecord
 
 DEFAULT_LOG_PATH: str = "logs/bot.log"
+
+# 直近の取引日を遡って探すときの上限（日）。年末年始の連休でも足りる長さ。
+_MAX_LOOKBACK_DAYS: int = 10
 
 # `core.logging_setup.LOG_FORMAT` が出す1行。この形に合わない行（例外の
 # スタックトレース等）は本文の続きなので、直前の行の一部として無視する。
@@ -143,6 +146,26 @@ def parse_log_lines(
 def latest_trading_day(log_lines: Iterable[LogLine]) -> Optional[date]:
     days = {line.trading_day for line in log_lines}
     return max(days) if days else None
+
+
+def last_closed_trading_day(now: Optional[datetime] = None) -> date:
+    """すでに引けた直近の米国取引日を返す。
+
+    「ボットがそもそも起動したか」を判定するために使う。`latest_trading_day` は
+    **ログに書かれている**最新の取引日を返すので、起動しなかった日はそのまま
+    前日のサマリが出て、正常な日と見分けがつかない。2026-08-06に launchd の
+    起動ジョブが disabled になっていたのを取りこぼしたのがこの穴である。
+    """
+    reference = (now.astimezone(US_EASTERN) if now is not None else datetime.now(US_EASTERN))
+    candidate = reference.date()
+    # 当日がまだ引けていなければ、直近の「引けた」日は前日以前になる。
+    if reference.time() < MARKET_CLOSE:
+        candidate -= timedelta(days=1)
+    for _ in range(_MAX_LOOKBACK_DAYS):
+        if candidate.weekday() < 5 and not is_us_market_holiday(candidate):
+            return candidate
+        candidate -= timedelta(days=1)
+    return candidate
 
 
 def build_day_report(
@@ -365,6 +388,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     with open(args.log, "r", encoding="utf-8", errors="replace") as f:
         log_lines = list(parse_log_lines(f))
 
+    warning: Optional[str] = None
     if args.date:
         trading_day = date.fromisoformat(args.date)
     else:
@@ -372,9 +396,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         if trading_day is None:
             print(f"解析できるログ行がありません: {args.log}", file=sys.stderr)
             return 1
+        # 起動しなかった日は、ログに行が無いので前日のサマリがそのまま出る。
+        # 正常な日と見分けがつかないため、ここで明示的に警告する。
+        expected = last_closed_trading_day()
+        if trading_day < expected:
+            warning = (
+                f"!!! {expected} のログがありません（最新の記録は {trading_day}）。"
+                "ボットがその日に起動していない可能性があります。\n"
+                "    launchctl list com.user.ibkralgotrade で登録状態を確認すること。"
+            )
 
     trades = TradeJournal(args.journal).load_trades()
     report = build_day_report(log_lines, trades, trading_day)
+    if warning:
+        print(warning)
+        print()
     print(format_report(report))
     return 0
 
