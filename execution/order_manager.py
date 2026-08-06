@@ -72,6 +72,12 @@ MIN_PRICE_INCREMENT_USD: float = 0.01
 # Order Preset が DAY を上書き適用する（Error 10349 として現れる）。
 _RESTING_ORDER_TIF: str = "GTC"
 
+# Order Preset による上書きを警告済みの銘柄。
+# 突き合わせは毎サイクル(300秒)走るため、素朴に出すと1建玉あたり1日78行になり、
+# 「読むべき1行」が埋もれる（「3. 実行環境と設定」のログ方針）。銘柄ごとに
+# 初回だけ出し、上書きが解消した時点で落として次の建玉でまた出せるようにする。
+_TIF_DOWNGRADE_WARNED: set = set()
+
 # 親の約定後、子注文が生きた状態へ移るまで待つ上限（秒）。
 # 送信直後は PendingSubmit で、ブローカーが受理して初めて PreSubmitted/Submitted
 # になる。短すぎると正常な注文を不成立と誤判定して建玉を決済してしまう。
@@ -852,6 +858,38 @@ class RestingExitProtection:
         return self.has_filled_exit or _RESTING_EXIT_ORDER_TYPES <= self.live_order_types
 
 
+def _warn_about_tif_downgrades(downgraded: Dict[str, set]) -> None:
+    """待機注文の有効期間が `GTC` 以外へ書き換えられていたら記録する。
+
+    **コードで `tif='GTC'` を明示しても、IB Gateway の Order Preset がそれを
+    上書きする**（`Error 10349`。2026-08-06のログでは板に置かれた子注文が
+    実際に `tif='DAY'` だった）。上書きは注文を拒否しないので発注は成功し、
+    こちらの `Order` オブジェクトは送信時の `GTC` を保持したままになる。
+    **つまりブローカーから読み直さない限り、この縮退はどこにも現れない。**
+
+    DAY のまま持ち越すと待機注文が引けで失効し、翌日の寄り付きまで損切りの
+    無い時間ができる。毎サイクルの突き合わせが翌日には置き直すが、
+    **夜間の穴は埋まらない**ため、防御ではなく検知としてここに置く。
+
+    直せるのは Gateway の Global Configuration → Presets だけなので、
+    案内はその1点に絞る。
+    """
+    for symbol in sorted(set(_TIF_DOWNGRADE_WARNED) - set(downgraded)):
+        _TIF_DOWNGRADE_WARNED.discard(symbol)
+
+    for symbol, tifs in sorted(downgraded.items()):
+        if symbol in _TIF_DOWNGRADE_WARNED:
+            continue
+        _TIF_DOWNGRADE_WARNED.add(symbol)
+        logger.warning(
+            "[%s] 待機注文の有効期間が %s になっています（%s で発注したはずのもの）。"
+            "IB Gateway の Order Preset による上書きで、引けで失効するため"
+            "翌朝まで損切りの無い時間ができます。"
+            "Global Configuration → Presets → Stocks の Time in Force を GTC にしてください。",
+            symbol, "/".join(sorted(tifs)), _RESTING_ORDER_TIF,
+        )
+
+
 async def find_resting_exit_protection_async(ib: IB) -> Dict[str, RestingExitProtection]:
     """銘柄ごとに、待機決済注文がブローカー側でどう置かれているかを返す。
 
@@ -865,6 +903,7 @@ async def find_resting_exit_protection_async(ib: IB) -> Dict[str, RestingExitPro
 
     live: Dict[str, set] = {}
     filled: set = set()
+    downgraded: Dict[str, set] = {}
     for trade in trades:
         symbol = getattr(trade.contract, "symbol", "")
         if not _is_resting_exit_order(trade, symbol):
@@ -874,6 +913,11 @@ async def find_resting_exit_protection_async(ib: IB) -> Dict[str, RestingExitPro
             filled.add(symbol)
         elif status in _LIVE_ORDER_STATUSES:
             live.setdefault(symbol, set()).add(trade.order.orderType)
+            tif = getattr(trade.order, "tif", "") or ""
+            if tif and tif != _RESTING_ORDER_TIF:
+                downgraded.setdefault(symbol, set()).add(tif)
+
+    _warn_about_tif_downgrades(downgraded)
 
     return {
         symbol: RestingExitProtection(

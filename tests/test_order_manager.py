@@ -1,11 +1,13 @@
 """execution/order_manager.py の単体テスト（IB呼び出しはすべてモック化）。"""
 
 import asyncio
+import logging
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from execution import order_manager
 from execution.order_manager import (
     MAX_ORDER_NOTIONAL_USD,
     MAX_ORDER_PRICE_DEVIATION_PCT,
@@ -355,7 +357,7 @@ def _real_orders_enabled():
 
 def _make_trade(status: str = "Filled", avg_fill_price: float = 100.0, commission: float = 0.35,
                 order_id: int = 42, order_type: str = "MKT", oca_group=None,
-                symbol: str = "AAPL", action: str = "SELL"):
+                symbol: str = "AAPL", action: str = "SELL", tif: str = "GTC"):
     trade = MagicMock()
     trade.isDone = MagicMock(return_value=True)
     trade.orderStatus.status = status
@@ -367,6 +369,7 @@ def _make_trade(status: str = "Filled", avg_fill_price: float = 100.0, commissio
     trade.order.orderType = order_type
     trade.order.ocaGroup = oca_group
     trade.order.action = action
+    trade.order.tif = tif
     trade.contract.symbol = symbol
     return trade
 
@@ -872,3 +875,57 @@ def test_a_filled_resting_exit_counts_as_complete() -> None:
     )
 
     assert asyncio.run(find_resting_exit_protection_async(ib))["AAPL"].is_complete is True
+
+
+def test_a_resting_order_downgraded_to_day_is_reported(caplog) -> None:
+    """有効期間がGTC以外へ書き換えられていたら記録すること。
+
+    Order Preset による上書きは注文を拒否しないため発注は成功し、こちら側の
+    Order は送信時のGTCを保持したままになる。ブローカーから読み直したこの経路
+    以外に気付く手段が無い（2026-08-06のログで tif='DAY' として実測）。
+    """
+    ib = MagicMock()
+    ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[
+        _make_trade(status="Submitted", order_type="STP", tif="DAY"),
+        _make_trade(status="Submitted", order_type="LMT", tif="DAY"),
+    ])
+
+    order_manager._TIF_DOWNGRADE_WARNED.clear()
+    with caplog.at_level(logging.WARNING):
+        protection = asyncio.run(find_resting_exit_protection_async(ib))
+
+    # 上書きされていても、注文自体は板に置かれている（保護そのものは成立する）。
+    assert protection["AAPL"].is_complete is True
+    assert "DAY" in caplog.text and "Presets" in caplog.text
+
+
+def test_the_tif_downgrade_is_reported_once_per_position(caplog) -> None:
+    """毎サイクル出さないこと。
+
+    突き合わせは300秒ごとに走るため、素朴に出すと1建玉あたり1日78行になり、
+    切り分けに使う行が埋もれる。解消したら落として次の建玉でまた出せること。
+    """
+    ib = MagicMock()
+    ib.reqAllOpenOrdersAsync = AsyncMock(
+        return_value=[_make_trade(status="Submitted", order_type="STP", tif="DAY")]
+    )
+
+    order_manager._TIF_DOWNGRADE_WARNED.clear()
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(find_resting_exit_protection_async(ib))
+        first = caplog.text.count("Presets")
+        asyncio.run(find_resting_exit_protection_async(ib))
+        assert caplog.text.count("Presets") == first == 1
+
+        # GTCへ直ったサイクルを挟むと、次の上書きはまた記録される。
+        ib.reqAllOpenOrdersAsync = AsyncMock(
+            return_value=[_make_trade(status="Submitted", order_type="STP", tif="GTC")]
+        )
+        asyncio.run(find_resting_exit_protection_async(ib))
+        assert caplog.text.count("Presets") == 1
+
+        ib.reqAllOpenOrdersAsync = AsyncMock(
+            return_value=[_make_trade(status="Submitted", order_type="STP", tif="DAY")]
+        )
+        asyncio.run(find_resting_exit_protection_async(ib))
+        assert caplog.text.count("Presets") == 2
