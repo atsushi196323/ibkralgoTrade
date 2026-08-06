@@ -1113,7 +1113,7 @@ def test_successful_screening_is_not_repeated_within_the_day() -> None:
 def test_screening_retry_waits_for_the_retry_interval() -> None:
     """再試行は毎サイクルではないこと。
 
-    購読権限が無い口座では失敗が復旧しないため、毎サイクル(180秒)叩くと
+    購読権限が無い口座では失敗が復旧しないため、毎サイクル(300秒)叩くと
     一日中スキャナー要求とログを出し続けることになる。
     """
     start = datetime(2026, 8, 4, 10, 0, tzinfo=US_EASTERN)
@@ -2232,7 +2232,7 @@ def test_rejected_entry_order_does_not_create_a_local_position(trade_journal) ->
 def test_real_exit_uses_the_broker_fill_and_records_round_trip_commission(trade_journal) -> None:
     """実発注時は待機注文の実約定で決済を記録すること。
 
-    ドライランの推定（観測した現在値が待機注文の値段に届いたか）は180秒ごとの
+    ドライランの推定（観測した現在値が待機注文の値段に届いたか）は300秒ごとの
     1点しか見ないため、ザラ場で逆指値に触れて戻した動きを取りこぼす。
     """
     ib = MagicMock()

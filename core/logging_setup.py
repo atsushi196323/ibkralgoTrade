@@ -29,7 +29,7 @@ LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 # StreamHandlerと取り違えないよう、名前で判別する。
 CONSOLE_HANDLER_NAME: str = "ibkralgotrade-console"
 
-# 1ファイル10MB × 10世代。180秒ポーリングで数ヶ月分が収まる一方、
+# 1ファイル10MB × 10世代。300秒ポーリングで数ヶ月分が収まる一方、
 # ディスクを無制限には食わない量として置いている。
 MAX_BYTES: int = 10 * 1024 * 1024
 BACKUP_COUNT: int = 10

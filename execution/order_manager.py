@@ -55,7 +55,7 @@ _TERMINAL_UNFILLED_STATUSES = frozenset({"Cancelled", "ApiCancelled", "Inactive"
 _LIVE_ORDER_STATUSES = frozenset({"PreSubmitted", "Submitted", _STATUS_FILLED})
 
 # 米国株の呼値。**丸めずに送ると注文が拒否される。**
-# 2026-08-05のペーパー検証で、損切り 67.55×0.95 = 63.1750 がそのまま送られ、
+# 2026-08-05のペーパー検証で、損切り 66.50×0.95 = 63.1750 がそのまま送られ、
 # IBKRが `Warning 110（指定価格がこのコントラクトの呼値と一致しません）` を返して
 # 逆指値だけが不成立になった。利確(73.15)はたまたま2桁だったため通り、
 # **損切りの無い建玉が残った**。ib_insyncは110を警告としてしか通知せず、
@@ -889,7 +889,7 @@ def find_filled_resting_exit(ib: IB, symbol: str) -> Optional[RestingOrderFill]:
 
     実発注時の決済検知はこちらを使う。ドライラン中は観測した現在値から
     推定するしかないが（`strategy.exit_signal.detect_resting_order_exit`）、
-    それは180秒ごとの1点しか見ないため、バーの中で逆指値に触れて戻した
+    それは300秒ごとの1点しか見ないため、バーの中で逆指値に触れて戻した
     動きを取りこぼす。実際の約定が取れるならその推定は要らない。
     """
     if not symbol:
