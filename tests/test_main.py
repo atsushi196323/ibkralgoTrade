@@ -1185,17 +1185,28 @@ def test_poll_interval_keeps_watchlist_within_ibkr_pacing_limit() -> None:
     assert requests_per_10min <= 60
 
 
-def test_fallback_watchlist_stays_within_the_monitoring_cap() -> None:
-    """固定ウォッチリストがMAX_WATCHLIST_SIZEを超えないこと。
-
-    _refresh_watchlist_asyncのフォールバック経路は株価帯で絞るだけで
-    件数の切り詰めを行わない（スクリーニング経路だけが上位N件に絞る）。
-    そのためこのリストの件数がそのまま監視枠になり、増やすと上の
-    ペーシング不変条件を黙って割る。
-    """
-    assert len(WATCHLIST) <= MAX_WATCHLIST_SIZE
-
+def test_fallback_watchlist_has_no_duplicates() -> None:
     assert len(set(WATCHLIST)) == len(WATCHLIST), "重複した銘柄が監視枠を二重に消費します。"
+
+
+def test_fallback_watchlist_is_truncated_to_the_monitoring_cap() -> None:
+    """フォールバック経路も MAX_WATCHLIST_SIZE で切り詰めること。
+
+    株価帯を通る件数は株価しだいで日々変わるため、固定リストの長さだけでは
+    上のペーシング不変条件を保証できない。切り詰めが無いと、帯を通る銘柄が
+    増えた日に黙って制限を割る。
+
+    切り詰める順序は記載順である（成績を見て決めた順ではない）。
+    """
+    ib = MagicMock()
+    symbols = [f"SYM{i:02d}" for i in range(MAX_WATCHLIST_SIZE + 5)]
+
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
+        _fallback_prices({symbol: 100.0 for symbol in symbols}):
+        result = asyncio.run(_refresh_watchlist_async(ib, symbols, account_equity=1220.0))
+
+    assert result.symbols == symbols[:MAX_WATCHLIST_SIZE]
+    assert result.screened is False
 
 
 def test_daily_bars_are_fetched_once_per_symbol_across_cycles(trade_journal) -> None:
