@@ -151,8 +151,19 @@
 
 | ジョブ | 日本時間 | 内容 |
 | --- | --- | --- |
-| `com.user.ibkralgotrade` | 22:15 | Botを起動（寄り付き22:30の15分前に接続を確立しておく） |
-| `com.user.ibkralgotrade.afterclose` | 06:05 | `scripts/after_close.sh`（Bot停止 → 売買代金ランキング記録 → 稼働サマリ） |
+| `com.user.ibkralgotrade` | **月〜金** 22:15 | `scripts/start_bot.sh`（祝日判定 → Botを起動。寄り付き22:30の15分前に接続を確立しておく） |
+| `com.user.ibkralgotrade.afterclose` | **火〜土** 06:05 | `scripts/after_close.sh`（Bot停止 → 祝日判定 → 売買代金ランキング記録 → 稼働サマリ） |
+
+**2本の曜日は1日ずれる。** 金曜22:15に起動したセッションを閉じるのは土曜06:05のジョブなので、締め側を月〜金にすると**金曜のセッションが停止されず週末まで走り続ける**。日曜・月曜の06:05を外しているのは、それぞれ土曜・日曜の引け後にあたり取引が無いためである。
+
+**祝日はlaunchdでは表現できない。** `StartCalendarInterval` が持つキーは `Minute` / `Hour` / `Day` / `Weekday` / `Month` だけで、除外の仕組みも祝日カレンダーも無い。そのため判定は起動直前に行う（`scripts/is_us_trading_day.py` → `core/market_hours.is_us_trading_day`。基準は**米国東部時間の今日**で、22:15 JST も 06:05 JST もこれで対象の取引日と一致する）。
+
+- **起動側を止める理由は稼働ログである。** 祝日に起動しても `is_regular_trading_hours()` が時間外と判定して待機するだけで実害は無いが、7時間ぶんの待機ログとGatewayへの接続試行が積まれ、翌朝のサマリが「なぜ1件も建たなかったのか」を読む用途に使えなくなる
+- **締め側でランキングを記録しない理由はより実害が大きい。** yfinanceが返す最終終値は前営業日のもので、それを休場日の日付で記録すると**同じ順位の日が2日ぶん履歴に入り**、直近10取引日の中央値が引きずられて翌日の急上昇判定がずれる（`RankHistoryStore` は日付が違えば別の日として追記する）
+- **Botの停止は休場日でも行う。** 手動で起動したものが残っていれば止める必要があり、止め損ねると翌日のログに混ざる
+- `tests/test_market_hours.py` の `test_is_us_trading_day_rejects_weekends_and_holidays` が番人（振替休場を含め、移動祝日の計算は `holidays` パッケージへ委譲している）
+
+**曜日を絞っても、その時刻にMacがスリープしていれば起動しない。** launchdは睡眠中の予定時刻を飛ばし、復帰時に遅れて1回だけ実行するため、寄り付き後に起動してその日の最初のスクリーニングを落とす。plistの `caffeinate` は**ジョブが動き始めてからの**スリープしか抑止しない。自動起床（`sudo pmset repeat wakeorpoweron MTWRF 22:10:00`）が要る。**これはmacOSで運用することに固有の制約で、VPSへ移せば消える**（systemdなら `OnCalendar=Mon..Fri 22:15` の1行で、祝日判定は同じラッパーがそのまま使える）。
 
 **引け後のサマリは「その取引日のログが存在するか」も判定する**（`scripts/daily_report.last_closed_trading_day`）。`--date` を省略したときの対象日は**ログに書かれている最新の取引日**なので、ボットが起動しなかった日は前日のサマリがそのまま出て、正常な日と区別がつかない。2026-08-06に `com.user.ibkralgotrade` が launchd 側で `disabled` になっていたのを取りこぼしたのがこの穴である（plistは存在するのに `launchctl list` に無い状態で、ファイルを見るだけでは気付けない）。直近の引けた取引日より古ければ、サマリの先頭に警告と確認コマンドを出す。
 
@@ -220,6 +231,8 @@ scripts/
   fetch_bars.py             検証用の日足をCSVへ保存する（yfinance、IBKR接続不要）
   rank_turnover.py          売買代金ランキングの日次記録（yfinance、観測専用）
   daily_report.py           1取引日の稼働サマリ（bot.log + trade_journal.csv を読む）
+  is_us_trading_day.py      その日が米国の取引日かを終了コードで返す（launchdの祝日判定用）
+  start_bot.sh              Botの起動（祝日なら起動しない。launchdが平日22:15に呼ぶ）
   after_close.sh            引け後の締め（Bot停止 → ランキング記録 → サマリ出力）
   export_tax_report.py      確定申告用CSVを出力するCLI
 tests/                      単体テスト。IBKRへの実接続は不要（すべてモック）
@@ -1060,8 +1073,12 @@ python -m backtest.run --csv bars/RIVN.csv --step-bars 315 --min-trades 1  # 旧
 python -m scripts.daily_report                  # ログ内の直近の取引日
 python -m scripts.daily_report --date 2026-08-04
 
-# 引け後の締め（launchdが日本時間06:05に呼ぶ。手動でも叩ける）
+# 引け後の締め（launchdが日本時間の火〜土06:05に呼ぶ。手動でも叩ける）
 bash scripts/after_close.sh
+
+# その日が米国の取引日か（launchdが祝日を表現できないための判定。0=取引日 / 1=休場）
+python -m scripts.is_us_trading_day
+python -m scripts.is_us_trading_day --date 2026-11-26
 
 # 売買代金ランキングの観測（yfinance、IBKR接続不要。観測のみで監視リストは変えない）
 python -m scripts.rank_turnover                 # universe.txt を使い logs/ へ記録
