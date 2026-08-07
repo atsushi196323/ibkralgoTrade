@@ -348,6 +348,13 @@ class PositionManager:
                 changed[field] = (recorded, live_price)
                 setattr(position, field, live_price)
 
+        # R倍率の分母は「実際に置いた待機注文の値段」から取る約束になっている
+        # （main._enter_position_async のコメント）。逆指値を板の値へ寄せておいて
+        # 分母を据え置くと、その約束が破れて R が実際に負ったリスクとずれる。
+        # INTCの実測では 92.09 -> 93.38 で、リスクは 4.84 ではなく 3.55 だった。
+        if "stop_price" in changed:
+            position.risk_per_share = max(position.entry_price - position.stop_price, 0.0)
+
         if changed:
             self._save()
         return changed

@@ -2907,6 +2907,9 @@ def test_recorded_resting_prices_are_corrected_to_the_book() -> None:
     position = manager.get_position("AAPL")
     assert position.stop_price == 93.38
     assert position.take_profit_price == 108.12
+    # R倍率の分母も板の逆指値から取り直すこと。据え置くと、板を正としておきながら
+    # Rだけが「置くつもりだった損切り」で残り、実際に負ったリスクとずれる。
+    assert position.risk_per_share == pytest.approx(100.0 - 93.38)
     # ずれを直すだけで、注文そのものは触らない（板は正しく守っている）。
     mock_cancel.assert_not_awaited()
     mock_place.assert_not_awaited()
@@ -2937,6 +2940,8 @@ def test_resting_prices_that_could_not_be_read_are_left_alone() -> None:
 
     position = manager.get_position("AAPL")
     assert position.stop_price == 95.0
+    # 逆指値を触っていないのだからRの分母も動かない。
+    assert position.risk_per_share == 5.0
     assert position.take_profit_price == 110.0
 
 

@@ -478,7 +478,9 @@ IBKR（既定）と CSV（`--csv`）の2通り。`run_backtest` が要求する�
 - 子注文の数量は**親と必ず一致**させる。`MAX_POSITION_SIZE` で数量を丸める場合は、丸めた後の数量でブラケット全体を組むこと
 - ボット側の判断（トレーリング・大引け）で成行決済するときは、**先に待機注文を取り消し、取り消しの確定を待つ**。残すと建玉が無いのに売り注文だけが生き、次にその銘柄を建てた瞬間に意図しない決済が起きる。確定を待たずに成行を重ねると売り超過として拒否される（`Error 201`）
 - **値段は呼値（$0.01）へ丸めてから送る**（`round_to_tick`）。丸めは切り上げ側に倒す（損切りが予定より遠くならない側）
-- **子注文の有効期間は `GTC`**。DAYだと引けで失効し、持ち越すスイングの建玉が翌日の寄り付きまで無防備になる。**ただしコードで `GTC` を明示していても、IB Gateway側のOrder Presetが `DAY` へ上書きする**（`Error 10349`。2026-08-06のログでも板に置かれた子注文は `tif='DAY'` だった）。**これはコードでは直らない——Gatewayの Global Configuration → Presets を直すこと**（設定は `~/Jts/<user>/ibg.xml` に暗号化されて入っており、ファイルからは書き換えられない）。未対応の間は、下の毎サイクルの突き合わせだけが引け後の失効に対する防御になる。
+- **子注文の有効期間は `GTC`**。DAYだと引けで失効し、持ち越すスイングの建玉が翌日の寄り付きまで無防備になる。**ただしコードで `GTC` を明示していても、IB Gateway側のOrder Presetが `DAY` へ上書きする**（`Error 10349`。2026-08-05のログでは板に置かれた子注文が `tif='DAY'` だった）。**これはコードでは直らない——Gatewayの Global Configuration → Presets を直すこと**（設定は `~/Jts/<user>/ibg.xml` に暗号化されて入っており、ファイルからは書き換えられない）。未対応の間は、下の毎サイクルの突き合わせだけが引け後の失効に対する防御になる。
+
+**2026-08-06以降、上書きは観測されていない。** 同日のINTCでは10349が `Order TIF was set to GTC based on order preset` として出ており、読み直した子注文も `tif='GTC'` だった（プリセット側が直っている）。**この節は消さない**——プリセットは設定ひとつで戻りうるうえ、上書きは注文を拒否しないので `_warn_about_tif_downgrades` の行が出ない限り気付けない。
 
   **上書きされたことは、ブローカーから注文を読み直さない限りどこにも現れない。** 上書きは注文を拒否しないので発注は成功し、こちら側の `Order` は送信時の `GTC` を保持したままになる。そのため `find_resting_exit_protection_async` が読み直した `tif` を検査し、`GTC` 以外なら銘柄ごとに1度だけ WARNING を出す（`_warn_about_tif_downgrades`）。**毎サイクル出さないのは、突き合わせが300秒ごとに走り1建玉あたり1日78行になるため**（「3. 実行環境と設定」のログ方針）。解消すれば記録済みの印を落とし、次に上書きされたときは再び出す。`tests/test_order_manager.py` の `test_a_resting_order_downgraded_to_day_is_reported` / `test_the_tif_downgrade_is_reported_once_per_position` が番人
 - **親が約定したら、子注文がブローカー側で生きていることを確認する**（`_ensure_children_are_live_async`）。生きていなければ建玉を成行で決済してから例外にする
@@ -511,7 +513,7 @@ IBKR（既定）と CSV（`--csv`）の2通り。`run_backtest` が要求する�
 
 `tests/test_order_manager.py` の `test_the_reprice_adopts_the_oca_group_ibkr_rewrote` / `test_a_reprice_that_never_reached_the_book_is_recorded_at_the_broker_price` が番人。
 
-**さらに、毎サイクルの突き合わせで値段そのものも照合すること**（`main._adopt_broker_resting_prices`）。**両方が生きていることは、値段が意図どおりであることを意味しない。** 上の10326も呼値違反(`Warning 110`)も、拒否しても元の注文を生かすため、`is_complete` による生存確認だけでは通り抜ける。ずれていたら**板の値を正として記録し直す**——実際に約定するのは板にある注文であって記録ではなく、記録側に寄せるとR倍率が実際に負ったリスクと違う値で残る。読めなかった側は触らない（「確かめられなかった」を「一致した」として扱わないため）。`tests/test_main.py` の `test_recorded_resting_prices_are_corrected_to_the_book` / `test_resting_prices_that_could_not_be_read_are_left_alone` が番人。
+**さらに、毎サイクルの突き合わせで値段そのものも照合すること**（`main._adopt_broker_resting_prices`）。**両方が生きていることは、値段が意図どおりであることを意味しない。** 上の10326も呼値違反(`Warning 110`)も、拒否しても元の注文を生かすため、`is_complete` による生存確認だけでは通り抜ける。ずれていたら**板の値を正として記録し直す**——実際に約定するのは板にある注文であって記録ではなく、記録側に寄せるとR倍率が実際に負ったリスクと違う値で残る。読めなかった側は触らない（「確かめられなかった」を「一致した」として扱わないため）。**逆指値を板の値へ寄せたら、R倍率の分母(`Position.risk_per_share`)も同じ値から取り直すこと。** 分母は「実際に置いた待機注文の値段」から取る約束（`main._enter_position_async`）なので、値段だけ直して据え置くと、板を正としておきながらRだけが「置くつもりだった損切り」で残る。INTCの実測では 92.09 → 93.38 でリスクは 4.84 ではなく 3.55 であり、Rが約36%過小に出る。`tests/test_main.py` の `test_recorded_resting_prices_are_corrected_to_the_book` / `test_resting_prices_that_could_not_be_read_are_left_alone` が番人。
 
 **取り消しは、要求を投げるだけでなくブローカー側で確定するまで待つこと**（`cancel_bracket_orders_async` / `_await_cancellation_async`）。`cancelOrder` は要求を送るだけで、`Cancelled` になるまで注文は板に生きている。同日の決済で実際に起きた並びが以下である。
 
