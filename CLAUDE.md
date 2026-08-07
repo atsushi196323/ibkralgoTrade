@@ -511,6 +511,8 @@ IBKR（既定）と CSV（`--csv`）の2通り。`run_backtest` が要求する�
 
 `tests/test_order_manager.py` の `test_the_reprice_adopts_the_oca_group_ibkr_rewrote` / `test_a_reprice_that_never_reached_the_book_is_recorded_at_the_broker_price` が番人。
 
+**さらに、毎サイクルの突き合わせで値段そのものも照合すること**（`main._adopt_broker_resting_prices`）。**両方が生きていることは、値段が意図どおりであることを意味しない。** 上の10326も呼値違反(`Warning 110`)も、拒否しても元の注文を生かすため、`is_complete` による生存確認だけでは通り抜ける。ずれていたら**板の値を正として記録し直す**——実際に約定するのは板にある注文であって記録ではなく、記録側に寄せるとR倍率が実際に負ったリスクと違う値で残る。読めなかった側は触らない（「確かめられなかった」を「一致した」として扱わないため）。`tests/test_main.py` の `test_recorded_resting_prices_are_corrected_to_the_book` / `test_resting_prices_that_could_not_be_read_are_left_alone` が番人。
+
 **取り消しは、要求を投げるだけでなくブローカー側で確定するまで待つこと**（`cancel_bracket_orders_async` / `_await_cancellation_async`）。`cancelOrder` は要求を送るだけで、`Cancelled` になるまで注文は板に生きている。同日の決済で実際に起きた並びが以下である。
 
 ```

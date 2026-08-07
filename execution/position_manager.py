@@ -320,6 +320,38 @@ class PositionManager:
             self._save()
         return position
 
+    def adopt_broker_resting_prices(
+        self, symbol: str, stop_price: Optional[float], take_profit_price: Optional[float],
+    ) -> Dict[str, tuple]:
+        """待機注文の値段を、ブローカーが実際に持っている値へ合わせる。
+
+        **ブローカー側が正である。** 実際に約定するのは板にある注文であって、
+        こちらの記録ではない。記録がずれたままだと、R倍率が実際に負った
+        リスクと違う値で残り、置き直しの基準にもずれた値段が使われる。
+
+        変わった項目を `{項目名: (記録していた値, 板の値)}` で返す（呼び出し側が
+        記録に残せるように）。読めなかった側(None)は触らない——「確かめられ
+        なかった」ことを「一致した」として扱わないためである。
+        """
+        position = self._positions.get(symbol)
+        if position is None:
+            return {}
+
+        changed: Dict[str, tuple] = {}
+        for field, live_price in (
+            ("stop_price", stop_price), ("take_profit_price", take_profit_price),
+        ):
+            if live_price is None or live_price <= 0:
+                continue
+            recorded = getattr(position, field)
+            if recorded != live_price:
+                changed[field] = (recorded, live_price)
+                setattr(position, field, live_price)
+
+        if changed:
+            self._save()
+        return changed
+
     def close_position(self, symbol: str, now: Optional[datetime] = None) -> Position:
         position = self._positions.pop(symbol, None)
         if position is None:

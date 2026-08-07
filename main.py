@@ -32,6 +32,7 @@ from execution.order_manager import (
     ENABLE_REAL_ORDERS,
     MAX_ORDER_NOTIONAL_USD,
     MAX_POSITION_SIZE,
+    RestingExitProtection,
     cancel_bracket_orders_async,
     ensure_orders_are_paper_only,
     find_filled_resting_exit,
@@ -983,6 +984,7 @@ async def _restore_missing_resting_orders_async(
     for symbol in position_manager.open_symbols():
         state = protection.get(symbol)
         if state is not None and state.is_complete:
+            _adopt_broker_resting_prices(position_manager, symbol, state)
             continue
 
         position = position_manager.get_position(symbol)
@@ -1001,6 +1003,36 @@ async def _restore_missing_resting_orders_async(
         contract = await caches.contracts.get_async(ib, symbol)
         await _restore_resting_exit_orders_async(
             ib, contract, position, reference_price=position.entry_price,
+        )
+
+
+def _adopt_broker_resting_prices(
+    position_manager: PositionManager, symbol: str, state: RestingExitProtection,
+) -> None:
+    """記録している待機注文の値段が板とずれていたら、板の値へ合わせて記録する。
+
+    **生存確認だけでは値段のずれを検出できない。** 修正が拒否されても元の注文は
+    生き続けるため（2026-08-06にINTCで `Error 10326` として実測。置き直しが
+    両方とも拒否され、板は参照価格ベースの 93.38 / 108.12 のまま、
+    `positions.json` には実約定ベースの 92.09 / 106.63 が残った）、
+    両方が「生きている」ことは値段が意図どおりであることを意味しない。
+
+    ずれを見つけたら板の値を正とする。実際に約定するのは板にある注文であり、
+    ここで記録側に寄せると、R倍率が実際に負ったリスクと違う値で残る。
+    """
+    if state.has_filled_exit:
+        # 約定済み＝建玉はもう閉じている。この後の決済処理が実約定を読むので、
+        # ここで値段を触っても意味が無い。
+        return
+
+    changed = position_manager.adopt_broker_resting_prices(
+        symbol, state.stop_price, state.take_profit_price,
+    )
+    for field, (recorded, live_price) in sorted(changed.items()):
+        logger.warning(
+            "[%s] 待機注文の %s が記録(%.2f)と板(%.2f)でずれています。"
+            "実際に約定するのは板の注文なので、板の値段で記録し直しました。",
+            symbol, field, recorded, live_price,
         )
 
 

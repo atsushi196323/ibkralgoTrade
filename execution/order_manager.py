@@ -933,6 +933,11 @@ class RestingExitProtection:
     # 待機注文の**約定**が観測できたか。約定していれば建玉はもう閉じており、
     # OCAの相方もIBKR側が取り消す。置き直しの対象にしてはならない。
     has_filled_exit: bool
+    # 板に実際に置かれている値段。**ローカルの記録と一致する保証は無い。**
+    # 修正が拒否されても元の注文は生き続けるため（`Error 10326` / `Warning 110`）、
+    # 生存確認だけでは値段のずれを検出できない。読めなかった側は None。
+    stop_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
 
     @property
     def is_complete(self) -> bool:
@@ -992,6 +997,7 @@ async def find_resting_exit_protection_async(ib: IB) -> Dict[str, RestingExitPro
     live: Dict[str, set] = {}
     filled: set = set()
     downgraded: Dict[str, set] = {}
+    prices: Dict[str, Dict[str, float]] = {}
     for trade in trades:
         symbol = getattr(trade.contract, "symbol", "")
         if not _is_resting_exit_order(trade, symbol):
@@ -1000,10 +1006,15 @@ async def find_resting_exit_protection_async(ib: IB) -> Dict[str, RestingExitPro
         if status == _STATUS_FILLED:
             filled.add(symbol)
         elif status in _LIVE_ORDER_STATUSES:
-            live.setdefault(symbol, set()).add(trade.order.orderType)
-            tif = getattr(trade.order, "tif", "") or ""
+            order = trade.order
+            live.setdefault(symbol, set()).add(order.orderType)
+            tif = getattr(order, "tif", "") or ""
             if tif and tif != _RESTING_ORDER_TIF:
                 downgraded.setdefault(symbol, set()).add(tif)
+            if order.orderType == "STP":
+                prices.setdefault(symbol, {})["stop"] = float(order.auxPrice)
+            elif order.orderType == "LMT":
+                prices.setdefault(symbol, {})["take_profit"] = float(order.lmtPrice)
 
     _warn_about_tif_downgrades(downgraded)
 
@@ -1011,6 +1022,8 @@ async def find_resting_exit_protection_async(ib: IB) -> Dict[str, RestingExitPro
         symbol: RestingExitProtection(
             live_order_types=frozenset(live.get(symbol, ())),
             has_filled_exit=symbol in filled,
+            stop_price=prices.get(symbol, {}).get("stop"),
+            take_profit_price=prices.get(symbol, {}).get("take_profit"),
         )
         for symbol in set(live) | filled
     }

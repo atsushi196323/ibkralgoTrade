@@ -2839,10 +2839,13 @@ def test_sigterm_is_converted_to_keyboard_interrupt():
 # --- 建玉と待機注文の突き合わせ ------------------------------------------------------
 
 
-def _protection(live=(), filled=False):
+def _protection(live=(), filled=False, stop_price=None, take_profit_price=None):
     from execution.order_manager import RestingExitProtection
 
-    return RestingExitProtection(live_order_types=frozenset(live), has_filled_exit=filled)
+    return RestingExitProtection(
+        live_order_types=frozenset(live), has_filled_exit=filled,
+        stop_price=stop_price, take_profit_price=take_profit_price,
+    )
 
 
 def _position_manager_with_one_open_position() -> PositionManager:
@@ -2873,6 +2876,68 @@ def test_restore_skips_symbols_whose_bracket_is_fully_live() -> None:
 
     mock_cancel.assert_not_awaited()
     mock_place.assert_not_awaited()
+
+
+def test_recorded_resting_prices_are_corrected_to_the_book() -> None:
+    """記録している待機注文の値段が板とずれていたら、板の値へ直すこと。
+
+    **両方が生きていることは、値段が意図どおりであることを意味しない。**
+    修正が拒否されても元の注文は生き続けるため（2026-08-06にINTCで
+    `Error 10326` として実測。置き直しが両方とも拒否され、板は参照価格ベースの
+    まま、positions.json には実約定ベースの値段が残った）、生存確認だけでは
+    このずれを毎サイクル見逃す。実際に約定するのは板の注文なので板を正とする。
+    """
+    ib = MagicMock()
+    manager = _position_manager_with_one_open_position()
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch(
+            "main.find_resting_exit_protection_async",
+            new=AsyncMock(return_value={"AAPL": _protection(
+                live=("STP", "LMT"), stop_price=93.38, take_profit_price=108.12,
+            )}),
+        ), \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()) as mock_cancel, \
+        patch("main.place_resting_exit_orders_async", new=AsyncMock()) as mock_place:
+
+        asyncio.run(main_module._restore_missing_resting_orders_async(
+            ib, manager, main_module.MarketDataCaches(),
+        ))
+
+    position = manager.get_position("AAPL")
+    assert position.stop_price == 93.38
+    assert position.take_profit_price == 108.12
+    # ずれを直すだけで、注文そのものは触らない（板は正しく守っている）。
+    mock_cancel.assert_not_awaited()
+    mock_place.assert_not_awaited()
+
+
+def test_resting_prices_that_could_not_be_read_are_left_alone() -> None:
+    """板の値段が読めなかった側は記録を触らないこと。
+
+    「確かめられなかった」ことを「一致した」としても「ずれた」としても
+    ならない。読めない側を0や推定値で上書きすると、損切りの基準が静かに壊れる。
+    """
+    ib = MagicMock()
+    manager = _position_manager_with_one_open_position()
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch(
+            "main.find_resting_exit_protection_async",
+            new=AsyncMock(return_value={"AAPL": _protection(
+                live=("STP", "LMT"), stop_price=None, take_profit_price=None,
+            )}),
+        ), \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()), \
+        patch("main.place_resting_exit_orders_async", new=AsyncMock()):
+
+        asyncio.run(main_module._restore_missing_resting_orders_async(
+            ib, manager, main_module.MarketDataCaches(),
+        ))
+
+    position = manager.get_position("AAPL")
+    assert position.stop_price == 95.0
+    assert position.take_profit_price == 110.0
 
 
 def test_restore_places_the_bracket_again_when_nothing_is_live() -> None:
