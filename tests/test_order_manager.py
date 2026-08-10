@@ -808,6 +808,88 @@ def test_the_reprice_adopts_the_oca_group_ibkr_rewrote() -> None:
     assert [order.ocaGroup for order in repriced] == ["267089215", "267089215"]
 
 
+def test_the_reprice_waits_for_ibkr_to_rewrite_the_oca_group() -> None:
+    """書き換えは親の約定より後に届くので、届くまで待ってから修正を送ること。
+
+    親の約定直後に一度読むだけだと、まだこちらが送った名前のままの子注文が返り、
+    取り込みが空振りして修正が 10326 で拒否される。2026-08-06(INTC)・
+    2026-08-10(UPS) の2回とも実際にこれで置き直しが不発になり、待機注文が
+    参照価格ベースの位置に残った（UPSは実約定104.06に対し損切り98.69 = -5.16%）。
+    """
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(avg_fill_price=67.44), _make_trade(order_type="STP"),
+        _make_trade(order_type="LMT"), _make_trade(), _make_trade(),
+    ])
+
+    rewrite_arrived = {"yet": False}
+
+    async def _no_sleep(_seconds: float) -> None:
+        # 待った後にはじめて書き換えが読めるようになる、という実機の順序を再現する。
+        rewrite_arrived["yet"] = True
+
+    async def _read_open_orders():
+        if rewrite_arrived["yet"]:
+            return [
+                _resting_trade("STP", 64.07, perm_id=501, oca_group="267089215"),
+                _resting_trade("LMT", 74.19, perm_id=502, oca_group="267089215"),
+            ]
+        # 送信時の名前のまま。子注文のOrderは placeOrder に渡した実体そのもの。
+        sent_group = ib.placeOrder.call_args_list[1].args[1].ocaGroup
+        return [
+            _resting_trade("STP", 63.18, perm_id=501, oca_group=sent_group),
+            _resting_trade("LMT", 73.15, perm_id=502, oca_group=sent_group),
+        ]
+
+    ib.reqAllOpenOrdersAsync = AsyncMock(side_effect=_read_open_orders)
+
+    with _real_orders_enabled(), \
+            patch("execution.order_manager.asyncio.sleep", new=_no_sleep):
+        result = asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AMBQ"), quantity=3,
+            stop_price=66.5 * 0.95, take_profit_price=66.5 * 1.10, reference_price=66.5,
+        ))
+
+    repriced = [call.args[1] for call in ib.placeOrder.call_args_list[3:]]
+    assert [order.ocaGroup for order in repriced] == ["267089215", "267089215"]
+    # 待って取り込めた結果、実約定ベースの値段が板に載っていること。
+    assert result.stop_price == pytest.approx(64.07, abs=0.01)
+    assert result.take_profit_price == pytest.approx(74.19, abs=0.01)
+
+
+def test_the_reprice_gives_up_waiting_for_the_oca_rewrite_instead_of_hanging() -> None:
+    """書き換えが読めないまま上限に達したら、待ち続けずに先へ進むこと。
+
+    修正が拒否される可能性は残るが、それは読み直しの検証が捕まえる。ここで
+    無限に待つと、建玉ができた直後のサイクルが返らなくなる。
+    """
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(avg_fill_price=67.44), _make_trade(order_type="STP"),
+        _make_trade(order_type="LMT"), _make_trade(), _make_trade(),
+    ])
+
+    async def _read_open_orders():
+        sent_group = ib.placeOrder.call_args_list[1].args[1].ocaGroup
+        return [
+            _resting_trade("STP", 63.18, perm_id=501, oca_group=sent_group),
+            _resting_trade("LMT", 73.15, perm_id=502, oca_group=sent_group),
+        ]
+
+    ib.reqAllOpenOrdersAsync = AsyncMock(side_effect=_read_open_orders)
+
+    with _real_orders_enabled(), \
+            patch("execution.order_manager._OCA_GROUP_REWRITE_TIMEOUT_SECONDS", 0.0):
+        result = asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AMBQ"), quantity=3,
+            stop_price=66.5 * 0.95, take_profit_price=66.5 * 1.10, reference_price=66.5,
+        ))
+
+    # 板に残った値段を記録すること（要求した64.07/74.19ではない）。
+    assert result.stop_price == pytest.approx(63.18, abs=0.01)
+    assert result.take_profit_price == pytest.approx(73.15, abs=0.01)
+
+
 def test_a_reprice_that_never_reached_the_book_is_recorded_at_the_broker_price() -> None:
     """修正が板に届かなかったら、要求した値段ではなく板の値段を記録すること。
 

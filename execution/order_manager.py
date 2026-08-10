@@ -408,6 +408,11 @@ _OCA_GROUP_PREFIX: str = "BRACKET"
 # OCAグループの取り消し方式。2 = 「約定した分だけ残りを減らす（オーバーフィル抑制あり）」。
 # 1(即時取り消し)より約定の重複が起きにくいIBKRの推奨値。
 _OCA_TYPE_REDUCE_WITH_OVERFILL_PROTECTION: int = 2
+# IBKRが子注文のOCAグループ名を親のpermIdへ書き換えるのを待つ上限。
+# 実測(2026-08-10 UPS)では親の約定から3秒後に読んでもまだ書き換わっておらず、
+# 取り込みが空振りして置き直しが 10326 で拒否された。約定直後の一度きりの
+# 読み取りでは足りない（`_adopt_broker_oca_group_async`）。
+_OCA_GROUP_REWRITE_TIMEOUT_SECONDS: float = 5.0
 
 
 @dataclass
@@ -727,25 +732,58 @@ async def _adopt_broker_oca_group_async(ib: IB, symbol: str, orders: BracketOrde
     permIdで引かないのは、ローカルの `Order` にpermIdが載るのがブローカーからの
     状態更新を受けた後で、置き直しの時点で 0 のままでありうるためである。
     `PositionManager` は1銘柄1建玉なので、STPとLMTはそれぞれ1件に定まる。
-    """
-    try:
-        trades = await ib.reqAllOpenOrdersAsync()
-    except Exception:
-        logger.warning("[%s] OCAグループ名の読み直しに失敗しました。", symbol, exc_info=True)
-        return
 
-    by_order_type = {
-        trade.order.orderType: trade.order
-        for trade in trades
-        if _is_resting_exit_order(trade, symbol)
-    }
-    for child in (orders.stop_loss, orders.take_profit):
-        live_order = by_order_type.get(child.orderType)
-        if live_order is None:
-            continue
-        live_group = getattr(live_order, "ocaGroup", "") or ""
-        if live_group and live_group != child.ocaGroup:
+    **1回読んで終わりにしてはならない。書き換えは親の約定より後に届く。**
+    親が約定した直後に読むと、まだこちらが送った名前のままの子注文が返り、
+    取り込みが空振りして修正が 10326 で拒否される。2026-08-06(INTC)・
+    2026-08-10(UPS) の2回とも、実約定に合わせた置き直しがこれで不発になり、
+    待機注文が参照価格ベースの位置に残った（UPSは実約定104.06に対し損切り
+    98.69 ＝ -5.16%。意図は -5%）。**拒否は警告としてしか見えず、元の注文が
+    生き続けるため、生存確認では気付けない。** 書き換えが届くまで
+    `_OCA_GROUP_REWRITE_TIMEOUT_SECONDS` だけ待つ。
+
+    待ち切れなければ何もせず戻る——修正が拒否される可能性は残るが、それは
+    読み直しの検証(`_read_back_resting_prices_async`)が捕まえる。ここで
+    推測した名前を入れる方が危険である。
+    """
+    children = (orders.stop_loss, orders.take_profit)
+    # 書き換えが届いたかは「こちらが送った名前と違うか」で判定する。取り込んだ
+    # 後の値と比べると、2周目以降に自分が入れた名前を見て「まだ未着」と誤判定する。
+    sent_groups = {child.orderType: child.ocaGroup for child in children}
+
+    waited = 0.0
+    while True:
+        try:
+            trades = await ib.reqAllOpenOrdersAsync()
+        except Exception:
+            logger.warning("[%s] OCAグループ名の読み直しに失敗しました。", symbol, exc_info=True)
+            return
+
+        by_order_type = {
+            trade.order.orderType: trade.order
+            for trade in trades
+            if _is_resting_exit_order(trade, symbol)
+        }
+        rewritten = True
+        for child in children:
+            live_order = by_order_type.get(child.orderType)
+            live_group = getattr(live_order, "ocaGroup", "") or "" if live_order else ""
+            if not live_group or live_group == sent_groups[child.orderType]:
+                rewritten = False
+                continue
             child.ocaGroup = live_group
+
+        if rewritten or waited >= _OCA_GROUP_REWRITE_TIMEOUT_SECONDS:
+            if not rewritten:
+                logger.warning(
+                    "[%s] IBKRによるOCAグループ名の書き換えが %.0f 秒以内に読めませんでした。"
+                    "置き直しが 10326 で拒否される可能性があります。",
+                    symbol, _OCA_GROUP_REWRITE_TIMEOUT_SECONDS,
+                )
+            return
+
+        await asyncio.sleep(_ORDER_STATUS_POLL_INTERVAL_SECONDS)
+        waited += _ORDER_STATUS_POLL_INTERVAL_SECONDS
 
 
 async def _read_back_resting_prices_async(ib: IB, symbol: str) -> tuple:
