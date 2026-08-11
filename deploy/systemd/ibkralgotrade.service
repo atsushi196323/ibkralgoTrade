@@ -1,0 +1,37 @@
+[Unit]
+# 米国市場の寄り付き15分前にBotを起動する（起動時刻はタイマー側）。
+Description=IBKR algo trading bot (US swing)
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ibkralgoTrade
+
+# .env の読み込み(python-dotenvはcwd基準)と logs/ の出力先を
+# リポジトリ直下に固定するため WorkingDirectory は必須。
+#
+# インタープリタの実体を渡すのは、systemdがログインシェルを経由せず
+# PATHにpyenv/venvが入らないため（launchd側と同じ理由）。
+Environment=IBKRALGO_PYTHON=%h/ibkralgoTrade/.venv/bin/python
+
+# main.pyを直接起動せずラッパーを挟むのは、**米国市場の祝日を
+# OnCalendar では表現できない**ためである。除外の仕組みも祝日カレンダーも
+# 無いので、判定は起動直前に scripts/start_bot.sh が行い、休場日は
+# プロセスを起こさない（休場日に起動しても実害は無いが、7時間ぶんの
+# 待機ログとGatewayへの接続試行が積まれ、翌朝のサマリが読めなくなる）。
+ExecStart=/bin/bash %h/ibkralgoTrade/scripts/start_bot.sh
+
+# 停止は after_close.sh が systemctl stop で行う。既定の KillMode=control-group
+# により SIGTERM が main.py へ届き、_raise_keyboard_interrupt_on_sigterm が
+# KeyboardInterrupt へ変換して disconnect_async() まで通す。
+# disconnect に余裕を持たせるため、SIGKILLまでの猶予を既定より延ばす。
+TimeoutStopSec=30
+
+# 落ちたら再起動するが、間隔を空ける。main.py 自身が ConnectionError を
+# 捕捉して再試行し続ける設計なので、ここで即時再起動を繰り返す必要は無い。
+Restart=on-failure
+RestartSec=60
+
+# configure_logging()が効く前(起動時の例外・依存関係の解決失敗など)は
+# logs/bot.log に残らないため、journal へ出す（journalctl -u で読める）。
+StandardOutput=journal
+StandardError=journal

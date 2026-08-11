@@ -1,0 +1,31 @@
+[Unit]
+Description=Start the IBKR bot on US trading weekdays (22:15 JST)
+
+[Timer]
+# 日本時間22:15 = 米国東部夏時間09:15。寄り付き(09:30 ET = 22:30 JST)の
+# 15分前に起動し、接続を先に確立しておく。寄り付きと同時刻にすると、
+# Gatewayへの再ログインと起動が重なって最初の数サイクルが接続失敗になり、
+# その日の最初のスクリーニングを落とす。
+# 冬時間(EST)の間は08:15 ETになるが、main.pyが is_regular_trading_hours() で
+# 時間外を弾いて寄り付きまで待機するため実害は無い。
+#
+# **タイムゾーンを明示する。** systemdのOnCalendarは既定でシステムのTZを見るため、
+# VPSがUTCのままだと9時間ずれる。ここに書いておけばシステム設定に依存しない
+# （systemd 252以降。古い環境では末尾のTZ指定を外し、
+#  `sudo timedatectl set-timezone Asia/Tokyo` でシステム側を合わせること）。
+#
+# 曜日は月〜金。締め側(afterclose)は火〜土なので**1日ずれる**——金曜22:15に
+# 起動したセッションを閉じるのは土曜06:05のジョブだからである。
+OnCalendar=Mon..Fri 22:15 Asia/Tokyo
+
+# **落とした回を後から実行しない。** systemdが停止していた間の予定を
+# 復帰時にまとめて実行すると、寄り付きを大きく過ぎた時刻にその日の
+# セッションを始めることになる（macOSのlaunchdでスリープ復帰時に
+# 遅れて起動していた挙動そのもので、VPSへ移す動機の一つがこれである）。
+Persistent=false
+
+# 起動が秒単位で揃う必要は無い一方、遅れは寄り付きを削る。
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,23 @@
+[Unit]
+# 引け後の締め: Bot停止 → 祝日判定 → 売買代金ランキング記録 → 稼働サマリ。
+Description=IBKR algo trading after-close wrap-up
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/ibkralgoTrade
+Environment=IBKRALGO_PYTHON=%h/ibkralgoTrade/.venv/bin/python
+
+# Bot停止に systemctl --user を使うため、ユーザーバスの在り処を渡す。
+# systemd --user 配下では通常設定済みだが、明示しておくと
+# 手で `systemctl --start` した場合にも同じ経路を通る。
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+
+# 出力は logs/after_close.log へ追記する（launchd側と同じ扱い。1日あたり
+# 数十行の要約だけが積まれるためローテーションは置いていない）。
+# logs/ はGit管理外なので、クローン直後は存在しない。リダイレクトは
+# configure_logging() より先に効くため、ここで作っておく。
+ExecStart=/bin/bash -c 'mkdir -p %h/ibkralgoTrade/logs && %h/ibkralgoTrade/scripts/after_close.sh >> %h/ibkralgoTrade/logs/after_close.log 2>&1'
+
+# rank_turnover は yfinance で639銘柄を取得するため20〜30秒かかる。
+# ネットワークが不調な日に無限に待たせない。
+TimeoutStartSec=10min

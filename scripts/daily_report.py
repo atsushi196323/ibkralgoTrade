@@ -21,6 +21,7 @@
 
 import argparse
 import os
+import platform
 import re
 import sys
 from collections import Counter
@@ -511,10 +512,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 正常な日と見分けがつかないため、ここで明示的に警告する。
         expected = last_closed_trading_day()
         if trading_day < expected:
+            # 確認コマンドはスケジューラごとに違う。macOS(launchd)とLinux(systemd)で
+            # 案内を分けるのは、動かない方のコマンドを出すと「登録されていない」のか
+            # 「コマンドが無い」のかを切り分ける手間が増えるため。
+            if platform.system() == "Darwin":
+                how_to_check = (
+                    "    launchctl list com.user.ibkralgotrade で登録状態を確認すること。"
+                )
+            else:
+                how_to_check = (
+                    "    systemctl --user list-timers ibkralgotrade.timer で登録状態を確認すること。"
+                )
             warning = (
                 f"!!! {expected} のログがありません（最新の記録は {trading_day}）。"
                 "ボットがその日に起動していない可能性があります。\n"
-                "    launchctl list com.user.ibkralgotrade で登録状態を確認すること。"
+                f"{how_to_check}"
             )
 
     trades = TradeJournal(args.journal).load_trades()

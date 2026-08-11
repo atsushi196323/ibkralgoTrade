@@ -16,9 +16,10 @@ set -u
 
 cd "$(dirname "$0")/.." || exit 1
 
-# launchdはログインシェルを経由せずPATHにpyenvが入らないため、plistと同じく
+# launchd/systemdはログインシェルを経由せずPATHにpyenvやvenvが入らないため、
 # インタープリタの実体を指す。環境変数で上書きできるようにしてあるのは、
-# 手元で別の環境から叩いて動作を確かめられるようにするため。
+# 手元で別の環境から叩いて動作を確かめられるようにするためと、**Linuxでは
+# パスが違う**ため（VPSでは systemd unit の Environment= で渡す）。
 PYTHON="${IBKRALGO_PYTHON:-/Users/user/.pyenv/versions/3.11.10/bin/python3.11}"
 
 if ! "${PYTHON}" -m scripts.is_us_trading_day; then
@@ -28,8 +29,13 @@ fi
 
 # caffeinateでラップするのは、macOSのアイドルスリープがCPU使用率ではなく
 # ユーザー操作の有無で判定されるため（plist側のコメントに経緯がある）。
+# **Linuxにこの問題は無い**ので挟まない——サーバはスリープしないうえ、
+# caffeinate自体が存在しない。
 #
-# execで置き換えるのは、launchdが監視するプロセスをcaffeinateにするため。
-# このシェルが親のまま残ると、after_close.sh の pkill パターンが
-# 一致しないシェルを残したままcaffeinateだけを落とすことになる。
-exec /usr/bin/caffeinate -i -s -m "${PYTHON}" main.py
+# execで置き換えるのは、launchd/systemdが監視するプロセスをこのシェルではなく
+# 実体にするため。このシェルが親のまま残ると、after_close.sh の pkill パターンが
+# 一致しないシェルを残したまま子だけを落とすことになる。
+if [ "$(uname -s)" = "Darwin" ]; then
+    exec /usr/bin/caffeinate -i -s -m "${PYTHON}" main.py
+fi
+exec "${PYTHON}" main.py

@@ -20,23 +20,35 @@ set -u
 
 cd "$(dirname "$0")/.." || exit 1
 
-# launchdはログインシェルを経由せずPATHにpyenvが入らないため、plistと同じく
+# launchd/systemdはログインシェルを経由せずPATHにpyenvやvenvが入らないため、
 # インタープリタの実体を指す。環境変数で上書きできるようにしてあるのは、
-# 手元で別の環境から叩いて動作を確かめられるようにするため。
+# 手元で別の環境から叩いて動作を確かめられるようにするためと、**Linuxでは
+# パスが違う**ため（VPSでは systemd unit の Environment= で渡す）。
 PYTHON="${IBKRALGO_PYTHON:-/Users/user/.pyenv/versions/3.11.10/bin/python3.11}"
+
+# systemdで動かしている場合のユニット名（VPS運用。deploy/systemd/ を参照）。
+BOT_UNIT="${IBKRALGO_SYSTEMD_UNIT:-ibkralgotrade.service}"
 
 echo "===== after_close: $(date '+%Y-%m-%d %H:%M:%S %Z') ====="
 
-# SIGTERMを使う。main.pyがこれを KeyboardInterrupt へ変換して
-# disconnect_async() まで通す（main._raise_keyboard_interrupt_on_sigterm）。
+# いずれの経路でも **SIGTERM** で止める。main.pyがこれを KeyboardInterrupt へ
+# 変換して disconnect_async() まで通す（main._raise_keyboard_interrupt_on_sigterm）。
 # SIGINTにしないのは、シェルがバックグラウンドで起動した子プロセスの
 # SIGINTを SIG_IGN にする場合があり（実測でcaffeinate配下のsleepが無視した）、
 # 届いても止まらない経路があるため。
 #
+# systemd配下では systemctl から止める。pkillで殺すとユニットが失敗扱いで残り、
+# 翌日の起動時に状態を読み違える。KillMode の既定(control-group)により
+# SIGTERMはmain.pyへ届くので、停止の作法は同じである。
+if command -v systemctl >/dev/null 2>&1 \
+        && systemctl --user is-active --quiet "${BOT_UNIT}" 2>/dev/null; then
+    echo "systemdユニット(${BOT_UNIT})を停止します。"
+    systemctl --user stop "${BOT_UNIT}"
+    echo "Botを停止しました。"
 # パターンはpythonの起動行に合わせる。pgrep -f は引数まで見るので、
-# 同じ行を引数に持つcaffeinate側も一緒に一致して止まる（意図どおり。
+# 同じ行を引数に持つcaffeinate側(macOS)も一緒に一致して止まる（意図どおり。
 # caffeinateはシグナルを子へ中継しないので、python本体を確実に含める必要がある）。
-if pkill -TERM -u "$(id -u)" -f "${PYTHON} main.py"; then
+elif pkill -TERM -u "$(id -u)" -f "${PYTHON} main.py"; then
     echo "Botへ停止シグナルを送りました。"
     for _ in $(seq 1 10); do
         sleep 1

@@ -163,7 +163,13 @@
 - **Botの停止は休場日でも行う。** 手動で起動したものが残っていれば止める必要があり、止め損ねると翌日のログに混ざる
 - `tests/test_market_hours.py` の `test_is_us_trading_day_rejects_weekends_and_holidays` が番人（振替休場を含め、移動祝日の計算は `holidays` パッケージへ委譲している）
 
-**曜日を絞っても、その時刻にMacがスリープしていれば起動しない。** launchdは睡眠中の予定時刻を飛ばし、復帰時に遅れて1回だけ実行するため、寄り付き後に起動してその日の最初のスクリーニングを落とす。plistの `caffeinate` は**ジョブが動き始めてからの**スリープしか抑止しない。自動起床（`sudo pmset repeat wakeorpoweron MTWRF 22:10:00`）が要る。**これはmacOSで運用することに固有の制約で、VPSへ移せば消える**（systemdなら `OnCalendar=Mon..Fri 22:15` の1行で、祝日判定は同じラッパーがそのまま使える）。
+**曜日を絞っても、その時刻にMacがスリープしていれば起動しない。** launchdは睡眠中の予定時刻を飛ばし、復帰時に遅れて1回だけ実行するため、寄り付き後に起動してその日の最初のスクリーニングを落とす。plistの `caffeinate` は**ジョブが動き始めてからの**スリープしか抑止しない。自動起床（`sudo pmset repeat wakeorpoweron MTWRF 22:10:00`）が要る。**これはmacOSで運用することに固有の制約で、VPSへ移せば消える。** 2026-08-10には実際にこれで1取引日を落とした（22:15 JSTにスリープ中で、ジョブは発火しなかった）。
+
+**移行先のunitは `deploy/systemd/` に用意してある**（手順は `deploy/README.md`）。祝日判定は同じ `scripts/start_bot.sh` がそのまま使え、Pythonのコードは無改修で動く。**現在稼働しているのはlaunchd側であり、systemd側はまだデプロイしていない。** 移行時に効いてくる差は次の3点である。
+
+- **`Persistent=false` にしてある。** systemdの既定（`true`）だと、停止していた間の予定を復帰時にまとめて実行する——**launchdがスリープ復帰時に遅れて起動していたのと同じ挙動**で、寄り付きを大きく過ぎてからその日のセッションを始めることになる。移行の動機そのものを打ち消すので戻してはならない
+- **`OnCalendar` にタイムゾーンを明示してある**（`Asia/Tokyo`）。systemdの既定はシステムのTZなので、VPSがUTCのままだと9時間ずれる
+- **`loginctl enable-linger` が要る。** 無いとSSHを切った時点でユーザーのタイマーごと止まる。症状は「毎日何も起きない」で、`scripts/daily_report.py` の「ログがありません」警告が唯一の手掛かりになる
 
 **引け後のサマリは「その取引日のログが存在するか」も判定する**（`scripts/daily_report.last_closed_trading_day`）。`--date` を省略したときの対象日は**ログに書かれている最新の取引日**なので、ボットが起動しなかった日は前日のサマリがそのまま出て、正常な日と区別がつかない。2026-08-06に `com.user.ibkralgotrade` が launchd 側で `disabled` になっていたのを取りこぼしたのがこの穴である（plistは存在するのに `launchctl list` に無い状態で、ファイルを見るだけでは気付けない）。直近の引けた取引日より古ければ、サマリの先頭に警告と確認コマンドを出す。
 
@@ -244,6 +250,7 @@ scripts/
   start_bot.sh              Botの起動（祝日なら起動しない。launchdが平日22:15に呼ぶ）
   after_close.sh            引け後の締め（Bot停止 → ランキング記録 → サマリ出力）
   export_tax_report.py      確定申告用CSVを出力するCLI
+deploy/systemd/             VPS(Linux)運用のsystemd unit。launchdの2本と同じ役割・同じ時刻
 tests/                      単体テスト。IBKRへの実接続は不要（すべてモック）
 conftest.py                 pytest共通設定
 ```
