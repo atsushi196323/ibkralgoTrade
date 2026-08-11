@@ -19,6 +19,31 @@ VPSではこの制約ごと消える。
 | タイムゾーン | `sudo timedatectl set-timezone Asia/Tokyo`（timerにTZを明示してあるので必須ではないが、ログが読みやすい） |
 | パッケージ | `procps`（`pkill`/`pgrep`）。通常は導入済みだが、**無いと `after_close.sh` がBotを止められない** |
 
+**2GBで足りるのは、常駐するプロセスが実質2つだけだからである。** `after_close.sh` は
+ランキング記録(yfinance・639銘柄)の**前にBotを停止する**ため、ピークが重ならない。
+
+| | 常駐する時間帯 | 概算 |
+| --- | --- | --- |
+| IB Gateway（Java + Xvfb） | 常時 | 約1GB |
+| `main.py`（pandas/numpy・監視20銘柄） | 22:15〜06:05 JST | 数百MB |
+| `scripts/rank_turnover`（yfinance） | 06:05に数十秒（Bot停止後） | — |
+
+**ただし2GBちょうどで運用するならスワップを置くこと。** さくらのVPS等の
+最小イメージはスワップ無しで配られることがあり、GatewayのJVMがGC中に一時的に
+膨らむとOOM killerがGatewayを落とす。**落ちてもBot側のログには「接続できない」
+としか出ない**ため、原因に辿り着けない。
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+**クラウド側のファイアウォールで開けるのはSSH(22)だけでよい。** APIポート(4002)も
+VNC(5900)も外へ出さない。**ただしdockerのポート公開は、さくらのVPSのパケット
+フィルタも ufw も迂回する**ため、それらは防御にならない。塞いでいるのは
+compose側の `127.0.0.1` 束縛だけである（下記2.）。
+
 ## 2. IB Gateway の自動ログイン
 
 **IB GatewayはGUIのJavaアプリで、しかも1日1回ログアウトする。** 素で置くと毎日
