@@ -17,6 +17,7 @@ VPSではこの制約ごと消える。
 | メモリ | **2GB以上。** IB Gateway単体で1GB前後使い、これに Python + pandas が乗る |
 | OS | Ubuntu LTS 等。`OnCalendar` のタイムゾーン指定を使うので **systemd 252以降**が望ましい |
 | タイムゾーン | `sudo timedatectl set-timezone Asia/Tokyo`（timerにTZを明示してあるので必須ではないが、ログが読みやすい） |
+| パッケージ | `procps`（`pkill`/`pgrep`）。通常は導入済みだが、**無いと `after_close.sh` がBotを止められない** |
 
 ## 2. IB Gateway の自動ログイン
 

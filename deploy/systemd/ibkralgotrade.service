@@ -2,6 +2,15 @@
 # 米国市場の寄り付き15分前にBotを起動する（起動時刻はタイマー側）。
 Description=IBKR algo trading bot (US swing)
 
+# 失敗が続いたら再試行を打ち切り、failed状態で止まる。
+# start_bot.sh は取引日を判定できなかったとき（インタープリタのパス違い等）に
+# 終了コード1を返すので、Restart=on-failure と組み合わせると**設定を直すまで
+# 60秒ごとに再起動し続ける**。打ち切っておけば `systemctl --user list-units --failed`
+# に残り、journalも1日ぶん埋まらない。市場が閉じている間の接続失敗で
+# main.py が落ちるわけではない（自前で再試行し続ける）ので、この回数で足りる。
+StartLimitIntervalSec=1h
+StartLimitBurst=5
+
 [Service]
 Type=simple
 WorkingDirectory=%h/ibkralgoTrade

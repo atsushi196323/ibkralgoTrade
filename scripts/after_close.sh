@@ -40,11 +40,22 @@ echo "===== after_close: $(date '+%Y-%m-%d %H:%M:%S %Z') ====="
 # systemd配下では systemctl から止める。pkillで殺すとユニットが失敗扱いで残り、
 # 翌日の起動時に状態を読み違える。KillMode の既定(control-group)により
 # SIGTERMはmain.pyへ届くので、停止の作法は同じである。
+BOT_STOP_FAILED=0
+
 if command -v systemctl >/dev/null 2>&1 \
         && systemctl --user is-active --quiet "${BOT_UNIT}" 2>/dev/null; then
     echo "systemdユニット(${BOT_UNIT})を停止します。"
     systemctl --user stop "${BOT_UNIT}"
     echo "Botを停止しました。"
+# **「確認できなかった」を「停止していた」と読み替えてはならない。**
+# pkillが無い環境（procps未導入の最小構成）では pkill が非ゼロで返るため、
+# そのまま else へ落ちると「既に停止しています」と表示される——Botが
+# 動き続けていても同じ文面になり、翌日のログに混ざる。start_bot.sh の
+# 取引日判定と同じ種類の取り違えなので、ここでも区別して失敗として残す。
+elif ! command -v pkill >/dev/null 2>&1; then
+    echo "ERROR: pkill が見つからないため、Botが稼働中かどうか確認できませんでした。" \
+         "procps を導入すること。" >&2
+    BOT_STOP_FAILED=1
 # パターンはpythonの起動行に合わせる。pgrep -f は引数まで見るので、
 # 同じ行を引数に持つcaffeinate側(macOS)も一緒に一致して止まる（意図どおり。
 # caffeinateはシグナルを子へ中継しないので、python本体を確実に含める必要がある）。
@@ -82,7 +93,7 @@ case $? in
     0) ;;
     1)
         echo "ランキングの記録と稼働サマリは行いません。"
-        exit 0
+        exit "${BOT_STOP_FAILED}"
         ;;
     *)
         echo "ERROR: 取引日を判定できませんでした (PYTHON=${PYTHON})。" \
@@ -98,3 +109,8 @@ echo "----- 売買代金ランキングの記録 -----"
 echo
 echo "----- 稼働サマリ -----"
 "${PYTHON}" -m scripts.daily_report || echo "daily_report が失敗しました。"
+
+# Botを止められたか確認できなかった場合は、記録を残したうえで失敗として返す
+# （systemdのfailedに出す）。ランキングと稼働サマリはBotの停止に失敗しても
+# 実行する方針なので、ここまで来てから返す。
+exit "${BOT_STOP_FAILED}"
