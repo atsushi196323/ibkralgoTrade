@@ -149,7 +149,37 @@ Global Configuration → Presets を見る:
 ssh -L 5900:127.0.0.1:5900 <user>@<vps>   # 別端末で。VNCは外へ出さない
 ```
 
-## 6. 移行後のmacOS側
+## 6. ログを手元へ持ってきて改善する
+
+**VPSへ移すと、改善の材料になるログはすべて向こう側に出る。** `logs/` はGit管理外
+（実際の取引記録なのでコミットしてはならない）なので、gitでは流れてこない。
+「手元でログを読んで直す」という進め方を続けるには同期が要る。
+
+```bash
+IBKRALGO_VPS=user@vps.example.com bash scripts/fetch_vps_logs.sh
+python -m scripts.daily_report --log logs_vps/bot.log --journal logs_vps/trade_journal.csv
+```
+
+**同期先を `logs/` にしない。** 手元の `logs/` にはmacOSで稼働していた期間の記録が
+入っており、混ぜるとどちらの環境のものか区別できなくなる（`trade_journal.csv` は
+追記型なので特に危険）。`logs_vps/` は `.gitignore` の `logs*/` に含まれる。
+
+同期されるもの:
+
+| ファイル | 用途 |
+| --- | --- |
+| `bot.log` | 稼働ログ。「なぜ1件も建たなかったのか」はここにしかない |
+| `trade_journal.csv` | 決済ごとの実現損益・R倍率・為替レート |
+| `positions.json` | 保有ポジションと待機注文の値段 |
+| `after_close.log` | 引け後の締め処理の要約 |
+| `systemd.out` / `systemd.err` | **起動しなかった日の切り分け**（祝日でスキップしたのか、失敗したのか） |
+
+`systemd.out` / `systemd.err` は launchd の `launchd.out` / `launchd.err` に対応する。
+**journalではなくファイルに出しているのは、`logs/` を同期するだけで揃うようにするため**
+である（journalだと `journalctl` を別途取り出す必要がある）。2026-08-10にジョブが
+動かなかった件は、この出力がファイルに残っていたから切り分けられた。
+
+## 7. 移行後のmacOS側
 
 **launchdのジョブを止めること。** 残すと同じ認証情報で二重にログインし、
 一方のセッションが切られる。

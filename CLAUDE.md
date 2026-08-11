@@ -171,6 +171,8 @@
 - **`OnCalendar` にタイムゾーンを明示してある**（`Asia/Tokyo`）。systemdの既定はシステムのTZなので、VPSがUTCのままだと9時間ずれる
 - **`loginctl enable-linger` が要る。** 無いとSSHを切った時点でユーザーのタイマーごと止まる。症状は「毎日何も起きない」で、`scripts/daily_report.py` の「ログがありません」警告が唯一の手掛かりになる
 
+**systemd側の標準出力・標準エラーは journal ではなく `logs/` 配下のファイルへ出す**（`StandardOutput=append:`）。journalに置くと、**改善のためにログを手元へ持ってくるときに `logs/` の同期だけでは拾えない**。ここに出るのは `scripts/start_bot.sh` 自身の出力（祝日でスキップしたのか、取引日を判定できずに失敗したのか）と `configure_logging()` が効く前の例外で、**起動しなかった日を切り分ける唯一の材料**である。launchd側が `logs/launchd.out` へ出しているのと同じ扱いに揃えてある。同期は `scripts/fetch_vps_logs.sh`（`logs_vps/` へ。手元の `logs/` と混ぜると、どちらの環境の記録か区別できなくなる）。
+
 **ラッパーは休場日(終了コード1)と判定失敗を区別すること。** `scripts/is_us_trading_day.py` が返すのは 0=取引日 / 1=休場日 だけなので、それ以外はインタープリタのパス違いや依存関係の欠落を意味する。`if ! python -m scripts.is_us_trading_day` のようにまとめて「起動しない」へ倒すと、**設定を間違えた日が休場日と同じ見た目になり、しかも終了コード0でスケジューラには成功として記録される**——毎日何も起きないまま気付けない。**VPSへ移すときに最も起こりやすい間違いがこれである**（既定値がmacOSのpyenvのパスを指しているため、`IBKRALGO_PYTHON` を渡し忘れると必ず踏む）。判定できなかったときは終了コード1で失敗として残し、`systemctl --user list-units --failed` と journal に出す。
 
 **引け後のサマリは「その取引日のログが存在するか」も判定する**（`scripts/daily_report.last_closed_trading_day`）。`--date` を省略したときの対象日は**ログに書かれている最新の取引日**なので、ボットが起動しなかった日は前日のサマリがそのまま出て、正常な日と区別がつかない。2026-08-06に `com.user.ibkralgotrade` が launchd 側で `disabled` になっていたのを取りこぼしたのがこの穴である（plistは存在するのに `launchctl list` に無い状態で、ファイルを見るだけでは気付けない）。直近の引けた取引日より古ければ、サマリの先頭に警告と確認コマンドを出す。

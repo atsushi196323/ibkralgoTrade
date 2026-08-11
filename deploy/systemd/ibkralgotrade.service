@@ -40,7 +40,18 @@ TimeoutStopSec=30
 Restart=on-failure
 RestartSec=60
 
-# configure_logging()が効く前(起動時の例外・依存関係の解決失敗など)は
-# logs/bot.log に残らないため、journal へ出す（journalctl -u で読める）。
-StandardOutput=journal
-StandardError=journal
+# configure_logging()が効く前(起動時の例外・依存関係の解決失敗など)と、
+# start_bot.sh 自身の出力(祝日判定・取引日を判定できなかったERROR)は
+# logs/bot.log に残らない。
+#
+# **journalではなく logs/ 配下のファイルへ出す。** journalに置くと、あとで
+# 手元へ持ってきて調べるときに `logs/` を同期するだけでは拾えず、
+# journalctl を別途取り出す必要がある（`scripts/fetch_vps_logs.sh` は
+# logs/ をまとめて同期する）。launchd側が logs/launchd.out へ出しているのと
+# 同じ扱いに揃える——2026-08-10にジョブが動かなかった件は、この出力が
+# ファイルに残っていたから切り分けられた。
+#
+# 標準エラーが端末でないため configure_logging はコンソール出力を行わず、
+# bot.log と同じ内容がここへ二重に積まれることはない（CLAUDE.md「3.」）。
+StandardOutput=append:%h/ibkralgoTrade/logs/systemd.out
+StandardError=append:%h/ibkralgoTrade/logs/systemd.err

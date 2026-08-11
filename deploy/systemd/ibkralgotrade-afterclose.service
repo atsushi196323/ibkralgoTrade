@@ -18,6 +18,12 @@ Environment=XDG_RUNTIME_DIR=/run/user/%U
 # configure_logging() より先に効くため、ここで作っておく。
 ExecStart=/bin/bash -c 'mkdir -p %h/ibkralgoTrade/logs && %h/ibkralgoTrade/scripts/after_close.sh >> %h/ibkralgoTrade/logs/after_close.log 2>&1'
 
+# ExecStart自体が失敗した場合（bashが起動できない等）の記録先。
+# journalではなくファイルにするのは起動側と同じ理由——後から手元へ
+# 同期して調べられるようにするため。
+StandardOutput=append:%h/ibkralgoTrade/logs/systemd.out
+StandardError=append:%h/ibkralgoTrade/logs/systemd.err
+
 # rank_turnover は yfinance で639銘柄を取得するため20〜30秒かかる。
 # ネットワークが不調な日に無限に待たせない。
 TimeoutStartSec=10min
