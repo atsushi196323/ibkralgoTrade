@@ -22,10 +22,26 @@ cd "$(dirname "$0")/.." || exit 1
 # パスが違う**ため（VPSでは systemd unit の Environment= で渡す）。
 PYTHON="${IBKRALGO_PYTHON:-/Users/user/.pyenv/versions/3.11.10/bin/python3.11}"
 
-if ! "${PYTHON}" -m scripts.is_us_trading_day; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S %Z') Botは起動しません。"
-    exit 0
-fi
+# **休場日(終了コード1)と、判定そのものに失敗した場合を区別する。**
+# `is_us_trading_day` が返すのは 0=取引日 / 1=休場日 だけなので、それ以外は
+# インタープリタのパス違いや依存関係の欠落を意味する。まとめて「起動しない」に
+# 倒すと、**設定を間違えた日が休場日と同じ見た目になり、しかも終了コード0で
+# スケジューラには成功として記録される**——毎日何も起きないまま気付けない。
+# VPSへ移すときに最も起こりやすい間違いがこれである（既定値がmacOSのpyenvを
+# 指しているため）。判定できなかったときは失敗として残すこと。
+"${PYTHON}" -m scripts.is_us_trading_day
+case $? in
+    0) ;;
+    1)
+        echo "$(date '+%Y-%m-%d %H:%M:%S %Z') Botは起動しません。"
+        exit 0
+        ;;
+    *)
+        echo "$(date '+%Y-%m-%d %H:%M:%S %Z') ERROR: 取引日を判定できませんでした" \
+             "(PYTHON=${PYTHON})。Botを起動しません。" >&2
+        exit 1
+        ;;
+esac
 
 # caffeinateでラップするのは、macOSのアイドルスリープがCPU使用率ではなく
 # ユーザー操作の有無で判定されるため（plist側のコメントに経緯がある）。
