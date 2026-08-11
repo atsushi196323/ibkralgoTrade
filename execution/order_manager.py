@@ -44,6 +44,9 @@ PAPER_TRADING_PORTS = frozenset({7497, 4002})
 # （時間外・板が無い・IBKR側の滞留）であり、待ち続けても意味が無い。
 ORDER_FILL_TIMEOUT_SECONDS: float = 60.0
 _ORDER_STATUS_POLL_INTERVAL_SECONDS: float = 1.0
+# 「取消」と通知された注文に、遅れて約定が届かないか見届ける猶予
+# （`_await_late_fill_async`。実測の差は0.7秒だが、余裕を持たせる）。
+_LATE_FILL_GRACE_SECONDS: float = 3.0
 
 _STATUS_FILLED: str = "Filled"
 # 約定せずに終わった状態。拒否(Inactive)もここに含まれる。
@@ -309,6 +312,45 @@ def _commission_of(trade) -> float:
     return total
 
 
+async def _await_late_fill_async(trade) -> bool:
+    """「取消」と読めた注文に、遅れて約定が届かないか見届ける。
+
+    **IBKRが取消を立ててから約定通知が来ることがある。** IB Gatewayの
+    Order Preset が成行注文のTIFを書き換えると `Error 10349` が返り、
+    ib_insync はその時点で status を `Cancelled` にするが、注文自体は
+    生きていて約定する。2026-08-11にINTCの決済成行で実測した並びが下記で、
+    `Cancelled` と約定の差は **0.7秒** だった。
+
+        00:09:13.268  Error 10349: Order TIF was set to GTC based on order preset
+        00:09:13.269  status='Cancelled'（fills は空）
+        00:09:13.969  IBKRATSで2株が 97.99 で約定
+        00:09:13.972  commissionReport realizedPNL=0.115567
+
+    このときポーリングの目が `Cancelled` 側に当たると、**実際には閉じた建玉を
+    「決済に失敗した」と判定する**。呼び出し側(`main._market_exit_async`)は
+    取り消した待機注文を置き直すので、**建玉が無いのに売り注文だけが板に残る**
+    ——次にその銘柄を建てた瞬間に意図しない決済が起きる状態である
+    （「9. 開発時の禁止事項」）。新規建て側では逆に、約定済みの建玉を
+    記録しないまま放置することになる。
+
+    そのため終端ステータスをそのまま失敗と読まず、猶予のあいだ約定を待つ。
+    本当に拒否された注文はこの猶予のぶんだけ判定が遅れるだけで、結論は変わらない。
+    """
+    reported_status = trade.orderStatus.status
+    waited = 0.0
+    while waited < _LATE_FILL_GRACE_SECONDS:
+        await asyncio.sleep(_ORDER_STATUS_POLL_INTERVAL_SECONDS)
+        waited += _ORDER_STATUS_POLL_INTERVAL_SECONDS
+        if trade.orderStatus.status == _STATUS_FILLED:
+            logger.warning(
+                "[%s] 注文はいったん %s と通知されましたが、その後に約定しました。"
+                "取消として扱っていれば、建玉と待機注文の対応が壊れていました。",
+                trade.contract.symbol, reported_status,
+            )
+            return True
+    return False
+
+
 async def _await_fill_async(ib: IB, trade, symbol: str, label: str) -> None:
     """約定が確定するまで待つ。約定しなければ OrderNotFilledError を投げる。"""
     waited = 0.0
@@ -321,6 +363,8 @@ async def _await_fill_async(ib: IB, trade, symbol: str, label: str) -> None:
         return
 
     if status in _TERMINAL_UNFILLED_STATUSES:
+        if await _await_late_fill_async(trade):
+            return
         raise OrderNotFilledError(
             f"[{symbol}] {label}が約定せずに終了しました: status={status}。"
             "資金不足などでIBKRが拒否した可能性があります。"

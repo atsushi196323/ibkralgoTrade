@@ -461,6 +461,58 @@ def test_rejected_parent_cancels_the_children_and_raises() -> None:
     assert cancelled == [child_a.order, child_b.order]
 
 
+class _StatusSequence:
+    """読むたびに次の状態を返す `orderStatus`（遅れて届く約定を再現する）。"""
+
+    def __init__(self, statuses, avg_fill_price: float = 97.99):
+        self._statuses = list(statuses)
+        self.avgFillPrice = avg_fill_price
+
+    @property
+    def status(self) -> str:
+        if len(self._statuses) > 1:
+            return self._statuses.pop(0)
+        return self._statuses[0]
+
+
+def test_an_order_reported_cancelled_but_filled_afterwards_counts_as_filled() -> None:
+    """「取消」の後に約定が届いたら、約定として扱うこと。
+
+    IB GatewayのOrder Presetが成行注文のTIFを書き換えると `Error 10349` が返り、
+    ib_insyncはその時点でstatusを Cancelled にするが、注文は生きていて約定する
+    （2026-08-11にINTCの決済成行で実測。Cancelledと約定の差は0.7秒）。ここで
+    例外にすると、呼び出し側は決済が失敗したと判断して取り消した待機注文を
+    置き直し、**建玉が無いのに売り注文だけが板に残る**。
+    """
+    ib = MagicMock()
+    trade = _make_trade(status="Cancelled")
+    trade.orderStatus = _StatusSequence(["Cancelled", "Cancelled", "Filled"])
+    ib.placeOrder = MagicMock(return_value=trade)
+
+    with _real_orders_enabled():
+        result = asyncio.run(place_market_order_async(
+            ib, MagicMock(symbol="INTC"), action="SELL", quantity=2,
+        ))
+
+    assert result.fill_price == pytest.approx(97.99, abs=0.01)
+
+
+def test_an_order_that_stays_cancelled_still_raises() -> None:
+    """猶予のあいだ約定が届かなければ、従来どおり例外にすること。
+
+    本当に拒否された注文まで約定扱いにすると、実体の無い建玉を記録する。
+    """
+    ib = MagicMock()
+    trade = _make_trade(status="Cancelled")
+    trade.orderStatus = _StatusSequence(["Cancelled"])
+    ib.placeOrder = MagicMock(return_value=trade)
+
+    with _real_orders_enabled(), pytest.raises(OrderNotFilledError):
+        asyncio.run(place_market_order_async(
+            ib, MagicMock(symbol="INTC"), action="SELL", quantity=2,
+        ))
+
+
 def test_unfilled_market_order_is_cancelled_and_raises() -> None:
     """約定しないまま時間切れになったら、注文を取り消して例外にすること。"""
     ib = MagicMock()
