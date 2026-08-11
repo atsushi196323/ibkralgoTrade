@@ -12,3 +12,6 @@ logs*/
 
 # 検証用に取得したヒストリカルバー(scripts/fetch_bars.py)。再取得できるのでコミットしない。
 bars/
+
+# IB Gatewayの設定（VPSのDocker運用でvolumeとしてマウントする先）。口座情報を含む。
+deploy/ib-gateway/tws_settings/

@@ -1,0 +1,59 @@
+# IB Gateway（ペーパー口座）をヘッドレスで動かし、自動ログインさせる。
+#
+# このイメージは IB Gateway + IBC（自動ログイン）+ Xvfb + x11vnc を同梱している。
+# Gatewayは**GUIのJavaアプリで、しかも1日1回ログアウトする**ため、素で置くと
+# 毎日手でログインし直すことになる。IBCがその再認証を代行する。
+#
+# 使い方:
+#   cp .env.example .env   # 認証情報を書く（.env はGit管理外）
+#   docker compose up -d
+#   docker compose logs -f
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: always
+    environment:
+      TWS_USERID: ${TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD}
+
+      # **ペーパー口座に固定する。** 本プロジェクトは注文層の検証中で、
+      # 実資金の口座へ発注してはならない（「9. 開発時の禁止事項」）。
+      # なおBot側も `ensure_orders_are_paper_only` がポート番号で二重に防いでいる。
+      TRADING_MODE: paper
+
+      # **no にすること。** Botは実際に発注する。read-onlyだと注文が拒否され、
+      # しかも「発注はしたが約定しない」形で現れるため切り分けが難しい。
+      READ_ONLY_API: "no"
+
+      # ログの時刻と AUTO_RESTART_TIME の解釈をJSTに揃える。
+      TIME_ZONE: Asia/Tokyo
+
+      # **既定の "11:59 PM" のままにしてはならない。** 23:59 JST = 10:59 ET は
+      # 米国市場のザラ場のど真ん中で、Gatewayの再起動が監視サイクルを直撃する。
+      # Botが停止している時間帯（06:05〜22:15 JST）に置くこと。
+      AUTO_RESTART_TIME: "12:00 PM"
+
+      # 2要素認証はペーパー口座では要求されない（実資金口座へ移す際に再検討する）。
+      # タイムアウト時は再起動して再ログインを試みる。
+      TWOFA_TIMEOUT_ACTION: restart
+      RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
+
+      # VNCはGUI設定（Order Presets等）を確認するときだけ使う。
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD}
+
+    ports:
+      # **必ず 127.0.0.1 に束ねること。APIポートには認証が無い。**
+      # "4002:4004" と書くと 0.0.0.0 で公開され、インターネットから
+      # 誰でも発注できる状態になる。**dockerのポート公開は ufw を迂回するため、
+      # ファイアウォールを設定してあっても塞げない。**
+      - "127.0.0.1:4002:4004"   # ペーパー（.env の IBKR_PORT=4002 と一致）
+      # VNCも同様。閲覧はSSHトンネル経由で行う:
+      #   ssh -L 5900:127.0.0.1:5900 <user>@<vps>
+      - "127.0.0.1:5900:5900"
+
+    volumes:
+      # **Gatewayの設定を永続化する。** 消えると毎回の再起動で既定へ戻り、
+      # とくに Order Presets の修正が失われる。プリセットが注文のTIFを
+      # 上書きすると `Error 10349` になるが、**上書きは注文を拒否しないため
+      # 気付けない**（CLAUDE.md「決済の置き場所」を参照）。
+      - ./tws_settings:/home/ibgateway/Jts

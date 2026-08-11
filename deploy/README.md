@@ -18,19 +18,76 @@ VPSではこの制約ごと消える。
 | OS | Ubuntu LTS 等。`OnCalendar` のタイムゾーン指定を使うので **systemd 252以降**が望ましい |
 | タイムゾーン | `sudo timedatectl set-timezone Asia/Tokyo`（timerにTZを明示してあるので必須ではないが、ログが読みやすい） |
 
-## 2. IB Gateway
+## 2. IB Gateway の自動ログイン
 
-**IB GatewayはGUIのJavaアプリなので、ヘッドレスでは Xvfb と組み合わせる。**
-日次の自動ログイン・自動再起動には [IBC](https://github.com/IbcAlpha/IBC) を使う
-（Gatewayは1日1回再起動する。`core/connection.py` のリトライ既定値は
-その再起動を待ち切れる長さとして決めてある）。
+**IB GatewayはGUIのJavaアプリで、しかも1日1回ログアウトする。** 素で置くと毎日
+手でログインし直すことになり、「Macを起動する」手間が「VPSにログインする」手間に
+置き換わるだけで無人化にならない。再認証を代行するのが
+[IBC](https://github.com/IbcAlpha/IBC) で、これが**無人運用の必須条件**である。
 
-**APIポート(4002)を外部に晒さないこと。認証が無い。** Gatewayのリスニングを
-localhostに限定し、ファイアウォールでも塞ぐ。IBCの設定ファイルには
-パスワードが平文で入るので `chmod 600` とし、SSHは鍵認証のみにする。
+`core/connection.py` のリトライ既定値（10回・1回あたり上限60秒＝総待ち約4分）は、
+この日次再起動を待ち切れる長さとして決めてある。
+
+**推奨は Docker 版**（[gnzsnz/ib-gateway-docker](https://github.com/gnzsnz/ib-gateway-docker)）。
+IB Gateway・IBC・Xvfb・x11vnc が同梱されており、Javaの導入もXvfbの起動も要らない。
+本プロジェクト向けの設定を `deploy/ib-gateway/` に置いてある。
+
+```bash
+cd ~/ibkralgoTrade/deploy/ib-gateway
+cp .env.example .env && chmod 600 .env   # ペーパー口座の認証情報を書く
+docker compose up -d
+docker compose logs -f                   # ログイン成功まで見届ける
+```
+
+`deploy/ib-gateway/docker-compose.yml` で本プロジェクト向けに指定している値:
+
+| | 値 | 理由 |
+| --- | --- | --- |
+| `TRADING_MODE` | `paper` | 注文層の検証中。実資金の口座へ発注してはならない |
+| `READ_ONLY_API` | `no` | Botは実際に発注する。read-onlyだと注文が拒否される |
+| `AUTO_RESTART_TIME` | `12:00 PM` | **既定の23:59は 10:59 ET＝ザラ場のど真ん中。** Botが停止している時間帯(06:05〜22:15 JST)に置く |
+| ポート公開 | `127.0.0.1:4002:4004` | **APIポートには認証が無い。** 下記参照 |
+| Jtsのvolume | `./tws_settings` | 設定を永続化しないと Order Presets の修正が再起動で消える |
+
+**APIポートは必ず `127.0.0.1` に束ねること。** `"4002:4004"` と書くと 0.0.0.0 で
+公開され、インターネットから誰でも発注できる状態になる。**dockerのポート公開は
+ufw を迂回する**ため、ファイアウォールを設定してあっても塞げない。確認:
+
+```bash
+ss -tlnp | grep 4002        # 127.0.0.1:4002 になっていること（0.0.0.0 は危険）
+```
+
+### Docker を使わない場合
+
+IBC を直接入れる。Java・IB Gateway・Xvfb を自分で用意する必要がある。
+
+```bash
+wget https://github.com/IbcAlpha/IBC/releases/download/3.24.1/IBCLinux-3.24.1.zip
+sudo mkdir -p /opt/ibc && sudo unzip IBCLinux-3.24.1.zip -d /opt/ibc
+sudo chmod o+x /opt/ibc/*.sh /opt/ibc/scripts/*.sh
+```
+
+`config.ini` で設定する主な項目（名称は IBC 3.24.1 のもの）:
+
+| 設定 | 値 |
+| --- | --- |
+| `IbLoginId` / `IbPassword` | ペーパー口座の認証情報 |
+| `TradingMode` | `paper` |
+| `AutoRestartTime` | Botが停止している時間帯（例 `12:00 PM`） |
+| `AcceptIncomingConnectionAction` | `accept`（API接続ダイアログで止まらないように） |
+| `ExistingSessionDetectedAction` | `primary` |
+
+### 共通の注意
+
+**ペーパー口座は2要素認証を要求されない。** 自動ログインが成立するのはこのため
+である。**実資金の口座へ移す際は IB Key による2FAが要る**ので、無人運用の設計を
+その時点で見直すこと（ペーパー検証中は影響しない）。
 
 **同じ認証情報でMacとVPSの同時ログインはできない。** 後からのログインが先の
 セッションを切るため、並行稼働ではなく切り替えとして移行すること。
+
+**IBCの設定ファイル(`.env` / `config.ini`)には平文のパスワードが入る。**
+`chmod 600` とし、SSHは鍵認証のみにする。
 
 ## 3. セットアップ
 
@@ -76,8 +133,19 @@ tail -f ~/ibkralgoTrade/logs/bot.log           # 稼働ログ
 `scripts/is_us_trading_day.py` が起動直前に行うので、平日でも起動しない日がある。
 
 ```bash
+.venv/bin/python -m scripts.check_market_data   # Gatewayへの接続と価格の取得経路
 .venv/bin/python -m scripts.daily_report
 bash scripts/after_close.sh    # 締め処理を手で1回通しておく
+```
+
+**Gatewayを新しく立てたら Order Presets を確認すること。** プリセットが注文の
+有効期間(TIF)を書き換えると `Error 10349` が出るが、**上書きは注文を拒否しないので
+気付けない**。子注文が `DAY` に落とされると、持ち越すスイングの建玉が引けで
+無防備になる（CLAUDE.md「決済の置き場所」）。VNCで繋いで
+Global Configuration → Presets を見る:
+
+```bash
+ssh -L 5900:127.0.0.1:5900 <user>@<vps>   # 別端末で。VNCは外へ出さない
 ```
 
 ## 6. 移行後のmacOS側
