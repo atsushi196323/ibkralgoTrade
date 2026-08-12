@@ -228,3 +228,14 @@ python -m scripts.check_deployment   # macOS側で実行し、登録が残って
 `logs/positions.json` は**移行先へ引き継ぐこと。** 建玉の状態（建値・待機注文の値段・
 R倍率の分母）がここにあり、失うとブローカー同期で拾い直した建玉として
 扱われて建値が手数料込みの `avgCost` に化ける。
+
+**引き継いだら、稼働させる前にブローカー側と突き合わせること。**
+
+```bash
+.venv/bin/python -m scripts.check_positions   # 照会のみ。発注も取り消しもしない
+```
+
+移行の前後でBotが止まっている間に待機注文が約定していると、記録だけが残る。
+`is_confirmed_by_broker` がERRORを出して決済は見送るので危険な売り建てには
+ならないが、**その銘柄が監視枠を占め続ける**（`MAX_CONCURRENT_POSITIONS` は2しかない）。
+待機注文が片側しか生きていない建玉も同時に分かる。

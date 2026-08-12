@@ -252,6 +252,7 @@ scripts/
   check_market_data.py      実機でマーケットデータの取得経路を切り分ける診断CLI
   check_screener.py         スキャナー・PER取得の購読権限を切り分ける診断CLI
   check_deployment.py       VPS移行の設定漏れ（linger・スワップ・タイマー・launchd残存）の点検CLI
+  check_positions.py        記録とブローカーの建玉・待機注文を突き合わせる照会CLI（再起動・移行の直後に使う）
   fetch_bars.py             検証用の日足をCSVへ保存する（yfinance、IBKR接続不要）
   rank_turnover.py          売買代金ランキングの日次記録（yfinance、観測専用）
   daily_report.py           1取引日の稼働サマリ（bot.log + trade_journal.csv を読む。注文層の結果もここに出る）
@@ -1140,6 +1141,9 @@ python -m scripts.check_screener --full   # 本番と同じパイプラインを
 
 # VPS移行の設定漏れの点検（IBKR接続不要。NGがあれば終了コード1）
 python -m scripts.check_deployment
+
+# 記録とブローカーの建玉の突き合わせ（照会のみ。再起動・環境の移行の直後に）
+python -m scripts.check_positions
 
 # 確定申告用CSVの出力（既定は前年分。IBKR接続不要）
 python -m scripts.export_tax_report
