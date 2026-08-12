@@ -9,7 +9,7 @@ import logging
 import xml.etree.ElementTree as ET
 from typing import List, Optional
 
-from ib_insync import IB, ScannerSubscription, Stock
+from ib_async import IB, ScannerSubscription, Stock
 
 logger = logging.getLogger(__name__)
 

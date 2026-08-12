@@ -136,7 +136,7 @@ def test_ibkr_escaped_message_is_decoded(tmp_path: Path, _restore_root_logger) -
     log_path = tmp_path / "bot.log"
     configure_logging(log_path=str(log_path))
 
-    logging.getLogger("ib_insync.wrapper").error(
+    logging.getLogger("ib_async.wrapper").error(
         "Error 1100, reqId -1: "
         "\\u63a5\\u7d9a\\u304c\\u5207\\u65ad\\u3055\\u308c\\u307e\\u3057\\u305f\\u3002"
     )
@@ -152,7 +152,7 @@ def test_filter_applies_to_records_from_child_loggers(tmp_path: Path, _restore_r
     """伝播してきたレコードにも効くこと。
 
     ロガーに付けたフィルターは子ロガーからの伝播レコードに適用されないため、
-    ハンドラ側に付けている。IBKRのメッセージは ib_insync.wrapper が出すので、
+    ハンドラ側に付けている。IBKRのメッセージは ib_async.wrapper が出すので、
     ここを取り違えると本番でだけ効かない。
     """
     log_path = tmp_path / "bot.log"
@@ -226,7 +226,7 @@ def test_non_string_messages_are_not_touched(tmp_path: Path, _restore_root_logge
 
 # --- IBKRの定型通知の抑制 ---------------------------------------------------------
 
-# 2026-08-04時点の logs/bot.log では、データファームの状態通知と ib_insync.client の
+# 2026-08-04時点の logs/bot.log では、データファームの状態通知と ib_async.client の
 # 接続ログが全体の32%を占め、「なぜ1件も建たなかったのか」の答え（スキャン結果0件）は
 # 1行しか無かった。以下はその1行が埋もれないための境界の固定。
 
@@ -245,7 +245,7 @@ def test_data_farm_status_notifications_are_dropped(tmp_path: Path, _restore_roo
 
     written = _write_and_read(
         log_path,
-        "ib_insync.wrapper",
+        "ib_async.wrapper",
         logging.INFO,
         "Warning 2108, reqId -1: マーケットデータファームの接続状況は現在無効です。:usfarm",
     )
@@ -264,7 +264,7 @@ def test_data_farm_failures_are_kept(tmp_path: Path, _restore_root_logger) -> No
 
     written = _write_and_read(
         log_path,
-        "ib_insync.wrapper",
+        "ib_async.wrapper",
         logging.INFO,
         "Warning 2103, reqId -1: マーケットデータファームのコネクションが破損されています:usfarm",
     )
@@ -279,7 +279,7 @@ def test_ibkr_disconnection_errors_are_kept(tmp_path: Path, _restore_root_logger
 
     written = _write_and_read(
         log_path,
-        "ib_insync.wrapper",
+        "ib_async.wrapper",
         logging.ERROR,
         "Error 1100, reqId -1: IBKRとTrader Workstationの接続が切断されました。",
     )
@@ -287,24 +287,24 @@ def test_ibkr_disconnection_errors_are_kept(tmp_path: Path, _restore_root_logger
     assert "Error 1100" in written
 
 
-def test_ib_insync_connection_progress_is_dropped(tmp_path: Path, _restore_root_logger) -> None:
+def test_ib_async_connection_progress_is_dropped(tmp_path: Path, _restore_root_logger) -> None:
     """接続の進行ログは core/connection.py の記録と二重になるため残さないこと。"""
     log_path = tmp_path / "bot.log"
     configure_logging(log_path=str(log_path))
 
     written = _write_and_read(
-        log_path, "ib_insync.client", logging.INFO, "Connecting to 127.0.0.1:4002 with clientId 1..."
+        log_path, "ib_async.client", logging.INFO, "Connecting to 127.0.0.1:4002 with clientId 1..."
     )
 
     assert written == ""
 
 
-def test_ib_insync_client_errors_are_kept(tmp_path: Path, _restore_root_logger) -> None:
+def test_ib_async_client_errors_are_kept(tmp_path: Path, _restore_root_logger) -> None:
     log_path = tmp_path / "bot.log"
     configure_logging(log_path=str(log_path))
 
     written = _write_and_read(
-        log_path, "ib_insync.client", logging.ERROR, "API connection failed: ConnectionRefusedError"
+        log_path, "ib_async.client", logging.ERROR, "API connection failed: ConnectionRefusedError"
     )
 
     assert "API connection failed" in written
@@ -330,7 +330,7 @@ def test_the_screening_degradation_line_survives(tmp_path: Path, _restore_root_l
 
 
 def test_application_info_logs_are_not_affected(tmp_path: Path, _restore_root_logger) -> None:
-    """抑制はib_insync由来に限ること。自前のINFOは判断の材料そのもの。"""
+    """抑制はib_async由来に限ること。自前のINFOは判断の材料そのもの。"""
     log_path = tmp_path / "bot.log"
     configure_logging(log_path=str(log_path))
 
@@ -349,6 +349,6 @@ def test_unparseable_ibkr_messages_are_kept(tmp_path: Path, _restore_root_logger
     log_path = tmp_path / "bot.log"
     configure_logging(log_path=str(log_path))
 
-    written = _write_and_read(log_path, "ib_insync.wrapper", logging.INFO, "position: Position(...)")
+    written = _write_and_read(log_path, "ib_async.wrapper", logging.INFO, "position: Position(...)")
 
     assert "position: Position(...)" in written

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import pandas as pd
-from ib_insync import IB, Stock
+from ib_async import IB, Stock
 
 from data.fundamentals import get_pe_ratio_async, run_market_cap_scan_async
 from data.market_data import get_historical_bars_async

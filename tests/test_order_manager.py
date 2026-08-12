@@ -479,7 +479,7 @@ def test_an_order_reported_cancelled_but_filled_afterwards_counts_as_filled() ->
     """「取消」の後に約定が届いたら、約定として扱うこと。
 
     IB GatewayのOrder Presetが成行注文のTIFを書き換えると `Error 10349` が返り、
-    ib_insyncはその時点でstatusを Cancelled にするが、注文は生きていて約定する
+    ib_asyncはその時点でstatusを Cancelled にするが、注文は生きていて約定する
     （2026-08-11にINTCの決済成行で実測。Cancelledと約定の差は0.7秒）。ここで
     例外にすると、呼び出し側は決済が失敗したと判断して取り消した待機注文を
     置き直し、**建玉が無いのに売り注文だけが板に残る**。
@@ -667,7 +667,7 @@ def test_resting_order_prices_are_rounded_to_the_tick() -> None:
 
     2026-08-05のペーパー検証で、損切り 63.175 がそのまま送られてIBKRが
     Warning 110 を返し、**逆指値だけが不成立になった**（利確はたまたま2桁で通り、
-    損切りの無い建玉が残った）。ib_insyncは110を警告としてしか通知せず、
+    損切りの無い建玉が残った）。ib_asyncは110を警告としてしか通知せず、
     子注文の状態にも何も来ないため、丸めを欠くと静かに防御だけが消える。
     """
     orders = build_bracket_orders(
@@ -945,7 +945,7 @@ def test_the_reprice_gives_up_waiting_for_the_oca_rewrite_instead_of_hanging() -
 def test_a_reprice_that_never_reached_the_book_is_recorded_at_the_broker_price() -> None:
     """修正が板に届かなかったら、要求した値段ではなく板の値段を記録すること。
 
-    10326による拒否はib_insyncからは警告としてしか見えず、拒否されても元の注文は
+    10326による拒否はib_asyncからは警告としてしか見えず、拒否されても元の注文は
     生き続けるため生存確認は通る。確かめずに新しい値段を返すと、positions.json に
     ブローカーが持っていない値段が残り、Bot側の損切り判定・R倍率・置き直しの基準が
     すべてそこからずれる。

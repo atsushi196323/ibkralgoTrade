@@ -28,7 +28,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from ib_insync import IB, Stock
+from ib_async import IB, Stock
 
 from core.connection import IBKRConnection
 from data.fundamentals import get_pe_ratio_async, run_market_cap_scan_async

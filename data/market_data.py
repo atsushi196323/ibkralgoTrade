@@ -8,8 +8,8 @@ from datetime import date, datetime
 from typing import Optional, Tuple
 
 import pandas as pd
-from ib_insync import IB, Contract, Forex, Stock
-from ib_insync import util as ib_util
+from ib_async import IB, Contract, Forex, Stock
+from ib_async import util as ib_util
 
 from core.market_hours import US_EASTERN
 from core.pacing import RequestPacer
@@ -96,7 +96,7 @@ def _to_usable_price(value: object) -> Optional[float]:
 def _extract_ticker_price(ticker: object) -> Optional[Tuple[float, bool]]:
     """Tickerから (価格, 古い値か) を取り出す（marketPrice優先、無ければclose）。
 
-    ib_insyncのmarketPrice()は「bid/askの範囲内にあるlast、無ければ仲値」を返すが、
+    ib_asyncのmarketPrice()は「bid/askの範囲内にあるlast、無ければ仲値」を返すが、
     どちらも未取得ならNaNになるため、その場合は前日終値(close)にフォールバックする。
 
     Tickerのcloseは名前のとおり**前営業日の終値**であり、当日の値動きを
@@ -119,7 +119,7 @@ def _extract_ticker_price(ticker: object) -> Optional[Tuple[float, bool]]:
 def _ticker_update_time(ticker: object) -> Optional[datetime]:
     """Tickerの最終更新時刻を返す。datetimeとして読めなければNone。
 
-    ib_insyncのTickerは更新のたびにtimeを進める。型が読めない場合
+    ib_asyncのTickerは更新のたびにtimeを進める。型が読めない場合
     （モックや将来の仕様変更）にNoneを返すのは、鮮度を判定できないことを
     呼び出し側で「判定しない」に倒すため。
     """
@@ -130,7 +130,7 @@ def _ticker_update_time(ticker: object) -> Optional[datetime]:
 def _to_bar_date(value: object) -> Optional[date]:
     """バーの日付欄をdateへ正規化する。解釈できなければNone。
 
-    ib_insyncのDataFrame変換はbarSizeに応じてdate/datetime/文字列のいずれも
+    ib_asyncのDataFrame変換はbarSizeに応じてdate/datetime/文字列のいずれも
     返しうるため、鮮度判定の前にここで型を吸収する。
     """
     if isinstance(value, datetime):
@@ -191,7 +191,7 @@ async def _get_streaming_price_async(
         logger.exception("%s のストリーミング購読の開始に失敗しました。", contract.symbol)
         return None
 
-    # ib_insyncは同じコントラクトに対して**同一のTickerオブジェクト**を返し、
+    # ib_asyncは同じコントラクトに対して**同一のTickerオブジェクト**を返し、
     # cancelMktDataの後もそこには前回の購読で受け取った値が残る。購読直後に
     # そのまま読むと、前のサイクルで取得した価格を「現在価格」として返してしまい、
     # 以後どれだけ市場が動いても値が更新されない（実測: 決済判定が10分以上

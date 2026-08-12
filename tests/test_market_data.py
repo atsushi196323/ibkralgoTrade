@@ -234,7 +234,7 @@ def test_get_current_price_waits_for_streaming_tick_before_giving_up() -> None:
 
 # --- 現在価格: 使い回しTickerによる価格の凍結 -----------------------------------
 #
-# ib_insyncのreqMktDataは同じコントラクトに対して同一のTickerを返し、
+# ib_asyncのreqMktDataは同じコントラクトに対して同一のTickerを返し、
 # cancelMktData後も前回の値を保持する。購読直後にそれを読むと、市場が動いても
 # 永久に同じ価格を返し続ける（実測でボット側の決済判定が凍結した）。
 
@@ -501,7 +501,7 @@ def test_historical_fallback_is_stale_when_the_bar_date_is_unreadable() -> None:
 
 
 def test_bar_date_is_normalized_from_timestamps_and_strings() -> None:
-    """ib_insyncはbarSize次第でdate/datetime/文字列のいずれも返す。"""
+    """ib_asyncはbarSize次第でdate/datetime/文字列のいずれも返す。"""
     contract = MagicMock(symbol="AAPL")
     ib = _make_ib()
 

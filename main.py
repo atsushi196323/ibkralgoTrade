@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import pandas as pd
-from ib_insync import IB, Stock
+from ib_async import IB, Stock
 
 from core.connection import IBKRConnection
 from core.logging_setup import configure_logging

@@ -18,7 +18,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from ib_insync import IB, LimitOrder, MarketOrder, Order, Stock, StopOrder
+from ib_async import IB, LimitOrder, MarketOrder, Order, Stock, StopOrder
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ _LIVE_ORDER_STATUSES = frozenset({"PreSubmitted", "Submitted", _STATUS_FILLED})
 # 2026-08-05のペーパー検証で、損切り 66.50×0.95 = 63.1750 がそのまま送られ、
 # IBKRが `Warning 110（指定価格がこのコントラクトの呼値と一致しません）` を返して
 # 逆指値だけが不成立になった。利確(73.15)はたまたま2桁だったため通り、
-# **損切りの無い建玉が残った**。ib_insyncは110を警告としてしか通知せず、
+# **損切りの無い建玉が残った**。ib_asyncは110を警告としてしか通知せず、
 # 子注文には状態変化すら来ないため、丸めを欠くと静かに防御だけが消える。
 #
 # 1ドル未満の銘柄は呼値が $0.0001 になるが、監視できる株価帯の下限
@@ -317,7 +317,7 @@ async def _await_late_fill_async(trade) -> bool:
 
     **IBKRが取消を立ててから約定通知が来ることがある。** IB Gatewayの
     Order Preset が成行注文のTIFを書き換えると `Error 10349` が返り、
-    ib_insync はその時点で status を `Cancelled` にするが、注文自体は
+    ib_async はその時点で status を `Cancelled` にするが、注文自体は
     生きていて約定する。2026-08-11にINTCの決済成行で実測した並びが下記で、
     `Cancelled` と約定の差は **0.7秒** だった。
 
@@ -656,7 +656,7 @@ async def place_bracket_order_async(
 
     # 親が約定した = 建玉ができた時点で、子注文が本当にブローカー側で生きているかを
     # 確かめる。送信が受理されたことと、注文が板に置かれたことは別である
-    # （呼値違反・値幅制限・プリセットによる拒否は、ib_insyncからは警告としてしか
+    # （呼値違反・値幅制限・プリセットによる拒否は、ib_asyncからは警告としてしか
     # 見えず、子注文の状態には何も来ないことがある）。
     await _ensure_children_are_live_async(
         ib, contract, child_trades, quantity, orders.oca_group,
@@ -718,7 +718,7 @@ async def _reprice_children_to_fill_async(
     `Error 10326（OCAグループの見直しはできません）` で修正ごと拒否する。
 
     **修正が板に届いたことは、ブローカーから読み直して確かめること。** 10326は
-    ib_insyncからは警告としてしか見えず、拒否されても元の注文はそのまま生き続ける
+    ib_asyncからは警告としてしか見えず、拒否されても元の注文はそのまま生き続ける
     ため、`_ensure_children_are_live_async` の生存確認は通ってしまう。確かめずに
     新しい値段を返すと、`positions.json` に**ブローカーが持っていない値段**が残る
     （2026-08-06にINTCで実測。ログは 93.38 -> 92.09 と記録したが、板は 93.38 の

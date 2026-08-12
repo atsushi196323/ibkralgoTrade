@@ -6,7 +6,7 @@ import os
 from typing import Optional
 
 from dotenv import load_dotenv
-from ib_insync import IB
+from ib_async import IB
 
 load_dotenv()
 

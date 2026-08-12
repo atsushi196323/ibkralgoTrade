@@ -4,7 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from ib_insync import ScannerSubscription
+from ib_async import ScannerSubscription
 
 from data.fundamentals import get_pe_ratio_async, run_market_cap_scan_async
 

@@ -9,12 +9,12 @@ from core.connection import IBKRConnection
 
 
 def _make_mock_ib() -> MagicMock:
-    """ib_insync.IB() の代わりに使うモックインスタンスを作る。"""
+    """ib_async.IB() の代わりに使うモックインスタンスを作る。"""
     mock_ib = MagicMock()
     mock_ib.connectAsync = AsyncMock(return_value=None)
     mock_ib.isConnected = MagicMock(return_value=False)
     mock_ib.disconnect = MagicMock()
-    # disconnectedEvent は ib_insync の Event 型で `+=` (__iadd__) をサポートする。
+    # disconnectedEvent は ib_async の Event 型で `+=` (__iadd__) をサポートする。
     mock_ib.disconnectedEvent = MagicMock()
     return mock_ib
 

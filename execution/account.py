@@ -3,7 +3,7 @@
 import logging
 from typing import Optional
 
-from ib_insync import IB
+from ib_async import IB
 
 logger = logging.getLogger(__name__)
 

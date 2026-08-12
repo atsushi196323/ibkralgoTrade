@@ -7,7 +7,7 @@ VPSではこの制約ごと消える。
 
 **リポジトリ側で必要な変更は済んでいる。** `scripts/start_bot.sh` は Linux では
 `caffeinate` を挟まず、`scripts/after_close.sh` は systemd 配下なら `systemctl --user stop`
-でBotを止める。Pythonのコードは無改修で動く（依存は `ib_insync` / `pandas` / `numpy` /
+でBotを止める。Pythonのコードは無改修で動く（依存は `ib_async` / `pandas` / `numpy` /
 `python-dotenv` / `holidays` のみで、時刻は `zoneinfo` で明示的にET/JSTを扱っている）。
 
 ## 1. サーバの前提

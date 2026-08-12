@@ -22,7 +22,7 @@ from datetime import date, datetime
 from typing import Dict, Optional
 
 import pandas as pd
-from ib_insync import IB, Contract, Stock
+from ib_async import IB, Contract, Stock
 
 from core.market_hours import US_EASTERN
 from data.market_data import (

@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
 
-from ib_insync import IB
+from ib_async import IB
 
 from core.market_hours import US_EASTERN
 

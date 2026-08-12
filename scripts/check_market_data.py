@@ -24,7 +24,7 @@ import logging
 import math
 from typing import List, Optional, Tuple
 
-from ib_insync import IB, Contract
+from ib_async import IB, Contract
 
 from core.connection import IBKRConnection
 from data.market_data import (
