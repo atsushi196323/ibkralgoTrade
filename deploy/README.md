@@ -160,10 +160,18 @@ tail -f ~/ibkralgoTrade/logs/bot.log           # 稼働ログ
 `scripts/is_us_trading_day.py` が起動直前に行うので、平日でも起動しない日がある。
 
 ```bash
+.venv/bin/python -m scripts.check_deployment    # 下記の設定漏れを一括で点検する
 .venv/bin/python -m scripts.check_market_data   # Gatewayへの接続と価格の取得経路
 .venv/bin/python -m scripts.daily_report
 bash scripts/after_close.sh    # 締め処理を手で1回通しておく
 ```
+
+**`scripts/check_deployment.py` が見るのは「忘れても即座にはエラーにならない」項目である。**
+linger・スワップ・タイマーの有効化・systemdのバージョン・APIポートの応答、そして
+移行元のmacOSで実行したときは**launchdジョブが残っていないか**。いずれも症状が
+「毎日何も起きない」「時々つながらない」という形でしか出ず、稼働してからでは
+休場日や一時的な切断と区別できない。**確かめられなかった項目はOKと数えず「要確認」
+として出す**（NGがあれば終了コード1）。
 
 **Gatewayを新しく立てたら Order Presets を確認すること。** プリセットが注文の
 有効期間(TIF)を書き換えると `Error 10349` が出るが、**上書きは注文を拒否しないので
@@ -213,6 +221,8 @@ python -m scripts.daily_report --log logs_vps/bot.log --journal logs_vps/trade_j
 ```bash
 launchctl bootout gui/$(id -u)/com.user.ibkralgotrade
 launchctl bootout gui/$(id -u)/com.user.ibkralgotrade.afterclose
+
+python -m scripts.check_deployment   # macOS側で実行し、登録が残っていないか確かめる
 ```
 
 `logs/positions.json` は**移行先へ引き継ぐこと。** 建玉の状態（建値・待機注文の値段・
