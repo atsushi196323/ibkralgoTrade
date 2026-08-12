@@ -41,6 +41,21 @@ services:
       # VNCはGUI設定（Order Presets等）を確認するときだけ使う。
       VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD}
 
+      # 設定の永続化先。**この変数を設定しないと volumes のマウントが
+      # 使われず、Order Presets の修正が再起動で消える**（既定値は
+      # 下と同じパスだが、上流は未設定時に永続化を行わない実装である）。
+      TWS_SETTINGS_PATH: /home/ibgateway/tws_settings
+
+      # API接続を自動で受け入れる。既定(`manual`)だとGUIの確認ダイアログが
+      # 出て、VNCで人が押すまで接続が通らない。コンテナ内のsocatが中継する
+      # ため接続元は 127.0.0.1（Trusted IP）に見えるので通常は出ないが、
+      # 出た場合の症状が「Botが接続だけできない」でGUIを見るまで分からない。
+      TWS_ACCEPT_INCOMING: accept
+
+      # コンテナ内の時刻。上流のcomposeはTIME_ZONEと両方を設定しており、
+      # ログの時刻と AUTO_RESTART_TIME の解釈を揃えるために合わせる。
+      TZ: Asia/Tokyo
+
     ports:
       # **必ず 127.0.0.1 に束ねること。APIポートには認証が無い。**
       # "4002:4004" と書くと 0.0.0.0 で公開され、インターネットから
@@ -56,4 +71,9 @@ services:
       # とくに Order Presets の修正が失われる。プリセットが注文のTIFを
       # 上書きすると `Error 10349` になるが、**上書きは注文を拒否しないため
       # 気付けない**（CLAUDE.md「決済の置き場所」を参照）。
-      - ./tws_settings:/home/ibgateway/Jts
+      #
+      # **マウント先を `/home/ibgateway/Jts` にしてはならない。** そこは
+      # IB Gateway本体の導入先（`Jts/ibgateway/<version>/` と `jts.ini.tmpl`）で、
+      # 空のホストディレクトリを重ねるとインストール自体が隠れてGatewayが
+      # 起動しない。永続化の口は上流が用意している `TWS_SETTINGS_PATH` である。
+      - ./tws_settings:/home/ibgateway/tws_settings

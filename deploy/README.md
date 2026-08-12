@@ -15,9 +15,9 @@ VPSではこの制約ごと消える。
 | | 要件 |
 | --- | --- |
 | メモリ | **2GB以上。** IB Gateway単体で1GB前後使い、これに Python + pandas が乗る |
-| OS | Ubuntu LTS 等。`OnCalendar` のタイムゾーン指定を使うので **systemd 252以降**が望ましい |
+| OS | **Ubuntu 24.04 LTS**（systemd 255）。`OnCalendar` 末尾のタイムゾーン指定は **systemd 252以降でしか解釈されず**、22.04(systemd 249)ではタイマーの読み込み自体が失敗する。22.04を使うなら `Asia/Tokyo` を外し `timedatectl` でシステム側を合わせること |
 | タイムゾーン | `sudo timedatectl set-timezone Asia/Tokyo`（timerにTZを明示してあるので必須ではないが、ログが読みやすい） |
-| パッケージ | `procps`（`pkill`/`pgrep`）。通常は導入済みだが、**無いと `after_close.sh` がBotを止められない** |
+| パッケージ | `procps`（`pkill`/`pgrep`）。通常は導入済みだが、**無いと `after_close.sh` がBotを止められない**。ほかに `git` / `python3-venv` / `rsync`（`fetch_vps_logs.sh` の受け側） |
 
 **2GBで足りるのは、常駐するプロセスが実質2つだけだからである。** `after_close.sh` は
 ランキング記録(yfinance・639銘柄)の**前にBotを停止する**ため、ピークが重ならない。
@@ -73,7 +73,8 @@ docker compose logs -f                   # ログイン成功まで見届ける
 | `READ_ONLY_API` | `no` | Botは実際に発注する。read-onlyだと注文が拒否される |
 | `AUTO_RESTART_TIME` | `12:00 PM` | **既定の23:59は 10:59 ET＝ザラ場のど真ん中。** Botが停止している時間帯(06:05〜22:15 JST)に置く |
 | ポート公開 | `127.0.0.1:4002:4004` | **APIポートには認証が無い。** 下記参照 |
-| Jtsのvolume | `./tws_settings` | 設定を永続化しないと Order Presets の修正が再起動で消える |
+| `TWS_ACCEPT_INCOMING` | `accept` | 既定(`manual`)はAPI接続の確認ダイアログを出し、人が押すまで通らない |
+| 設定のvolume | `./tws_settings` → `/home/ibgateway/tws_settings` | 永続化しないと Order Presets の修正が再起動で消える。**`/home/ibgateway/Jts` へマウントしてはならない**——Gateway本体の導入先で、空のディレクトリを重ねると起動しなくなる |
 
 **APIポートは必ず `127.0.0.1` に束ねること。** `"4002:4004"` と書くと 0.0.0.0 で
 公開され、インターネットから誰でも発注できる状態になる。**dockerのポート公開は
