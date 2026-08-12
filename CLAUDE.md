@@ -124,7 +124,7 @@
 | 環境変数 | 既定値 | 説明 |
 | --- | --- | --- |
 | `IBKR_HOST` | `127.0.0.1` | 接続先ホスト |
-| `IBKR_PORT` | `7497` | ポート番号（下表参照） |
+| `IBKR_PORT` | `4002` | ポート番号（下表参照）。VPSではGUIの無いIB Gatewayで運用するため、既定はGatewayのペーパーポート |
 | `IBKR_CLIENT_ID` | `1` | クライアントID（他プロセスと重複させないこと） |
 | `IBKR_MARKET_DATA_TYPE` | `3` | マーケットデータ種別。1=LIVE / 2=FROZEN / 3=DELAYED / 4=DELAYED_FROZEN |
 

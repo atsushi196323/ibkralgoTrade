@@ -32,7 +32,10 @@ class IBKRConnection:
         max_delay_seconds: float = 60.0,
     ) -> None:
         self.host: str = host if host is not None else os.getenv("IBKR_HOST", "127.0.0.1")
-        self.port: int = int(port if port is not None else os.getenv("IBKR_PORT", "7497"))
+        # 既定はIB Gatewayのペーパーポート(4002)。VPSではGUIの無いGatewayで
+        # 運用するため、TWS(7497)を既定にすると .env の書き漏れが「接続だけ
+        # できない」形で現れる。どちらもペーパー側なので許可リストは通る。
+        self.port: int = int(port if port is not None else os.getenv("IBKR_PORT", "4002"))
         self.client_id: int = int(client_id if client_id is not None else os.getenv("IBKR_CLIENT_ID", "1"))
         # ペーパー口座はリアルタイムデータの購読契約を持たないことが多く、
         # 未設定のままだとreqMktData/reqHistoricalDataが実データを返せず

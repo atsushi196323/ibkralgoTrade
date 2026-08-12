@@ -38,7 +38,7 @@ def test_init_uses_hardcoded_defaults_when_no_args_or_env(monkeypatch, mock_ib_c
     connection = IBKRConnection()
 
     assert connection.host == "127.0.0.1"
-    assert connection.port == 7497
+    assert connection.port == 4002
     assert connection.client_id == 1
     # ペーパー口座はリアルタイムデータの購読契約を持たないことが多いため、
     # 未設定時は遅延データ(3)をデフォルトにする。
