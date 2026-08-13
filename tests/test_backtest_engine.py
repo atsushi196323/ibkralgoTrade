@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from backtest.costs import ZERO_COST, CostModel
-from backtest.engine import BacktestConfig, Trade, run_backtest
+from backtest.engine import REASON_SESSION_END, BacktestConfig, Trade, run_backtest
 from strategy.exit_signal import REASON_STOP_LOSS, REASON_TAKE_PROFIT
 
 
@@ -343,3 +343,58 @@ def test_same_day_reentry_block_can_be_disabled() -> None:
     result = run_backtest("TEST", df, _config(costs=ZERO_COST, block_same_day_reentry=False))
 
     assert len(result.trades) > 1
+
+
+# --- 大引け前の強制決済（デイトレード） ---------------------------------------------
+
+
+def _two_day_intraday_df() -> pd.DataFrame:
+    """1日目の途中で買い、利確にも損切りにも届かないまま日をまたぐ日中足。"""
+    # 6本目で MA(5)=98.0 に対し 90.0（乖離 -8.2%）となり買いシグナルが立つ。
+    # 以降は損切り(85.5)にも利確(99.0)にもトレーリング(高値-3%)にも届かない。
+    day1 = _intraday_df([100.0] * 5 + [90.0, 90.5], day="2026-01-05")
+    day2 = _intraday_df([90.6, 90.7], day="2026-01-06")
+    return pd.concat([day1, day2], ignore_index=True)
+
+
+def test_positions_are_flattened_at_the_session_close() -> None:
+    """デイトレード検証では、建玉を取引日の最後のバーで手仕舞うこと。
+
+    ライブのデイトレード判定で建てた建玉は米国東部時間15:55に強制決済する
+    （オーバーナイトのギャップリスクを避けるため）。これを外したまま5分足を
+    回すと建玉が翌日以降へ繋がり、**検証しているものがライブと別の戦略になる**。
+    """
+    result = run_backtest(
+        "TEST", _two_day_intraday_df(), _config(costs=ZERO_COST, close_at_session_end=True),
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.reason == REASON_SESSION_END
+    # 1日目の最後のバー(10:00)で決済していること（翌日へ持ち越していない）。
+    assert trade.exit_date == pd.Timestamp("2026-01-05 10:00")
+    assert trade.exit_price == pytest.approx(90.5)
+
+
+def test_swing_backtests_still_hold_overnight() -> None:
+    """既定(False)では持ち越すこと。日足＝スイングの検証結果を変えてはならない。"""
+    result = run_backtest("TEST", _two_day_intraday_df(), _config(costs=ZERO_COST))
+
+    assert len(result.trades) == 1
+    assert result.trades[0].reason == "END_OF_DATA"
+    assert result.trades[0].exit_date == pd.Timestamp("2026-01-06 09:35")
+
+
+def test_no_entry_on_the_last_bar_of_a_session() -> None:
+    """大引けで手仕舞う設定では、その日の最後のバーで建てないこと。
+
+    建てても同じバーで決済することになり、往復の手数料とスリッページだけを
+    負う建玉が生まれる（ライブにこの動きは無い）。
+    """
+    df = _intraday_df([100.0] * 5 + [90.0], day="2026-01-05")
+
+    result = run_backtest(
+        "TEST", df, _config(costs=ZERO_COST, close_at_session_end=True),
+    )
+
+    assert result.trades == []

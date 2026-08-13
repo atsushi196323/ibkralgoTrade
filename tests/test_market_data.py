@@ -9,6 +9,7 @@ import pytest
 
 from core.market_hours import US_EASTERN
 from data.market_data import (
+    DEFAULT_HISTORICAL_TIMEOUT_SECONDS,
     PRICE_SOURCE_HISTORICAL,
     PRICE_SOURCE_SNAPSHOT,
     PRICE_SOURCE_STREAMING,
@@ -326,6 +327,7 @@ def test_get_intraday_bars_delegates_to_historical_bars_with_given_params() -> N
 
     mock_get_bars.assert_awaited_once_with(
         ib, contract, duration="2 D", bar_size="5 mins", what_to_show="TRADES",
+        timeout=DEFAULT_HISTORICAL_TIMEOUT_SECONDS,
     )
     assert result is expected_df
 
@@ -341,6 +343,7 @@ def test_get_intraday_bars_uses_day_trade_defaults() -> None:
 
     mock_get_bars.assert_awaited_once_with(
         ib, contract, duration="2 D", bar_size="5 mins", what_to_show="TRADES",
+        timeout=DEFAULT_HISTORICAL_TIMEOUT_SECONDS,
     )
 
 
@@ -543,3 +546,21 @@ def test_quote_is_none_when_every_route_fails() -> None:
         )
 
     assert quote is None
+
+
+def test_historical_bars_pass_the_timeout_through() -> None:
+    """重い取得のためにタイムアウトを延ばせること。
+
+    **タイムアウトは例外ではなく空のバー列として返る**（ib_asyncが要求を
+    取り消し、IBKRが Error 162 を返す）。ペーシング違反と区別がつかないため、
+    1年ぶんの5分足のような重い取得では呼び出し側が延ばせる必要がある
+    （2026-08-13に42銘柄中41銘柄が既定の60秒で空を返した）。
+    """
+    ib = MagicMock()
+    ib.reqHistoricalDataAsync = AsyncMock(return_value=[])
+
+    asyncio.run(get_historical_bars_async(
+        ib, MagicMock(symbol="AAPL"), duration="1 Y", bar_size="5 mins", timeout=300.0,
+    ))
+
+    assert ib.reqHistoricalDataAsync.await_args.kwargs["timeout"] == 300.0

@@ -397,13 +397,28 @@ async def get_usd_jpy_rate_async(
     )
 
 
+# ib_async の reqHistoricalDataAsync の既定タイムアウト。稼働中の取得
+# （日足300本・日中足2日分）はこれで十分に収まる。
+DEFAULT_HISTORICAL_TIMEOUT_SECONDS: float = 60.0
+
+
 async def get_historical_bars_async(
     ib: IB,
     contract: Contract,
     duration: str = "60 D",
     bar_size: str = "1 day",
     what_to_show: str = "TRADES",
+    timeout: float = DEFAULT_HISTORICAL_TIMEOUT_SECONDS,
 ) -> pd.DataFrame:
+    """ヒストリカルバーを取得する。
+
+    **タイムアウトすると例外ではなく空のバー列が返る**（ib_asyncが要求を
+    取り消し、IBKRが `Error 162 API historical data query cancelled` を
+    返す）。ペーシング違反と同じく呼び出し側からは「データが無い銘柄」と
+    区別がつかないため、重い取得では `timeout` を延ばすこと——1年ぶんの
+    5分足（約19,500本）は既定の60秒に収まらない銘柄が多い（2026-08-13に
+    実測。42銘柄中41銘柄がちょうど60秒で空を返し、INTCだけが間に合った）。
+    """
     # IBKRの「10分あたり60件」制限を超えると、例外ではなく空のバー列が返るため
     # 呼び出し側から違反を検知できない。発行前に必ず枠を確保する。
     await _historical_pacer.acquire()
@@ -416,6 +431,7 @@ async def get_historical_bars_async(
         whatToShow=what_to_show,
         useRTH=True,
         formatDate=1,
+        timeout=timeout,
     )
     df: pd.DataFrame = ib_util.df(bars)
     if df is None:
@@ -441,6 +457,7 @@ async def get_intraday_bars_async(
     duration: str = "2 D",
     bar_size: str = "5 mins",
     what_to_show: str = "TRADES",
+    timeout: float = DEFAULT_HISTORICAL_TIMEOUT_SECONDS,
 ) -> pd.DataFrame:
     """デイトレード向けの短期足（分足・秒足・時間足）を取得する。
 
@@ -456,4 +473,5 @@ async def get_intraday_bars_async(
 
     return await get_historical_bars_async(
         ib, contract, duration=duration, bar_size=bar_size, what_to_show=what_to_show,
+        timeout=timeout,
     )

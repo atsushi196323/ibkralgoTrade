@@ -27,6 +27,10 @@ from strategy.pullback import MarketFilterConfig, detect_pullback_signal
 
 logger = logging.getLogger(__name__)
 
+# 大引け前の強制決済（デイトレード）。ライブでは米国東部時間15:55に出す成行で、
+# バックテストではその取引日の最後のバーの終値で約定させる。
+REASON_SESSION_END: str = "SESSION_END"
+
 
 @dataclass
 class BacktestConfig:
@@ -47,6 +51,17 @@ class BacktestConfig:
     market_min_deviation_pct: Optional[float] = None
     market_max_deviation_pct: Optional[float] = None
     relative_threshold_pct: Optional[float] = None
+    # 取引日の最後のバーで建玉を手仕舞う（デイトレード検証用。既定False）。
+    #
+    # **日中足でこれを外すと、検証しているものがライブと別の戦略になる。**
+    # ライブのデイトレード判定で建てた建玉は米国東部時間15:55に強制決済し
+    # （`main.py` の大引け前決済。オーバーナイトのギャップリスクを避けるため）、
+    # スイングだけが持ち越す。外したまま5分足を回すと建玉が翌日以降へ繋がり、
+    # ギャップの分だけ損益が別物になる。
+    #
+    # 日足では1バー=1日なので毎バー決済することになり意味を成さない。
+    # 既定をFalseにしているのはそのため（スイングの検証結果は変わらない）。
+    close_at_session_end: bool = False
     # 決済した当日は同じ銘柄へ再エントリーしない（ライブ側と揃えるための既定True）。
     # これが無いと、下落トレンド中に「買う→損切り→また買う」を1日に何度も
     # 繰り返す。日足のように1バー=1日のデータでは元々起こらないため無影響だが、
@@ -167,10 +182,17 @@ def run_backtest(symbol: str, df: pd.DataFrame, config: Optional[BacktestConfig]
         bar = _bar_at(df, i, close_price)
         current_day = _trading_day_of(dates.iloc[i])
         is_last_bar = i == len(df) - 1
+        # その取引日の最後のバーか（次のバーの取引日が変わるか）。
+        is_session_end = config.close_at_session_end and (
+            is_last_bar or _trading_day_of(dates.iloc[i + 1]) != current_day
+        )
 
         if position_qty == 0:
             in_cooldown = config.block_same_day_reentry and current_day == last_exit_day
-            if not in_cooldown and i + 1 >= config.ma_window:
+            # 大引けで手仕舞う設定のとき、その日の最後のバーでは建てない。
+            # 建てても同じバーで決済することになり、往復の手数料とスリッページ
+            # だけを負う建玉が生まれる（ライブにこの動きは無い）。
+            if not in_cooldown and not is_session_end and i + 1 >= config.ma_window:
                 window_df = df.iloc[max(0, i + 1 - config.ma_window): i + 1]
                 market_deviation = None
                 if market_deviations is not None:
@@ -234,7 +256,7 @@ def run_backtest(symbol: str, df: pd.DataFrame, config: Optional[BacktestConfig]
 
             should_sell = resting_exit is not None or (result is not None and result.should_sell)
 
-            if should_sell or is_last_bar:
+            if should_sell or is_last_bar or is_session_end:
                 if resting_exit is not None:
                     reason = resting_exit.reason
                     # 逆指値はトリガー後に成行になるためスリッページを負う。
@@ -244,8 +266,13 @@ def run_backtest(symbol: str, df: pd.DataFrame, config: Optional[BacktestConfig]
                         if reason == REASON_STOP_LOSS else resting_exit.fill_price
                     )
                 else:
-                    # トレーリングと期末の手仕舞いはボットが成行で出す。
-                    reason = result.reason if result is not None and result.should_sell else "END_OF_DATA"
+                    # トレーリング・大引け・期末の手仕舞いはボットが成行で出す。
+                    if result is not None and result.should_sell:
+                        reason = result.reason
+                    elif is_session_end and not is_last_bar:
+                        reason = REASON_SESSION_END
+                    else:
+                        reason = "END_OF_DATA"
                     exit_fill_price = costs.sell_fill_price(close_price)
 
                 exit_commission = costs.commission_for(position_qty, exit_fill_price)

@@ -41,6 +41,12 @@ DEFAULT_OUT_DIR: str = "bars/intraday"
 DEFAULT_DURATION: str = "1 Y"
 DEFAULT_BAR_SIZE: str = "5 mins"
 
+# 1年ぶんの5分足（約19,500本）は ib_async の既定タイムアウト(60秒)に
+# 収まらない。**タイムアウトは例外ではなく空のバー列として返る**ため、
+# 短すぎると「データが無い銘柄」と区別がつかない（2026-08-13に42銘柄中41銘柄が
+# ちょうど60秒で空を返した）。取得は1回きりなので長めに取る。
+DEFAULT_TIMEOUT_SECONDS: float = 300.0
+
 # 本体(main.py)と衝突しないクライアントID。稼働中に流すと同じIDでは接続できない。
 DEFAULT_CLIENT_ID: int = 9
 
@@ -73,6 +79,8 @@ def _parse_args() -> argparse.Namespace:
                         help="reqHistoricalDataのdurationStr。5分足の上限は 1 Y。")
     parser.add_argument("--bar-size", default=DEFAULT_BAR_SIZE)
     parser.add_argument("--client-id", type=int, default=DEFAULT_CLIENT_ID)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
+                        help="1リクエストの待ち時間の上限(秒)。超えると空で返る。")
     parser.add_argument("--force", action="store_true",
                         help="既存のCSVがあっても取得し直す。")
     return parser.parse_args()
@@ -94,6 +102,7 @@ async def _fetch_one_async(ib, symbol: str, args: argparse.Namespace) -> Optiona
         return None
     bars = await get_intraday_bars_async(
         ib, contract, duration=args.duration, bar_size=args.bar_size,
+        timeout=args.timeout,
     )
     if bars is None or bars.empty:
         # ペーシング違反は例外ではなく空のバー列として返る（CLAUDE.md「6.1」）。
