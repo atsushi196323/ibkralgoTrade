@@ -526,9 +526,17 @@ IBKR（既定）と CSV（`--csv`）の2通り。`run_backtest` が要求する�
 
 損切りが遠い側へずれるため、1トレードのリスクが設計値(1%)を超える。実際この日、先に発動したのは**Bot側のポーリング判定**（建値-5% = 64.38）だった。ブローカー側に待機注文を置く意味は「プロセスが落ちていても効く」ことにあるので、その注文が実勢とずれた位置にあると防御の主役がBot側へ移り、設計の前提が崩れる。
 
-**置き直しの修正には、IBKRが書き換えた側のOCAグループ名を付けること**（`_adopt_broker_oca_group_async`）。IBKRは子注文の `ocaGroup` を親のpermIdへ書き換えるが（同節の後述）、こちら側の `Order` は送信時の名前を保持したままである。**その名前のまま修正を送ると、IBKRはOCAグループを変更しようとしていると解釈し、`Error 10326（OCAグループの見直しはできません）` で修正ごと拒否する。** 突き合わせは銘柄＋注文種別で行う——permIdはローカルの `Order` に載るのがブローカーからの状態更新後で、置き直しの時点では0のままでありうる。
+**置き直しの修正には、IBKRが使う側のOCAグループ名＝親注文のpermIdを付けること**（`_adopt_parent_perm_id_as_oca_group`）。IBKRは子注文の `ocaGroup` を親のpermIdへ書き換えるが、こちら側の `Order` は送信時の名前を保持したままである。**その名前のまま修正を送ると、IBKRはOCAグループを変更しようとしていると解釈し、`Error 10326（OCAグループの見直しはできません）` で修正ごと拒否する。**
 
-**そして、書き換えが届くまで待ってから修正を送ること**（`_OCA_GROUP_REWRITE_TIMEOUT_SECONDS`、現在5秒）。**書き換えは親の約定より後に届くため、約定直後に一度読むだけでは間に合わない。** 空振りすると取り込みが起きず、修正はやはり10326で拒否される。2026-08-06(INTC)・2026-08-10(UPS)の**2回とも実約定に合わせた置き直しが不発**になっており、UPSでは親の約定から3秒後に読んでもまだ送信時の名前のままだった（その結果、実約定104.06に対し損切りが98.69＝**-5.16%**の位置に残った。意図は-5%）。**拒否は警告としてしか見えず元の注文が生き続けるため、生存確認では気付けない。** 読めないまま上限に達したらWARNINGを1行出して先へ進む（待ち続けると建玉直後のサイクルが返らなくなる。実害は読み直しの検証が捕まえる）。`tests/test_order_manager.py` の `test_the_reprice_waits_for_ibkr_to_rewrite_the_oca_group` / `test_the_reprice_gives_up_waiting_for_the_oca_rewrite_instead_of_hanging` が番人。
+**書き換え後の名前をブローカーから読み直そうとしてはならない。在セッション中には読めない**（2026-08-13に確定）。ib_async 2.1.0 の `Wrapper.openOrder` は、同じセッションで自分が出した注文については既存の `Trade` を再利用し、更新するのは `permId / totalQuantity / lmtPrice / auxPrice / orderType / orderRef` **だけ**である——`ocaGroup` は更新対象に入っていない。したがって `reqAllOpenOrdersAsync()` は自分が送った名前を返し続ける。
+
+かつてここには「書き換えが届くまで5秒待つ」ポーリングを置いていたが、**待ち時間の問題ではないため必ず空振りし、置き直しは3回とも 10326 で拒否された**（2026-08-06 INTC・2026-08-10 UPS・2026-08-12 INTC。UPSは実約定104.06に対し損切りが98.69＝**-5.16%**、INTCは実約定102.41に対し95.44＝**-6.81%**の位置に残り、リスクが資金の1.16%＝設計値1%を超えた）。
+
+2026-08-12のログがこれを裏付けている。**同じファイルの中で、前のセッションで発注したUPSの子注文は書き換え後の `ocaGroup='1448732136'`（＝親のpermId。子は ...137 / ...138）で読めるのに対し、同じセッションで発注したINTCの子注文は6時間半後まで `BRACKET_INTC_128689795724352` のままだった**（親のpermIdは470578601、子は470578602 / 470578603）。**読めないだけで、書き換え自体は起きている。**
+
+`permId` は上記のとおり `openOrder` が更新するフィールドなので、親の約定後には必ず読める。読めない場合（0）は名前を触らずに進む——修正が拒否される可能性は残るが、それは読み直しの検証が捕まえる。`tests/test_order_manager.py` の `test_the_reprice_names_the_oca_group_after_the_parent_perm_id` / `test_the_reprice_does_not_wait_to_read_back_the_rewritten_oca_group` / `test_a_parent_without_a_perm_id_leaves_the_oca_group_alone` が番人。
+
+**同じ制約は `tif` にも掛かる**（`openOrder` の更新対象外）。そのため `_warn_about_tif_downgrades` が検知できるのは**前のセッションから持ち越した建玉の待機注文**——夜間の失効が実際に問題になる側——に限られ、**建てた当日の「検知なし」は上書きが無かったことの証拠にならない**。その日のうちの手掛かりは `Error 10349` のログだけである。
 
 **そして、修正が板に届いたことをブローカーから読み直して確かめること**（`_read_back_resting_prices_async`）。**10326は注文を拒否しても元の注文をそのまま生かすため、`_ensure_children_are_live_async` の生存確認は通ってしまう。** 確かめずに新しい値段を返すと `positions.json` にブローカーが持っていない値段が残り、Bot側の損切り判定・R倍率・置き直しの基準がすべてそこからずれる。届かなかった場合は板にある実際の値段を記録する。
 
@@ -539,7 +547,7 @@ IBKR（既定）と CSV（`--csv`）の2通り。`run_backtest` が要求する�
 | 損切り STP | 92.09 | **93.38** |
 | 利確 LMT | 106.63 | **108.12** |
 
-`tests/test_order_manager.py` の `test_the_reprice_adopts_the_oca_group_ibkr_rewrote` / `test_a_reprice_that_never_reached_the_book_is_recorded_at_the_broker_price` が番人。
+`tests/test_order_manager.py` の `test_a_reprice_that_never_reached_the_book_is_recorded_at_the_broker_price` が番人。
 
 **さらに、毎サイクルの突き合わせで値段そのものも照合すること**（`main._adopt_broker_resting_prices`）。**両方が生きていることは、値段が意図どおりであることを意味しない。** 上の10326も呼値違反(`Warning 110`)も、拒否しても元の注文を生かすため、`is_complete` による生存確認だけでは通り抜ける。ずれていたら**板の値を正として記録し直す**——実際に約定するのは板にある注文であって記録ではなく、記録側に寄せるとR倍率が実際に負ったリスクと違う値で残る。読めなかった側は触らない（「確かめられなかった」を「一致した」として扱わないため）。**逆指値を板の値へ寄せたら、R倍率の分母(`Position.risk_per_share`)も同じ値から取り直すこと。** 分母は「実際に置いた待機注文の値段」から取る約束（`main._enter_position_async`）なので、値段だけ直して据え置くと、板を正としておきながらRだけが「置くつもりだった損切り」で残る。INTCの実測では 92.09 → 93.38 でリスクは 4.84 ではなく 3.55 であり、Rが約36%過小に出る。`tests/test_main.py` の `test_recorded_resting_prices_are_corrected_to_the_book` / `test_resting_prices_that_could_not_be_read_are_left_alone` が番人。
 

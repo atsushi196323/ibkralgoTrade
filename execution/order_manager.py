@@ -452,11 +452,6 @@ _OCA_GROUP_PREFIX: str = "BRACKET"
 # OCAグループの取り消し方式。2 = 「約定した分だけ残りを減らす（オーバーフィル抑制あり）」。
 # 1(即時取り消し)より約定の重複が起きにくいIBKRの推奨値。
 _OCA_TYPE_REDUCE_WITH_OVERFILL_PROTECTION: int = 2
-# IBKRが子注文のOCAグループ名を親のpermIdへ書き換えるのを待つ上限。
-# 実測(2026-08-10 UPS)では親の約定から3秒後に読んでもまだ書き換わっておらず、
-# 取り込みが空振りして置き直しが 10326 で拒否された。約定直後の一度きりの
-# 読み取りでは足りない（`_adopt_broker_oca_group_async`）。
-_OCA_GROUP_REWRITE_TIMEOUT_SECONDS: float = 5.0
 
 
 @dataclass
@@ -652,6 +647,7 @@ async def place_bracket_order_async(
     # 子注文の値段は、参照価格ではなく**実約定価格**を基準に置き直す。
     stop_price, take_profit_price = await _reprice_children_to_fill_async(
         ib, contract, orders, reference_price, fill_price, stop_ratio, take_profit_ratio,
+        parent_trade.order,
     )
 
     # 親が約定した = 建玉ができた時点で、子注文が本当にブローカー側で生きているかを
@@ -690,6 +686,7 @@ async def _reprice_children_to_fill_async(
     fill_price: Optional[float],
     stop_ratio: float,
     take_profit_ratio: float,
+    parent: Order,
 ) -> tuple:
     """子注文の値段を、参照価格ではなく実約定価格を基準に置き直す。
 
@@ -711,10 +708,11 @@ async def _reprice_children_to_fill_async(
     **修正時は transmit=True にすること。** グループは既に送信済みなので、
     Falseのままだと修正が市場へ届かない。
 
-    **修正の前に、IBKRが書き換えた `ocaGroup` を取り込むこと。** IBKRは子注文の
-    OCAグループ名をこちらが付けた名前から親のpermIdへ書き換えるが、こちら側の
-    `Order` は送信時の名前を保持したままである。その状態で修正を送ると、
-    IBKRは**OCAグループを変更しようとしている**と解釈して
+    **修正の前に、OCAグループ名を親のpermIdへ揃えること**
+    （`_adopt_parent_perm_id_as_oca_group`）。IBKRは子注文のOCAグループ名を
+    こちらが付けた名前から親のpermIdへ書き換えるが、こちら側の `Order` は
+    送信時の名前を保持したままである。その状態で修正を送ると、IBKRは
+    **OCAグループを変更しようとしている**と解釈して
     `Error 10326（OCAグループの見直しはできません）` で修正ごと拒否する。
 
     **修正が板に届いたことは、ブローカーから読み直して確かめること。** 10326は
@@ -734,7 +732,7 @@ async def _reprice_children_to_fill_async(
     if new_stop == stop_price and new_take_profit == take_profit_price:
         return stop_price, take_profit_price
 
-    await _adopt_broker_oca_group_async(ib, contract.symbol, orders)
+    _adopt_parent_perm_id_as_oca_group(contract.symbol, orders, parent)
 
     orders.stop_loss.auxPrice = new_stop
     orders.take_profit.lmtPrice = new_take_profit
@@ -764,70 +762,49 @@ async def _reprice_children_to_fill_async(
     return new_stop, new_take_profit
 
 
-async def _adopt_broker_oca_group_async(ib: IB, symbol: str, orders: BracketOrders) -> None:
-    """IBKR側で書き換えられたOCAグループ名を、こちらの子注文へ取り込む。
+def _adopt_parent_perm_id_as_oca_group(
+    symbol: str, orders: BracketOrders, parent: Order,
+) -> None:
+    """子注文のOCAグループ名を、IBKRが使う名前（親のpermId）へ揃える。
 
-    取り込まないまま修正を送ると `Error 10326` で拒否される（この関数の
-    呼び出し元のdocstringを参照）。読めなければ何もしない——修正が拒否される
-    可能性は残るが、それは読み直しの検証(`_read_back_resting_prices_async`)が
-    捕まえる。ここで推測した名前を入れる方が危険である。
+    IBKRは子注文の `ocaGroup` を、こちらが付けた名前(`BRACKET_INTC_...`)から
+    **親注文のpermId**へ書き換える。こちら側の `Order` は送信時の名前を保持した
+    ままなので、その名前で修正を送るとIBKRはOCAグループを変更しようとしていると
+    解釈し、`Error 10326` で修正ごと拒否する。
 
-    **突き合わせは銘柄＋注文種別で行う**（`_is_resting_exit_order` と同じ方針）。
-    permIdで引かないのは、ローカルの `Order` にpermIdが載るのがブローカーからの
-    状態更新を受けた後で、置き直しの時点で 0 のままでありうるためである。
-    `PositionManager` は1銘柄1建玉なので、STPとLMTはそれぞれ1件に定まる。
+    **書き換え後の名前をブローカーから読み直すことはできない。** ib_async 2.1.0 の
+    `Wrapper.openOrder` は、同じセッションで自分が出した注文については既存の
+    `Trade` を再利用し、更新するのは `permId / totalQuantity / lmtPrice /
+    auxPrice / orderType / orderRef` **だけ**である——`ocaGroup` は更新対象に
+    入っていない。したがって `reqAllOpenOrdersAsync()` は自分が送った名前を
+    そのまま返し続け、**在セッション中に書き換えを観測する方法が無い**。
+    かつてここには書き換えが読めるまで待つポーリングを置いていたが、待ち時間の
+    問題ではないため必ず空振りし、置き直しは3回とも 10326 で拒否された
+    （2026-08-06 INTC・2026-08-10 UPS・2026-08-12 INTC）。
 
-    **1回読んで終わりにしてはならない。書き換えは親の約定より後に届く。**
-    親が約定した直後に読むと、まだこちらが送った名前のままの子注文が返り、
-    取り込みが空振りして修正が 10326 で拒否される。2026-08-06(INTC)・
-    2026-08-10(UPS) の2回とも、実約定に合わせた置き直しがこれで不発になり、
-    待機注文が参照価格ベースの位置に残った（UPSは実約定104.06に対し損切り
-    98.69 ＝ -5.16%。意図は -5%）。**拒否は警告としてしか見えず、元の注文が
-    生き続けるため、生存確認では気付けない。** 書き換えが届くまで
-    `_OCA_GROUP_REWRITE_TIMEOUT_SECONDS` だけ待つ。
+    2026-08-12のログがこれを裏付けている。同じファイルの中で、前のセッションで
+    発注したUPSの子注文は書き換え後の `ocaGroup='1448732136'`（＝親のpermId。子は
+    ...137 / ...138）で読めるのに対し、同じセッションで発注したINTCの子注文は
+    6時間半後まで `BRACKET_INTC_128689795724352` のままだった（親のpermIdは
+    470578601、子は 470578602 / 470578603）。**読めないだけで、書き換え自体は
+    起きている。**
 
-    待ち切れなければ何もせず戻る——修正が拒否される可能性は残るが、それは
-    読み直しの検証(`_read_back_resting_prices_async`)が捕まえる。ここで
-    推測した名前を入れる方が危険である。
+    permId は上記のとおり `openOrder` が更新するフィールドなので、親の約定後には
+    必ず読める。読めなかった場合（0）は何もしない——修正が拒否される可能性は
+    残るが、それは読み直しの検証(`_read_back_resting_prices_async`)が捕まえる。
+    ここで推測した名前を入れる方が危険である。
     """
-    children = (orders.stop_loss, orders.take_profit)
-    # 書き換えが届いたかは「こちらが送った名前と違うか」で判定する。取り込んだ
-    # 後の値と比べると、2周目以降に自分が入れた名前を見て「まだ未着」と誤判定する。
-    sent_groups = {child.orderType: child.ocaGroup for child in children}
+    perm_id = int(getattr(parent, "permId", 0) or 0)
+    if perm_id <= 0:
+        logger.warning(
+            "[%s] 親注文のpermIdが読めないため、OCAグループ名を揃えられませんでした。"
+            "待機注文の置き直しが 10326 で拒否される可能性があります。",
+            symbol,
+        )
+        return
 
-    waited = 0.0
-    while True:
-        try:
-            trades = await ib.reqAllOpenOrdersAsync()
-        except Exception:
-            logger.warning("[%s] OCAグループ名の読み直しに失敗しました。", symbol, exc_info=True)
-            return
-
-        by_order_type = {
-            trade.order.orderType: trade.order
-            for trade in trades
-            if _is_resting_exit_order(trade, symbol)
-        }
-        rewritten = True
-        for child in children:
-            live_order = by_order_type.get(child.orderType)
-            live_group = getattr(live_order, "ocaGroup", "") or "" if live_order else ""
-            if not live_group or live_group == sent_groups[child.orderType]:
-                rewritten = False
-                continue
-            child.ocaGroup = live_group
-
-        if rewritten or waited >= _OCA_GROUP_REWRITE_TIMEOUT_SECONDS:
-            if not rewritten:
-                logger.warning(
-                    "[%s] IBKRによるOCAグループ名の書き換えが %.0f 秒以内に読めませんでした。"
-                    "置き直しが 10326 で拒否される可能性があります。",
-                    symbol, _OCA_GROUP_REWRITE_TIMEOUT_SECONDS,
-                )
-            return
-
-        await asyncio.sleep(_ORDER_STATUS_POLL_INTERVAL_SECONDS)
-        waited += _ORDER_STATUS_POLL_INTERVAL_SECONDS
+    for child in (orders.stop_loss, orders.take_profit):
+        child.ocaGroup = str(perm_id)
 
 
 async def _read_back_resting_prices_async(ib: IB, symbol: str) -> tuple:
@@ -1041,6 +1018,16 @@ def _warn_about_tif_downgrades(downgraded: Dict[str, set]) -> None:
     実際に `tif='DAY'` だった）。上書きは注文を拒否しないので発注は成功し、
     こちらの `Order` オブジェクトは送信時の `GTC` を保持したままになる。
     **つまりブローカーから読み直さない限り、この縮退はどこにも現れない。**
+
+    **ただし同じセッションで自分が出した注文については、読み直しても現れない。**
+    ib_async 2.1.0 の `Wrapper.openOrder` は既存の `Trade` を再利用し、更新するのは
+    `permId / totalQuantity / lmtPrice / auxPrice / orderType / orderRef` だけで、
+    `tif` は更新対象に入っていない（`_adopt_parent_perm_id_as_oca_group` が
+    `ocaGroup` について同じ制約を受けているのと同じ理由）。したがってここで
+    検知できるのは**前のセッションから持ち越した建玉の待機注文**——つまり
+    夜間の失効が実際に問題になる側——に限られる。建てた当日の
+    「検知なし」は、上書きが無かったことの証拠にはならない。
+    その日のうちの手掛かりは `Error 10349` のログだけである。
 
     DAY のまま持ち越すと待機注文が引けで失効し、翌日の寄り付きまで損切りの
     無い時間ができる。毎サイクルの突き合わせが翌日には置き直すが、
