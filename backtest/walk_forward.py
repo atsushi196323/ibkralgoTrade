@@ -51,6 +51,11 @@ class ParameterGrid:
     market_min_deviation_pct: Sequence[Optional[float]] = (None,)
     market_max_deviation_pct: Sequence[Optional[float]] = (None,)
     relative_threshold_pct: Sequence[Optional[float]] = (None,)
+    # 大引け前の強制決済（デイトレード検証）。**探索の軸ではない。**
+    # ライブがどう決済するかは戦略の前提であって、学習期間に選ばせるもの
+    # ではない（選ばせると「持ち越した方が成績が良い」設定が選ばれ、
+    # ライブでは実行できない戦略を検証することになる）。
+    close_at_session_end: bool = False
 
     def combinations(self) -> List[BacktestConfig]:
         fields = [
@@ -60,7 +65,13 @@ class ParameterGrid:
             "relative_threshold_pct",
         ]
         value_lists = [getattr(self, name) for name in fields]
-        return [BacktestConfig(**dict(zip(fields, combo))) for combo in product(*value_lists)]
+        return [
+            BacktestConfig(
+                close_at_session_end=self.close_at_session_end,
+                **dict(zip(fields, combo)),
+            )
+            for combo in product(*value_lists)
+        ]
 
 
 @dataclass

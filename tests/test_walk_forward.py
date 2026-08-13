@@ -227,3 +227,27 @@ def test_infinite_profit_factor_is_broken_by_total_return() -> None:
     for window in result.windows:
         assert window.train_metrics.profit_factor == math.inf
         assert window.best_config.take_profit_pct == 10.0
+
+
+def test_the_grid_carries_the_session_close_setting_into_every_candidate() -> None:
+    """大引け決済は全候補に一律で掛かること（探索の軸にしない）。
+
+    ライブがどう決済するかは戦略の前提であって、学習期間に選ばせるもの
+    ではない。軸にすると「持ち越した方が成績が良い」設定が選ばれ、
+    ライブでは実行できない戦略を検証することになる。
+    """
+    grid = ParameterGrid(
+        ma_window=(20,), threshold_pct=(2.0,), take_profit_pct=(3.0,),
+        stop_loss_pct=(1.5,), trailing_stop_pct=(2.0,),
+        close_at_session_end=True,
+    )
+
+    combinations = grid.combinations()
+
+    assert combinations
+    assert all(config.close_at_session_end for config in combinations)
+
+
+def test_the_grid_defaults_to_holding_overnight() -> None:
+    """既定は持ち越し（日足＝スイングの検証結果を変えないため）。"""
+    assert all(not config.close_at_session_end for config in ParameterGrid().combinations())

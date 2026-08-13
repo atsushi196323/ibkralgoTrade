@@ -107,6 +107,28 @@ def _parse_args() -> argparse.Namespace:
              "小さくなり、小口座の成績を大幅に楽観視する。",
     )
 
+    strategy = parser.add_argument_group(
+        "戦略パラメータの探索範囲（既定はスイング＝日足で検証済みの範囲）",
+        "デイトレード(5分足)を検証するときは、ライブの既定値"
+        "（MA20 / -2% / +3% / -1.5% / トレーリング-2%）を含む範囲を明示すること。",
+    )
+    strategy.add_argument("--ma-window", type=int, nargs="*", default=None,
+                          help="移動平均期間の候補")
+    strategy.add_argument("--threshold", type=float, nargs="*", default=None,
+                          help="買いシグナルの下方乖離率(%%)の候補")
+    strategy.add_argument("--take-profit", type=float, nargs="*", default=None,
+                          help="利確幅(%%)の候補")
+    strategy.add_argument("--stop-loss", type=float, nargs="*", default=None,
+                          help="損切り幅(%%)の候補")
+    strategy.add_argument("--trailing-stop", type=float, nargs="*", default=None,
+                          help="トレーリングストップ幅(%%)の候補")
+    strategy.add_argument(
+        "--close-at-session-end", action="store_true",
+        help="取引日の最後のバーで建玉を手仕舞う（デイトレード検証では必須）。"
+             "ライブのデイトレード建玉は15:55 ETに強制決済するため、"
+             "これを付けずに日中足を回すと別の戦略を検証することになる。",
+    )
+
     market = parser.add_argument_group(
         "市場フィルター（指数の乖離率による追加条件。--market-csv が必須）"
     )
@@ -186,11 +208,23 @@ def _market_axis(values: Optional[List[float]], keep_unfiltered: bool) -> Sequen
     return tuple(values)
 
 
+def _axis(values, default):
+    """指定があればその候補列、無ければ既定の探索範囲を返す。"""
+    return tuple(values) if values else default
+
+
 def _build_grid(args: argparse.Namespace) -> ParameterGrid:
+    defaults = ParameterGrid()
     return ParameterGrid(
+        ma_window=_axis(args.ma_window, defaults.ma_window),
+        threshold_pct=_axis(args.threshold, defaults.threshold_pct),
+        take_profit_pct=_axis(args.take_profit, defaults.take_profit_pct),
+        stop_loss_pct=_axis(args.stop_loss, defaults.stop_loss_pct),
+        trailing_stop_pct=_axis(args.trailing_stop, defaults.trailing_stop_pct),
         market_min_deviation_pct=_market_axis(args.market_min_deviation, args.keep_unfiltered),
         market_max_deviation_pct=_market_axis(args.market_max_deviation, args.keep_unfiltered),
         relative_threshold_pct=_market_axis(args.relative_threshold, args.keep_unfiltered),
+        close_at_session_end=args.close_at_session_end,
     )
 
 
@@ -334,6 +368,10 @@ async def main() -> None:
         grid = _build_grid(args)
         config = replace(
             BacktestConfig(), costs=cost_model, initial_equity=args.initial_equity,
+            ma_window=grid.ma_window[0], threshold_pct=grid.threshold_pct[0],
+            take_profit_pct=grid.take_profit_pct[0], stop_loss_pct=grid.stop_loss_pct[0],
+            trailing_stop_pct=grid.trailing_stop_pct[0],
+            close_at_session_end=grid.close_at_session_end,
             market_min_deviation_pct=grid.market_min_deviation_pct[-1],
             market_max_deviation_pct=grid.market_max_deviation_pct[-1],
             relative_threshold_pct=grid.relative_threshold_pct[-1],
