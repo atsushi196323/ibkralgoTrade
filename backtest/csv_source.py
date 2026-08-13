@@ -21,12 +21,44 @@ from typing import Optional
 
 import pandas as pd
 
+from core.market_hours import US_EASTERN
+
 logger = logging.getLogger(__name__)
 
 _CLOSE_COLUMN: str = "close"
 # yfinanceの配当・分割調整済み終値。close列が無い場合の代替として使う。
 _ADJ_CLOSE_COLUMN: str = "adj close"
 _DATE_COLUMN: str = "date"
+
+
+# 日中足のタイムスタンプはIBKRが取引所のローカル時刻＋オフセット付きで返すため、
+# 1年ぶんのCSVには夏時間の境界をまたいで `-04:00` と `-05:00` が混在する。
+_TZ_OFFSET_PATTERN: str = r"(?:[+-]\d{2}:?\d{2}|Z)$"
+
+
+def _parse_dates(values: pd.Series) -> pd.Series:
+    """日付列をパースする。タイムゾーン付きなら米国東部時間へ揃える。
+
+    **混在オフセットの扱いはpandasのバージョンで変わる。** 2.2.2 は
+    `object` 型のSeriesとして通し（FutureWarning）、3.0.5 は
+    `ValueError: Mixed timezones detected` で落ちる。2026-08-13に、
+    同じ日中足CSVがMac(2.2.2)では読めてVPS(3.0.5)では落ちる状態を実測した。
+    **環境によって検証が通ったり落ちたりするのは、結果を信用できないのと同じ**
+    なので、ここで明示的に揃える。
+
+    東部時間へ変換するのは、`backtest.engine._trading_day_of` が
+    「同日中の再エントリー禁止」と「大引け前の強制決済」の区切りに
+    この値の日付を使うためである。取引日は東部時間で数える
+    （ライブ側のクールダウン・日次サーキットブレーカーと同じ区切り）。
+
+    **タイムゾーンを持たない日足CSVはそのまま扱う。** UTCとして解釈してから
+    東部時間へ変換すると、日付が1日前へずれる（UTC 00:00 = 前日19:00 ET）。
+    """
+    if not values.astype(str).str.contains(_TZ_OFFSET_PATTERN, regex=True, na=False).any():
+        return pd.to_datetime(values, errors="coerce")
+
+    parsed = pd.to_datetime(values, errors="coerce", utc=True)
+    return parsed.dt.tz_convert(US_EASTERN)
 
 
 def load_bars_from_csv(path: str, price_column: Optional[str] = None) -> pd.DataFrame:
@@ -60,7 +92,7 @@ def load_bars_from_csv(path: str, price_column: Optional[str] = None) -> pd.Data
     df[_CLOSE_COLUMN] = pd.to_numeric(df[_CLOSE_COLUMN], errors="coerce")
 
     if _DATE_COLUMN in df.columns:
-        df[_DATE_COLUMN] = pd.to_datetime(df[_DATE_COLUMN], errors="coerce")
+        df[_DATE_COLUMN] = _parse_dates(df[_DATE_COLUMN])
         # 日付が壊れている行は捨てる。並べ替えの基準が欠けると
         # バーの前後関係が崩れ、シグナル判定そのものが無意味になるため。
         df = df.dropna(subset=[_DATE_COLUMN])

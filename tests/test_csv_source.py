@@ -128,3 +128,42 @@ def test_loaded_df_is_directly_usable_by_backtest_engine(tmp_path) -> None:
 
     assert len(result.trades) == 1
     assert result.trades[0].entry_date == pd.Timestamp("2026-01-10")
+
+
+def test_intraday_timestamps_are_normalised_to_us_eastern(tmp_path) -> None:
+    """夏時間の境界をまたぐ日中足を、環境によらず同じように読めること。
+
+    IBKRの日中足は取引所のローカル時刻＋オフセットで返るため、1年ぶんの
+    CSVには `-04:00`(EDT) と `-05:00`(EST) が混在する。**この扱いはpandasの
+    バージョンで変わり**、2.2.2 は object 型で通し、3.0.5 は
+    `ValueError: Mixed timezones detected` で落ちる（2026-08-13に、同じCSVが
+    Macでは読めてVPSでは落ちる状態を実測）。環境で結果が変わる検証は
+    信用できないため、ここで東部時間へ揃える。
+    """
+    path = tmp_path / "INTRADAY.csv"
+    path.write_text(
+        "date,close\n"
+        "2025-11-01 09:30:00-04:00,100.0\n"   # 夏時間
+        "2025-11-05 09:30:00-05:00,101.0\n"   # 冬時間
+    )
+
+    df = load_bars_from_csv(str(path))
+
+    assert str(df["date"].dt.tz) == "America/New_York"
+    # 取引日の区切り（同日中の再エントリー禁止・大引け決済）が東部時間で取れること。
+    assert [d.date().isoformat() for d in df["date"]] == ["2025-11-01", "2025-11-05"]
+
+
+def test_daily_dates_without_a_timezone_are_left_naive(tmp_path) -> None:
+    """タイムゾーンを持たない日足は変換しないこと。
+
+    UTCとして解釈してから東部時間へ変換すると、日付が1日前へずれる
+    （UTC 00:00 = 前日19:00 ET）。
+    """
+    path = tmp_path / "DAILY.csv"
+    path.write_text("date,close\n2026-01-05,100.0\n2026-01-06,101.0\n")
+
+    df = load_bars_from_csv(str(path))
+
+    assert df["date"].dt.tz is None
+    assert [d.date().isoformat() for d in df["date"]] == ["2026-01-05", "2026-01-06"]
