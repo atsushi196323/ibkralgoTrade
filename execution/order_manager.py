@@ -645,10 +645,23 @@ async def place_bracket_order_async(
     commission = _commission_of(parent_trade)
 
     # 子注文の値段は、参照価格ではなく**実約定価格**を基準に置き直す。
-    stop_price, take_profit_price = await _reprice_children_to_fill_async(
+    stop_price, take_profit_price, reprice_landed = await _reprice_children_to_fill_async(
         ib, contract, orders, reference_price, fill_price, stop_ratio, take_profit_ratio,
         parent_trade.order,
     )
+    if not reprice_landed:
+        # 修正が拒否された（10326等）。拒否されても元の注文は生き続けるため、
+        # ここで諦めると設計より遠い逆指値がその建玉の一生ぶん残る。
+        replaced_stop, replaced_take_profit, replaced_trades = (
+            await _replace_children_at_fill_async(
+                ib, contract, quantity, fill_price, stop_ratio, take_profit_ratio,
+            )
+        )
+        if replaced_trades is not None:
+            stop_price, take_profit_price = replaced_stop, replaced_take_profit
+            # 生存確認は置き直した側に掛ける。取り消し済みの古いTradeを見ると
+            # 「子注文が死んでいる」と判定して建玉を成行決済してしまう。
+            child_trades = replaced_trades
 
     # 親が約定した = 建玉ができた時点で、子注文が本当にブローカー側で生きているかを
     # 確かめる。送信が受理されたことと、注文が板に置かれたことは別である
@@ -721,16 +734,21 @@ async def _reprice_children_to_fill_async(
     新しい値段を返すと、`positions.json` に**ブローカーが持っていない値段**が残る
     （2026-08-06にINTCで実測。ログは 93.38 -> 92.09 と記録したが、板は 93.38 の
     ままだった）。届かなかった場合は板にある実際の値段を返す。
+
+    3つ目の戻り値は「板が意図どおりになったか」である。**Falseのまま進めては
+    ならない**——呼び出し側は置き直し（取り消して置き直す）へ進む。修正が拒否
+    されても元の注文は生き続けるため、ここで False を握り潰すと設計より遠い
+    位置の逆指値がその建玉の一生ぶん残る。
     """
     stop_price = orders.stop_loss.auxPrice
     take_profit_price = orders.take_profit.lmtPrice
     if fill_price is None or fill_price <= 0 or reference_price <= 0:
-        return stop_price, take_profit_price
+        return stop_price, take_profit_price, True
 
     new_stop = round_to_tick(fill_price * stop_ratio)
     new_take_profit = round_to_tick(fill_price * take_profit_ratio)
     if new_stop == stop_price and new_take_profit == take_profit_price:
-        return stop_price, take_profit_price
+        return stop_price, take_profit_price, True
 
     _adopt_parent_perm_id_as_oca_group(contract.symbol, orders, parent)
 
@@ -747,11 +765,11 @@ async def _reprice_children_to_fill_async(
         logger.warning(
             "[%s] 実約定(%.2f)に合わせた待機注文の置き直しが板に届いていません: "
             "損切り %.2f（要求 %.2f）/ 利確 %.2f（要求 %.2f）。"
-            "実際に置かれている値段で記録します。",
+            "取り消して置き直します。",
             contract.symbol, fill_price,
             applied_stop, new_stop, applied_take_profit, new_take_profit,
         )
-        return applied_stop, applied_take_profit
+        return applied_stop, applied_take_profit, False
 
     logger.info(
         "[%s] 実約定(%.2f)に合わせて待機注文を置き直しました: "
@@ -759,7 +777,62 @@ async def _reprice_children_to_fill_async(
         contract.symbol, fill_price,
         stop_price, new_stop, take_profit_price, new_take_profit, reference_price,
     )
-    return new_stop, new_take_profit
+    return new_stop, new_take_profit, True
+
+
+async def _replace_children_at_fill_async(
+    ib: IB,
+    contract: Stock,
+    quantity: int,
+    fill_price: float,
+    stop_ratio: float,
+    take_profit_ratio: float,
+) -> tuple:
+    """修正が拒否された待機注文を、取り消してから実約定基準で置き直す。
+
+    修正(`_reprice_children_to_fill_async`)は `Error 10326` で拒否されることが
+    あり、**拒否されても元の注文は生き続ける**。2026-08-05〜08-12のペーパー検証
+    では3件とも拒否され、板の逆指値が実約定から -5.16%（UPS）・-6.81%（INTC）の
+    位置に残った。INTCでは1トレードのリスクが資金の1.16%となり、設計値の1%を
+    超えていた。**修正が通らないなら、置き直すしかない。**
+
+    副次的だが、検証にとってはこちらの方が重い。板の逆指値が意図より**下**に
+    あると、Bot側のポーリング判定（建値-5%）が常に先に発動する。3件とも
+    この配置だったため、**ブラケットの子注文が約定した例が一度も無く**、
+    現フェーズの主目的であるOCAの取消連動が観測できないままになっていた。
+
+    取り消しが確定しなかった場合は**置き直さずに諦める**（板の値段のまま返す）。
+    生きている注文へ重ねると建玉を超える売りが並び、IBKRが超過分を空売りと
+    見なして拒否する（`Error 201`）。ここで例外にしないのは、この時点の建玉が
+    まだローカルに記録されていないためである——送出すると、待機注文に守られた
+    建玉がブローカーにだけ残り、追跡が消える。値段は設計より遠いが保護はある
+    状態なので、記録して次のサイクルの突き合わせに委ねる方が安全側になる。
+
+    戻り値は (損切り, 利確, 置き直した子注文)。置き直せなかった場合の3つ目は
+    None で、呼び出し側は元の子注文で生存確認を続ける。
+    """
+    new_stop = round_to_tick(fill_price * stop_ratio)
+    new_take_profit = round_to_tick(fill_price * take_profit_ratio)
+
+    try:
+        await cancel_bracket_orders_async(ib, contract.symbol)
+    except RestingOrderCancelTimeoutError:
+        logger.warning(
+            "[%s] 意図とずれた待機注文を取り消せませんでした。置き直しは見送り、"
+            "板にある値段のまま記録します（生きている注文へ重ねると Error 201 になる）。",
+            contract.symbol,
+        )
+        return None, None, None
+
+    child_trades, _ = _place_resting_children(
+        ib, contract, quantity, new_stop, new_take_profit, reference_price=fill_price,
+    )
+    logger.info(
+        "[%s] 意図とずれた待機注文を取り消し、実約定(%.2f)基準で置き直しました: "
+        "損切り=STP@%.2f 利確=LMT@%.2f",
+        contract.symbol, fill_price, new_stop, new_take_profit,
+    )
+    return new_stop, new_take_profit, child_trades
 
 
 def _adopt_parent_perm_id_as_oca_group(
@@ -857,8 +930,51 @@ async def place_resting_exit_orders_async(
     if quantity <= 0:
         raise ValueError("数量は正の整数である必要があります。")
 
-    # 数量のクランプは掛けない。決済(SELL)に適用すると、ブローカー側に建玉が
-    # 残ったままローカルの追跡だけが消える（「9. 開発時の禁止事項」）。
+    if not ENABLE_REAL_ORDERS:
+        orders = build_bracket_orders(
+            symbol=contract.symbol, quantity=quantity,
+            stop_price=stop_price, take_profit_price=take_profit_price,
+            reference_price=reference_price,
+        )
+        logger.info(
+            "[DRY-RUN] 待機注文の再設置シミュレーション: symbol=%s qty=%s "
+            "損切り=STP@%.2f 利確=LMT@%.2f (placeOrderは呼び出していません)",
+            contract.symbol, quantity,
+            orders.stop_loss.auxPrice, orders.take_profit.lmtPrice,
+        )
+        return orders.oca_group
+
+    child_trades, oca_group = _place_resting_children(
+        ib, contract, quantity, stop_price, take_profit_price, reference_price,
+    )
+    await _ensure_children_are_live_async(
+        ib, contract, child_trades, quantity, oca_group, flatten_on_failure=False,
+    )
+    logger.info(
+        "[%s] 待機注文を置き直しました: qty=%s 損切り=STP@%.2f 利確=LMT@%.2f",
+        contract.symbol, quantity,
+        child_trades[0].order.auxPrice, child_trades[1].order.lmtPrice,
+    )
+    return oca_group
+
+
+def _place_resting_children(
+    ib: IB,
+    contract: Stock,
+    quantity: int,
+    stop_price: float,
+    take_profit_price: float,
+    reference_price: float,
+) -> tuple:
+    """親を伴わない待機決済注文（STP + LMT）を送り、(Trade列, OCAグループ名)を返す。
+
+    生存確認は呼び出し側で行う。**成立しなかったときに建玉を成行決済すべきか
+    どうかが呼び出し側で違う**ためである（建てた直後なら決済する、既にある
+    建玉への置き直しなら決済せずに知らせる。`_ensure_children_are_live_async`）。
+
+    数量のクランプは掛けない。決済(SELL)に適用すると、ブローカー側に建玉が
+    残ったままローカルの追跡だけが消える（「9. 開発時の禁止事項」）。
+    """
     orders = build_bracket_orders(
         symbol=contract.symbol, quantity=quantity,
         stop_price=stop_price, take_profit_price=take_profit_price,
@@ -870,23 +986,8 @@ async def place_resting_exit_orders_async(
     stop_loss.parentId = 0
     take_profit.parentId = 0
 
-    if not ENABLE_REAL_ORDERS:
-        logger.info(
-            "[DRY-RUN] 待機注文の再設置シミュレーション: symbol=%s qty=%s "
-            "損切り=STP@%.2f 利確=LMT@%.2f (placeOrderは呼び出していません)",
-            contract.symbol, quantity, stop_loss.auxPrice, take_profit.lmtPrice,
-        )
-        return orders.oca_group
-
     child_trades = [ib.placeOrder(contract, order) for order in (stop_loss, take_profit)]
-    await _ensure_children_are_live_async(
-        ib, contract, child_trades, quantity, orders.oca_group, flatten_on_failure=False,
-    )
-    logger.info(
-        "[%s] 待機注文を置き直しました: qty=%s 損切り=STP@%.2f 利確=LMT@%.2f",
-        contract.symbol, quantity, stop_loss.auxPrice, take_profit.lmtPrice,
-    )
-    return orders.oca_group
+    return child_trades, orders.oca_group
 
 
 async def _ensure_children_are_live_async(

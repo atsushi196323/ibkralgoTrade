@@ -945,13 +945,54 @@ def test_a_parent_without_a_perm_id_leaves_the_oca_group_alone() -> None:
     assert result.take_profit_price == pytest.approx(73.15, abs=0.01)
 
 
-def test_a_reprice_that_never_reached_the_book_is_recorded_at_the_broker_price() -> None:
-    """修正が板に届かなかったら、要求した値段ではなく板の値段を記録すること。
+def test_a_rejected_reprice_is_replaced_by_cancelling_and_placing_again() -> None:
+    """修正が板に届かなかったら、取り消して実約定基準で置き直すこと。
 
-    10326による拒否はib_asyncからは警告としてしか見えず、拒否されても元の注文は
-    生き続けるため生存確認は通る。確かめずに新しい値段を返すと、positions.json に
-    ブローカーが持っていない値段が残り、Bot側の損切り判定・R倍率・置き直しの基準が
-    すべてそこからずれる。
+    10326は拒否しても元の注文を生かすため、諦めると設計より遠い逆指値が建玉の
+    一生ぶん残る（2026-08-05〜08-12の3件とも。INTCは実約定102.41に対し95.44＝
+    -6.81%で、1トレードのリスクが資金の1.16%＝設計値1%超だった）。
+
+    加えて、板の逆指値が意図より下にあるとBot側のポーリング判定(建値-5%)が常に
+    先に発動する。3件ともこの配置だったため待機注文が一度も約定せず、現フェーズの
+    主目的であるOCAの取消連動が観測できないままになっていた。
+    """
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(avg_fill_price=67.44), _make_trade(order_type="STP"),
+        _make_trade(order_type="LMT"),
+        _make_trade(), _make_trade(),                       # 拒否された修正
+        _make_trade(order_type="STP"), _make_trade(order_type="LMT"),  # 置き直し
+    ])
+    stale = [
+        _resting_trade("STP", 63.18, perm_id=501, oca_group="267089215"),
+        _resting_trade("LMT", 73.15, perm_id=502, oca_group="267089215"),
+    ]
+    # 1回目=修正後の読み直し（板は参照価格ベースのまま）、2回目=取り消し対象の照会、
+    # 3回目=取り消しの確定待ち（消えている）。
+    ib.reqAllOpenOrdersAsync = AsyncMock(side_effect=[stale, stale, []])
+
+    with _real_orders_enabled():
+        result = asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AMBQ"), quantity=3,
+            stop_price=66.5 * 0.95, take_profit_price=66.5 * 1.10, reference_price=66.5,
+        ))
+
+    assert ib.cancelOrder.call_count == 2
+    assert result.stop_price == pytest.approx(67.44 * 0.95, abs=0.01)
+    assert result.take_profit_price == pytest.approx(67.44 * 1.10, abs=0.01)
+
+
+def test_a_reprice_that_never_reached_the_book_is_recorded_at_the_broker_price() -> None:
+    """置き直しもできなかったら、要求した値段ではなく板の値段を記録すること。
+
+    ここでは取り消しが確定しない（モックが待機注文を返し続ける）。生きている
+    注文へ重ねると売り超過で拒否される（`Error 201`）ので置き直しは見送るが、
+    そのとき記録まで要求した値段にすると positions.json にブローカーが持って
+    いない値段が残り、Bot側の損切り判定・R倍率・置き直しの基準がそこからずれる。
+
+    取り消せなかったことを例外にしないのは、この時点の建玉がまだローカルに
+    記録されていないためである。送出すると、待機注文に守られた建玉が
+    ブローカーにだけ残り、追跡が消える。
     """
     ib = MagicMock()
     ib.placeOrder = MagicMock(side_effect=[
