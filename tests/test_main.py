@@ -2317,6 +2317,40 @@ def test_real_exit_uses_the_broker_fill_and_records_round_trip_commission(trade_
     assert position_manager.has_position("AAPL") is False
 
 
+def test_a_resting_fill_is_recorded_even_when_the_current_price_is_unavailable(
+    trade_journal,
+) -> None:
+    """待機注文の約定検知を、現在価格の取得の後ろに置かないこと。
+
+    この判定が見るのはブローカー側の約定だけで、現在価格を必要としない。
+    価格取得の失敗の後ろに置くと、**既に約定している決済が記録されないまま
+    建玉がローカルに残る**。同時保有枠は2しかないので、価格が取れない状態が
+    続く銘柄が枠を占めたまま新規建てが止まる（本プロジェクトの典型的な
+    故障モードである「静かな縮退」そのもの）。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=10, risk_per_share=5.0,
+        strategy_type=STRATEGY_TYPE_SWING,
+        stop_price=95.0, take_profit_price=110.0, oca_group="OCA_AAPL",
+        entry_commission=0.35,
+    )
+    resting_fill = RestingOrderFill(order_type="STP", fill_price=95.0, commission=0.35)
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=None)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch("main.find_filled_resting_exit", return_value=resting_fill):
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    records = trade_journal.load_trades()
+    assert len(records) == 1
+    assert records[0].reason == REASON_STOP_LOSS
+    assert position_manager.has_position("AAPL") is False
+
+
 def test_main_refuses_to_start_with_real_orders_on_a_non_paper_port() -> None:
     """実発注が有効なまま本番ポートを向いていたら、1件も注文を出す前に止まること。
 

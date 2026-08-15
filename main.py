@@ -782,17 +782,13 @@ async def _process_exit_async(
         return
 
     contract = await caches.contracts.get_async(ib, symbol)
-    price = await get_current_price_async(ib, contract)
-    if price is None:
-        logger.warning("%s の現在価格が取得できなかったため決済判定をスキップします。", symbol)
-        return
-
-    position_manager.update_highest_price(symbol, price)
 
     # 1. ブローカー側に置いた待機注文（損切りの逆指値・利確の指値）が約定していないか。
     #    こちらはポーリングを待たずに市場で約定しているため、他の判定より先に確認する。
-    #    ブローカー同期で取り込んだ未追跡ポジションは待機注文を持たない(値段が0)ため対象外。
     #
+    #    **現在価格の取得より前に見る。** この判定はブローカー側の約定だけを見るので
+    #    現在価格を必要としない。価格取得の失敗の後ろに置くと、既に約定している決済が
+    #    記録されないまま建玉がローカルに残り、同時保有枠(2)を占め続ける。
     #    実発注時はブローカー側の約定そのものを見る。ドライランの推定
     #    （観測した現在値が待機注文の値段に届いたか）は300秒ごとの1点しか
     #    見ないため、ザラ場で逆指値に触れて戻した動きを取りこぼす。
@@ -816,7 +812,16 @@ async def _process_exit_async(
                 exit_commission=resting_fill.commission,
             )
             return
-    elif position.stop_price > 0 and position.take_profit_price > 0:
+
+    price = await get_current_price_async(ib, contract)
+    if price is None:
+        logger.warning("%s の現在価格が取得できなかったため決済判定をスキップします。", symbol)
+        return
+
+    position_manager.update_highest_price(symbol, price)
+
+    # ブローカー同期で取り込んだ未追跡ポジションは待機注文を持たない(値段が0)ため対象外。
+    if not ENABLE_REAL_ORDERS and position.stop_price > 0 and position.take_profit_price > 0:
         resting_exit = detect_resting_order_exit(
             stop_price=position.stop_price,
             take_profit_price=position.take_profit_price,
