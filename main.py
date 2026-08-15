@@ -1152,6 +1152,35 @@ def resolve_min_tradeable_price(account_equity: float) -> Optional[float]:
     return account_equity * (RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT) / MAX_POSITION_SIZE
 
 
+# 株価帯で除外した銘柄を、その取引日に1度だけ記録するための印。
+# スクリーニングが失敗した日はこのフィルターが900秒ごとに再実行され
+# （`SCREENING_RETRY_INTERVAL_SECONDS`）、同じ除外が1日26回ぶん並ぶ。
+# 2026-08-12〜14のVPSログでは18銘柄×26回＝468行/日がWARNINGを占めており、
+# 「読むべき1行」を埋める側に回っていた（「3. 実行環境と設定」のログ方針）。
+# 株価帯は資金と終値から1日1回決まるので、同じ日の2回目以降は情報が無い。
+_price_band_exclusions_logged: Tuple[Optional[str], Set[str]] = (None, set())
+
+
+def _should_log_price_band_exclusion(symbol: str, now: Optional[datetime] = None) -> bool:
+    """その取引日にまだ記録していない除外なら True を返す。
+
+    取引日が変わったら印を捨てる。持ち越すと翌日の除外が1行も出なくなり、
+    株価帯が動いて監視候補が痩せたことに気付けなくなる。
+    """
+    global _price_band_exclusions_logged
+
+    trading_day = (now or datetime.now(US_EASTERN)).astimezone(US_EASTERN).date().isoformat()
+    logged_day, logged_symbols = _price_band_exclusions_logged
+    if logged_day != trading_day:
+        logged_symbols = set()
+        _price_band_exclusions_logged = (trading_day, logged_symbols)
+
+    if symbol in logged_symbols:
+        return False
+    logged_symbols.add(symbol)
+    return True
+
+
 async def _filter_symbols_by_price_band_async(
     ib: IB, symbols: List[str], min_price: Optional[float], max_price: Optional[float],
     caches: MarketDataCaches,
@@ -1197,18 +1226,20 @@ async def _filter_symbols_by_price_band_async(
 
         price = float(daily_df["close"].iloc[-1])
         if max_price is not None and price > max_price:
-            logger.warning(
-                "[%s] 株価(%.2f USD)が上限(%.2f USD)を超えるため監視対象から外します"
-                "（現在の口座資金では数量が0株になる）。",
-                symbol, price, max_price,
-            )
+            if _should_log_price_band_exclusion(symbol):
+                logger.warning(
+                    "[%s] 株価(%.2f USD)が上限(%.2f USD)を超えるため監視対象から外します"
+                    "（現在の口座資金では数量が0株になる）。",
+                    symbol, price, max_price,
+                )
             continue
         if min_price is not None and price < min_price:
-            logger.warning(
-                "[%s] 株価(%.2f USD)が下限(%.2f USD)を下回るため監視対象から外します"
-                "（株数クランプでリスクベースのサイジングが効かない）。",
-                symbol, price, min_price,
-            )
+            if _should_log_price_band_exclusion(symbol):
+                logger.warning(
+                    "[%s] 株価(%.2f USD)が下限(%.2f USD)を下回るため監視対象から外します"
+                    "（株数クランプでリスクベースのサイジングが効かない）。",
+                    symbol, price, min_price,
+                )
             continue
         kept.append(symbol)
 

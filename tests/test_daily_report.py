@@ -146,6 +146,41 @@ def test_entry_skip_reasons_are_counted():
     assert report.skip_reasons["同時保有数の上限"] == 2
 
 
+def test_a_full_position_book_is_not_reported_as_a_dead_monitoring_loop():
+    """同時保有数の上限で埋まった日を「監視サイクルが回っていない」と書かないこと。
+
+    エントリー判定は上限に達しているとその場で return するため、乖離率の行が
+    1件も出ない。2026-08-14のVPSログ（UPS・INTCで枠が埋まった日）がこれで、
+    決済判定は5分ごとに動いていたのにサマリは停止しているように読めた。
+    サマリは「なぜ建たなかったのか」を切り分けるための道具なので、
+    正常な稼働を故障として報告してはならない。
+    """
+    lines = _lines(
+        "2026-08-14 23:47:19,000 [INFO] strategy.exit_signal: [INTC] entry=102.41 current=104.39 "
+        "high=107.31 pnl=1.93% high比乖離=-2.72% reason=NONE",
+        "2026-08-14 23:47:20,000 [INFO] __main__: [KO] 同時保有ポジション数の上限(2)に達しているため"
+        "新規エントリーをスキップします。",
+    )
+
+    report = build_day_report(lines, [], date(2026, 8, 14))
+    text = format_report(report)
+
+    assert report.exit_evaluations["INTC"] == 1
+    assert "監視サイクルが回っていない" not in text
+    assert "決済判定サイクル" in text
+
+
+def test_a_truly_idle_loop_is_still_reported():
+    """判定も見送りも1件も無い日は、従来どおり「回っていない」と書くこと。"""
+    lines = _lines(
+        "2026-08-14 23:47:19,000 [INFO] __main__: 口座資金(USD)を取得しました: 1205.54",
+    )
+
+    text = format_report(build_day_report(lines, [], date(2026, 8, 14)))
+
+    assert "監視サイクルが回っていない" in text
+
+
 def test_manual_login_hint_and_connection_rounds_are_reported():
     lines = _lines(
         "2026-08-03 23:00:00,000 [ERROR] __main__: TWSへの再接続に失敗しました。300秒後に再試行します。",

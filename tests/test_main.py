@@ -861,6 +861,45 @@ def test_price_band_filter_reuses_the_daily_bar_cache() -> None:
     assert mock_bars.await_count == 1
 
 
+def test_price_band_exclusions_are_logged_once_per_trading_day(caplog) -> None:
+    """株価帯の除外は、同じ取引日には銘柄ごとに1度しかWARNINGを出さないこと。
+
+    スクリーニングが空を返す日はこのフィルターが900秒ごとに再実行される
+    （SCREENING_RETRY_INTERVAL_SECONDS）。毎回出すと、2026-08-12〜14のVPSログの
+    ように18銘柄×26回＝468行/日がWARNINGを占め、「なぜ建たなかったのか」の
+    答えになる1行が埋もれる（§3のログ方針）。株価帯は資金と終値から1日1回
+    決まるので、同じ日の2回目以降に新しい情報は無い。
+    """
+    ib = MagicMock()
+    main_module._price_band_exclusions_logged = (None, set())
+
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
+        _fallback_prices({"NORMAL": 100.0, "PRICEY": 336.91}), \
+        caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            asyncio.run(_refresh_watchlist_async(
+                ib, ["NORMAL", "PRICEY"], account_equity=1220.0,
+            ))
+
+    excluded = [r for r in caplog.records if "上限" in r.getMessage() and "PRICEY" in r.getMessage()]
+    assert len(excluded) == 1
+
+
+def test_price_band_exclusions_are_logged_again_on_the_next_trading_day() -> None:
+    """取引日が変わったら印を捨てること。
+
+    持ち越すと翌日の除外が1行も出なくなり、株価帯が動いて監視候補が
+    痩せたことに気付けない。
+    """
+    main_module._price_band_exclusions_logged = (None, set())
+    day1 = datetime(2026, 8, 14, 10, 0, tzinfo=US_EASTERN)
+    day2 = datetime(2026, 8, 15, 10, 0, tzinfo=US_EASTERN)
+
+    assert main_module._should_log_price_band_exclusion("AAPL", now=day1) is True
+    assert main_module._should_log_price_band_exclusion("AAPL", now=day1) is False
+    assert main_module._should_log_price_band_exclusion("AAPL", now=day2) is True
+
+
 # --- main()のTWS接続維持（切断検知・再接続） ---------------------------------------
 
 

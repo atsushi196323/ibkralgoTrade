@@ -47,6 +47,10 @@ _LOG_LINE_RE = re.compile(
 _SIGNAL_RE = re.compile(
     r"^\[(?P<symbol>[^\]]+)\] 終値=.* 乖離率=(?P<deviation>-?[\d.]+)% シグナル=(?P<signal>\S+)"
 )
+# 保有中の銘柄に対する決済判定。エントリー判定が入口（同時保有数の上限など）で
+# 打ち切られた日は `_SIGNAL_RE` の行が1件も出ないため、この行だけが
+# 「監視サイクルは回っていた」ことの証拠になる。
+_EXIT_EVALUATION_RE = re.compile(r"^\[(?P<symbol>[^\]]+)\] entry=[\d.]+ current=[\d.]+ .*reason=")
 _ENTRY_RE = re.compile(r"^\[(?P<symbol>[^\]]+)\] ポジションを新規建てしました: entry=(?P<price>[\d.]+)")
 _EXIT_RE = re.compile(r"^\[(?P<symbol>[^\]]+)\] ポジションを決済しました")
 _PRICE_BAND_RE = re.compile(
@@ -120,6 +124,10 @@ class DayReport:
     # 銘柄ごとのシグナル判定の回数。ログにサイクルの開始を示す行が無いため、
     # 「いちばん多く判定された銘柄の回数」を評価サイクル数の代用にする。
     signal_evaluations: Counter = field(default_factory=Counter)
+    # 銘柄ごとの決済判定の回数。エントリー判定が入口で打ち切られる日
+    # （同時保有数の上限に達している等）でもサイクルは回っているため、
+    # 「監視ループが動いていない」と誤って報告しないための材料。
+    exit_evaluations: Counter = field(default_factory=Counter)
     cycles_skipped_closed: int = 0
     entries: List[Tuple[str, float]] = field(default_factory=list)
     exits: List[str] = field(default_factory=list)
@@ -219,6 +227,11 @@ def build_day_report(
             previous = report.lowest_deviation.get(symbol)
             if previous is None or deviation < previous:
                 report.lowest_deviation[symbol] = deviation
+            continue
+
+        evaluation = _EXIT_EVALUATION_RE.match(message)
+        if evaluation is not None:
+            report.exit_evaluations[evaluation.group("symbol")] += 1
             continue
 
         entry = _ENTRY_RE.match(message)
@@ -392,6 +405,14 @@ def format_report(report: DayReport) -> str:
             lines.append("  その日いちばん押した乖離率（買いシグナルは -5% 以下）:")
             for symbol, deviation in nearest:
                 lines.append(f"    {symbol}: {deviation:+.2f}%")
+        elif report.skip_reasons or report.exit_evaluations:
+            # エントリー判定は入口（同時保有数の上限など）で打ち切られると
+            # 乖離率を出す前に return する。決済判定や見送り理由が記録されて
+            # いる以上サイクルは回っているので、「動いていない」と読ませない。
+            lines.append(
+                "  乖離率の判定まで進んだ銘柄が無い"
+                "（監視サイクルは回っている。下の見送り理由を参照）。"
+            )
         else:
             lines.append("  シグナル判定の行が1件も無い（＝監視サイクルが回っていない）。")
         for label, count in report.skip_reasons.most_common():
@@ -470,6 +491,12 @@ def format_report(report: DayReport) -> str:
     lines.append("--- 稼働 ---")
     evaluations = max(report.signal_evaluations.values()) if report.signal_evaluations else 0
     lines.append(f"シグナル判定サイクル: {evaluations}回（最も多く判定された銘柄の回数）")
+    if report.exit_evaluations:
+        exit_evaluations = max(report.exit_evaluations.values())
+        lines.append(
+            f"決済判定サイクル: {exit_evaluations}回"
+            f"（保有中 {len(report.exit_evaluations)}銘柄の最多。0でなければ監視ループは回っている）"
+        )
     lines.append(f"市場時間外でスキップしたサイクル: {report.cycles_skipped_closed}回")
     lines.append(f"接続リトライを使い切ったラウンド: {report.connection_failure_rounds}回")
     if report.manual_login_hint:
