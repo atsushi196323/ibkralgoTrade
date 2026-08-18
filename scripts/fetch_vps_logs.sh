@@ -33,6 +33,12 @@ mkdir -p "${LOCAL_DIR}"
 # --delete は付けない。VPS側でローテーションによって消えた世代を
 # 手元から消す理由が無く、消すと過去の調査ができなくなる。
 # 圧縮するのは bot.log が10MB×10世代まで育つため。
+#
+# **再帰なので logs/backups/ の控えも一緒に来る。これがVPS消失に対する
+# 唯一の備えである**（`scripts/backup_records.py` の控えはVPSの同じディスクに
+# あるので、壊した・消したには効くが、ディスクごと失う側には効かない）。
+# trade_journal.csv は現フェーズが生み出す唯一の成果物なので、往復が
+# 積み始まったらこの同期を定期的に回すこと。
 rsync -avz --partial \
     "${IBKRALGO_VPS}:${REMOTE_DIR}" \
     "${LOCAL_DIR}/"

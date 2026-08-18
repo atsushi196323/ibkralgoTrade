@@ -151,6 +151,19 @@
 - `logs/bot.log` — 稼働ログ（10MB × 10世代でローテーション）
 - `logs/turnover_ranks.json` — 売買代金ランキングの日次履歴と、組み入れ済みの注目銘柄
 - `logs/after_close.log` — 引け後の締め処理（`scripts/after_close.sh`）の出力。1日あたり数十行の要約だけが積まれるため、ローテーションは置いていない
+- `logs/backups/YYYY-MM-DD/` — **再生成できない記録の控え**（`trade_journal.csv` / `positions.json` / `turnover_ranks.json`）。引け後の締めで1日1回、90日ぶん
+
+**控えるのは再生成できないものだけである**（`scripts/backup_records.py`）。`bot.log` は同じ出来事がローテーションで残るうえ大きいので入れない。3つを選んだ理由はそれぞれ違う。
+
+| | 失うと |
+| --- | --- |
+| `trade_journal.csv` | **実約定・実手数料を伴う往復の記録が消える。** 現フェーズが生み出す唯一の成果物で、実資金へ進む条件そのもの。ブローカーの取引報告から手で作り直すしかない |
+| `positions.json` | 建値・R倍率の分母・トレーリングの高値・クールダウンが消える。建玉はブローカー同期で拾い直せるが、建値が**手数料込みの `avgCost`** に化け、損切り判定と置き直しの基準がずれる |
+| `turnover_ranks.json` | 売買代金の順位は**過去に遡って取得できない**。落とした日数ぶん急上昇の判定ができなくなる |
+
+**`trade_journal.csv` は追記専用なので、直近の控えより縮んでいたらWARNINGを出す。** 切り詰め・書き込み失敗・取り違えのいずれかであり、気付かずに運用を続ける方が危ない。控えは日付ごとに別ファイルなので過去のぶんは残る。`positions.json` は決済のたびに縮むのでこの検査は掛けない。
+
+**控えはVPSの同じディスクにあるので、守れるのは「壊した・消した・上書きした」側だけである。** ディスクごと失う側の備えは `scripts/fetch_vps_logs.sh` による手元への同期で、rsyncは再帰なので控えもそのまま複製される。**往復が積み始まったらこの同期を定期的に回すこと。** `tests/test_backup_records.py` が番人。
 
 **1日のサイクルはlaunchdの2本のジョブで閉じている**（macOSの `~/Library/LaunchAgents/`。リポジトリ管理外）。
 
@@ -273,6 +286,7 @@ scripts/
   is_us_trading_day.py      その日が米国の取引日かを終了コードで返す（launchdの祝日判定用）
   start_bot.sh              Botの起動（祝日なら起動しない。launchdが平日22:15に呼ぶ）
   after_close.sh            引け後の締め（Bot停止 → ランキング記録 → サマリ出力）
+  backup_records.py         失うと復元できない記録を日付つきで控える（引け後に自動実行）
   export_tax_report.py      確定申告用CSVを出力するCLI
 deploy/systemd/             VPS(Linux)運用のsystemd unit。launchdの2本と同じ役割・同じ時刻
 tests/                      単体テスト。IBKRへの実接続は不要（すべてモック）
@@ -1251,6 +1265,10 @@ python -m scripts.check_positions
 systemctl --user stop ibkralgotrade
 python -m scripts.repair_resting_prices            # 何をするか表示するだけ
 python -m scripts.repair_resting_prices --apply    # 実際に修正を送る
+
+# 記録の控え（引け後の締めが自動で呼ぶ。手動でも叩ける。IBKR接続不要）
+python -m scripts.backup_records
+python -m scripts.backup_records --keep 30
 
 # 確定申告用CSVの出力（既定は前年分。IBKR接続不要）
 python -m scripts.export_tax_report

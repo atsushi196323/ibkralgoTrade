@@ -11,10 +11,13 @@
 # やること:
 #   1. Botを止める。引け後も動かし続けると、IB Gatewayのログアウト(08:00 JST)以降は
 #      再接続の失敗ログだけが積み上がり、翌日のサマリが読みにくくなる
-#   2. 売買代金ランキングを記録する（観測。監視リストは変更しない）
-#   3. 1日の稼働サマリを出す
+#   2. 再生成できない記録を控える（trade_journal.csv / positions.json /
+#      turnover_ranks.json）。3より先に取るのは、3が turnover_ranks.json を
+#      書き換えるためである
+#   3. 売買代金ランキングを記録する（観測。監視リストは変更しない）
+#   4. 1日の稼働サマリを出す
 #
-# 2と3は1が失敗しても実行する（Botが既に落ちている日も記録は残したいため）。
+# 2〜4は1が失敗しても実行する（Botが既に落ちている日も記録は残したいため）。
 
 set -u
 
@@ -101,6 +104,14 @@ case $? in
         exit 1
         ;;
 esac
+
+# 記録の控えを最初に取る。**失うと復元できないのはこの3ファイルだけ**であり
+# （trade_journal.csv / positions.json / turnover_ranks.json）、後続の
+# rank_turnover は turnover_ranks.json を書き換える。控えを先に取っておけば、
+# yfinanceの仕様変更などで壊れた内容を書き込んだ場合でも前日の状態へ戻せる。
+echo
+echo "----- 記録の控え -----"
+"${PYTHON}" -m scripts.backup_records || echo "backup_records が失敗しました（控えは更新されていません）。"
 
 echo
 echo "----- 売買代金ランキングの記録 -----"
