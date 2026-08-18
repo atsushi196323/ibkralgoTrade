@@ -683,6 +683,34 @@ def test_run_watchlist_cycle_continues_after_symbol_error(trade_journal) -> None
     assert mock_process.await_count == 2
 
 
+def test_the_position_limit_skip_is_logged_once_per_cycle(trade_journal, caplog) -> None:
+    """同時保有上限の見送りは、銘柄ごとではなくサイクルごとに1行だけ出すこと。
+
+    条件は口座全体のもので銘柄によらないのに、監視銘柄の数だけ同じ行が並ぶ。
+    2026-08-17のVPSログでは18銘柄×77サイクル＝1386行となり、**その日の全ログ
+    2773行のちょうど50%**を占めていた（§3のログ方針）。
+
+    サイクルごとには残す。枠が埋まった日は乖離率の行が1件も出ないため、
+    監視ループが回っていた証拠がこの行になる。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position("UPS", entry_price=104.06, quantity=2)
+    position_manager.open_position("INTC", entry_price=102.41, quantity=2)
+
+    with patch.object(position_manager, "sync_with_broker_async", new=AsyncMock()), \
+        patch("main._restore_missing_resting_orders_async", new=AsyncMock()), \
+        patch("main._process_exit_async", new=AsyncMock()), \
+        caplog.at_level(logging.INFO):
+        for _ in range(2):
+            asyncio.run(run_watchlist_cycle_async(
+                ib, ["AAA", "BBB", "CCC"], position_manager, trade_journal,
+            ))
+
+    skipped = [r for r in caplog.records if "同時保有ポジション数の上限" in r.getMessage()]
+    assert len(skipped) == 2, "1サイクルにつき1行（2サイクルで2行）であること"
+
+
 def test_run_watchlist_cycle_syncs_with_broker_before_processing_symbols(trade_journal) -> None:
     ib = MagicMock()
     position_manager = PositionManager()
@@ -872,7 +900,7 @@ def test_price_band_exclusions_are_logged_once_per_trading_day(caplog) -> None:
     決まるので、同じ日の2回目以降に新しい情報は無い。
     """
     ib = MagicMock()
-    main_module._price_band_exclusions_logged = (None, set())
+    main_module._once_per_day_logged = (None, set())
 
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
         _fallback_prices({"NORMAL": 100.0, "PRICEY": 336.91}), \
@@ -886,13 +914,32 @@ def test_price_band_exclusions_are_logged_once_per_trading_day(caplog) -> None:
     assert len(excluded) == 1
 
 
+def test_untradeable_symbols_are_logged_once_per_trading_day(caplog) -> None:
+    """本数不足・下降トレンドの見送りも、同じ取引日には銘柄ごとに1度だけ出すこと。
+
+    スクリーニングが空を返す日はこの判定が900秒ごとに再実行される。
+    2026-08-17のVPSログでは8銘柄×26回＝208行が積まれていたが、復帰までの距離は
+    日足から決まるため、同じ日の2回目以降に新しい情報は無い（§3のログ方針）。
+    """
+    ib = MagicMock()
+    caches = MarketDataCaches()
+    main_module._once_per_day_logged = (None, set())
+
+    with _fallback_prices({"SHORT": 100.0}), caplog.at_level(logging.INFO):
+        for _ in range(3):
+            asyncio.run(main_module._screen_watchlist_symbols_async(ib, ["SHORT"], caches))
+
+    reported = [r for r in caplog.records if "長期トレンドを判定できない" in r.getMessage()]
+    assert len(reported) == 1
+
+
 def test_price_band_exclusions_are_logged_again_on_the_next_trading_day() -> None:
     """取引日が変わったら印を捨てること。
 
     持ち越すと翌日の除外が1行も出なくなり、株価帯が動いて監視候補が
     痩せたことに気付けない。
     """
-    main_module._price_band_exclusions_logged = (None, set())
+    main_module._once_per_day_logged = (None, set())
     day1 = datetime(2026, 8, 14, 10, 0, tzinfo=US_EASTERN)
     day2 = datetime(2026, 8, 15, 10, 0, tzinfo=US_EASTERN)
 

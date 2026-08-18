@@ -561,10 +561,19 @@ async def _process_entry_async(
     caches: MarketDataCaches,
 ) -> None:
     if position_manager.count_open_positions() >= MAX_CONCURRENT_POSITIONS:
-        logger.info(
-            "[%s] 同時保有ポジション数の上限(%d)に達しているため新規エントリーをスキップします。",
-            symbol, MAX_CONCURRENT_POSITIONS,
-        )
+        # **銘柄ごとではなくサイクルごとに1行だけ出す。** 条件は口座全体のもので
+        # 銘柄によらないのに、監視銘柄の数だけ同じ行が並ぶ。2026-08-17のVPSログでは
+        # 18銘柄×77サイクル＝1386行で、その日の全ログ2773行のちょうど50%を
+        # 占めていた（「3. 実行環境と設定」のログ方針）。サイクルごとに残すのは、
+        # 枠が埋まった日に監視ループが回っていた証拠がこの行になるためである。
+        global _position_limit_skip_logged_in_cycle
+        if not _position_limit_skip_logged_in_cycle:
+            _position_limit_skip_logged_in_cycle = True
+            logger.info(
+                "同時保有ポジション数の上限(%d)に達しているため、"
+                "このサイクルの新規エントリーはすべて見送ります（保有中: %s）。",
+                MAX_CONCURRENT_POSITIONS, ", ".join(sorted(position_manager.open_symbols())),
+            )
         return
 
     # 発注回数の上限。データ取得より前に判定するのは、上限に達した後の
@@ -1066,11 +1075,19 @@ async def process_symbol_async(
         await _process_entry_async(ib, symbol, position_manager, trade_journal, caches)
 
 
+# 同時保有上限による見送りを、サイクルごとに1行へ絞るための印。
+# `run_watchlist_cycle_async` の入口で毎サイクル落とす。
+_position_limit_skip_logged_in_cycle: bool = False
+
+
 async def run_watchlist_cycle_async(
     ib: IB, watchlist: List[str], position_manager: PositionManager, trade_journal: TradeJournal,
     caches: Optional[MarketDataCaches] = None,
 ) -> None:
     caches = caches if caches is not None else MarketDataCaches()
+
+    global _position_limit_skip_logged_in_cycle
+    _position_limit_skip_logged_in_cycle = False
 
     await position_manager.sync_with_broker_async(ib)
 
@@ -1176,27 +1193,37 @@ def resolve_min_tradeable_price(account_equity: float) -> Optional[float]:
 # 2026-08-12〜14のVPSログでは18銘柄×26回＝468行/日がWARNINGを占めており、
 # 「読むべき1行」を埋める側に回っていた（「3. 実行環境と設定」のログ方針）。
 # 株価帯は資金と終値から1日1回決まるので、同じ日の2回目以降は情報が無い。
-_price_band_exclusions_logged: Tuple[Optional[str], Set[str]] = (None, set())
+_once_per_day_logged: Tuple[Optional[str], Set[Tuple[str, str]]] = (None, set())
+
+
+def _should_log_once_per_trading_day(
+    kind: str, symbol: str, now: Optional[datetime] = None,
+) -> bool:
+    """その取引日にまだ記録していない (種類, 銘柄) なら True を返す。
+
+    取引日が変わったら印を捨てる。持ち越すと翌日の1行目が出なくなり、
+    条件が変わって監視候補が痩せたことに気付けなくなる。
+
+    `kind` で種類を分けるのは、株価帯の除外と長期トレンドの見送りが同じ銘柄に
+    同時に起きうるためである。まとめると片方しか出ない。
+    """
+    global _once_per_day_logged
+
+    trading_day = (now or datetime.now(US_EASTERN)).astimezone(US_EASTERN).date().isoformat()
+    logged_day, logged_keys = _once_per_day_logged
+    if logged_day != trading_day:
+        logged_keys = set()
+        _once_per_day_logged = (trading_day, logged_keys)
+
+    key = (kind, symbol)
+    if key in logged_keys:
+        return False
+    logged_keys.add(key)
+    return True
 
 
 def _should_log_price_band_exclusion(symbol: str, now: Optional[datetime] = None) -> bool:
-    """その取引日にまだ記録していない除外なら True を返す。
-
-    取引日が変わったら印を捨てる。持ち越すと翌日の除外が1行も出なくなり、
-    株価帯が動いて監視候補が痩せたことに気付けなくなる。
-    """
-    global _price_band_exclusions_logged
-
-    trading_day = (now or datetime.now(US_EASTERN)).astimezone(US_EASTERN).date().isoformat()
-    logged_day, logged_symbols = _price_band_exclusions_logged
-    if logged_day != trading_day:
-        logged_symbols = set()
-        _price_band_exclusions_logged = (trading_day, logged_symbols)
-
-    if symbol in logged_symbols:
-        return False
-    logged_symbols.add(symbol)
-    return True
+    return _should_log_once_per_trading_day("price_band", symbol, now)
 
 
 async def _filter_symbols_by_price_band_async(
@@ -1345,19 +1372,22 @@ async def _screen_watchlist_symbols_async(
             continue
 
         # 監視に残す場合は「外します」と書けない。建てられない状態であることと
-        # 復帰までの距離は、残す場合こそ毎サイクル読みたい情報である。
+        # 復帰までの距離は、残す場合こそ読みたい情報である（ただし1取引日に1回。
+        # スクリーニングが空を返す日はこの判定が900秒ごとに再実行され、同じ行が
+        # 26回ぶん並ぶ。復帰までの距離は日足から決まるので2回目以降に情報は無い）。
         disposition = (
             "監視は継続します（新規建てはエントリー側で見送ります）"
             if KEEP_UNTRADEABLE_SYMBOLS_IN_WATCHLIST else "監視対象から外します"
         )
 
         if len(daily_df) < SWING_MIN_HISTORY_BARS:
-            logger.info(
-                "[%s] 日足が%d本しかなく長期トレンドを判定できないため、%s。"
-                "再エントリーまで残り%d営業日。",
-                symbol, len(daily_df), disposition,
-                SWING_MIN_HISTORY_BARS - len(daily_df),
-            )
+            if _should_log_once_per_trading_day("history", symbol):
+                logger.info(
+                    "[%s] 日足が%d本しかなく長期トレンドを判定できないため、%s。"
+                    "再エントリーまで残り%d営業日。",
+                    symbol, len(daily_df), disposition,
+                    SWING_MIN_HISTORY_BARS - len(daily_df),
+                )
             untradeable.add(symbol)
             if KEEP_UNTRADEABLE_SYMBOLS_IN_WATCHLIST:
                 kept.append(symbol)
@@ -1365,14 +1395,15 @@ async def _screen_watchlist_symbols_async(
 
         in_uptrend = is_in_long_term_uptrend(daily_df, STRUGGLING_MA_WINDOW)
         if in_uptrend is False:
-            logger.info(
-                "[%s] 終値が%d日移動平均を下回る下降トレンドのため、%s。"
-                "終値%.2f / MA%d %.2f（あと%+.1f%%で復帰）。",
-                symbol, STRUGGLING_MA_WINDOW, disposition,
-                _latest_close_price(daily_df), STRUGGLING_MA_WINDOW,
-                _long_term_moving_average(daily_df),
-                _pct_to_long_term_ma(daily_df),
-            )
+            if _should_log_once_per_trading_day("downtrend", symbol):
+                logger.info(
+                    "[%s] 終値が%d日移動平均を下回る下降トレンドのため、%s。"
+                    "終値%.2f / MA%d %.2f（あと%+.1f%%で復帰）。",
+                    symbol, STRUGGLING_MA_WINDOW, disposition,
+                    _latest_close_price(daily_df), STRUGGLING_MA_WINDOW,
+                    _long_term_moving_average(daily_df),
+                    _pct_to_long_term_ma(daily_df),
+                )
             untradeable.add(symbol)
             if not KEEP_UNTRADEABLE_SYMBOLS_IN_WATCHLIST:
                 continue

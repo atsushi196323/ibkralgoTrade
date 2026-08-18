@@ -212,7 +212,15 @@ launchctl print gui/$(id -u)/com.user.ibkralgotrade | grep '"Weekday"'
 - **`ib_async` 以外のINFO。** 乖離率・決済判定・価格の取得経路はいずれも判断の材料そのものである
 - **コードを読み取れない `ib_async.wrapper` のメッセージ。** 判定を外したときに黙って行が消える方が危険なので、残す側に倒す
 
-**繰り返し出る自分側のWARNINGは、銘柄ごとに取引日1回へ絞ること**（`_should_log_price_band_exclusion`）。スクリーニングが空を返す日は株価帯のフィルターが900秒ごとに再実行され（`SCREENING_RETRY_INTERVAL_SECONDS`）、同じ除外が1日26回ぶん並ぶ。2026-08-12〜14のVPSログでは **18銘柄×26回＝468行/日**がWARNINGの94%を占めていた。株価帯は資金と終値から1日1回決まるので、同じ日の2回目以降に情報は無い。**取引日が変われば印を捨てる**——持ち越すと翌日の除外が1行も出ず、帯が動いて監視候補が痩せたことに気付けない。`tests/test_main.py` の `test_price_band_exclusions_are_logged_once_per_trading_day` / `test_price_band_exclusions_are_logged_again_on_the_next_trading_day` が番人。
+**繰り返し出る自分側のログは、情報が増えない単位まで絞ること。** 判断の材料になる1行が埋もれると、ログをファイルへ残している目的そのものが失われる。実測（2026-08-17のVPSログ、全2773行）で多かった順に3つ、絞り方が異なる。
+
+| 行 | 実測 | 絞り方 |
+| --- | --- | --- |
+| 同時保有上限による見送り | **1386行＝全体の50%** | **サイクルに1行**（`_position_limit_skip_logged_in_cycle`）。条件は口座全体のもので銘柄によらない。サイクルごとには残す——枠が埋まった日は乖離率の行が1件も出ないため、監視ループが回っていた証拠がこの行になる |
+| 下降トレンド・本数不足の見送り | 208行 | 銘柄ごとに**取引日1回**（`_should_log_once_per_trading_day`）。復帰までの距離は日足から決まる |
+| 株価帯による除外 | 468行/日（2026-08-12〜14） | 同上。株価帯は資金と終値から1日1回決まる |
+
+**繰り返し出る自分側のWARNINGは、銘柄ごとに取引日1回へ絞ること**（`_should_log_once_per_trading_day`）。スクリーニングが空を返す日は株価帯のフィルターが900秒ごとに再実行され（`SCREENING_RETRY_INTERVAL_SECONDS`）、同じ除外が1日26回ぶん並ぶ。2026-08-12〜14のVPSログでは **18銘柄×26回＝468行/日**がWARNINGの94%を占めていた。株価帯は資金と終値から1日1回決まるので、同じ日の2回目以降に情報は無い。**取引日が変われば印を捨てる**——持ち越すと翌日の除外が1行も出ず、帯が動いて監視候補が痩せたことに気付けない。`tests/test_main.py` の `test_price_band_exclusions_are_logged_once_per_trading_day` / `test_price_band_exclusions_are_logged_again_on_the_next_trading_day` / `test_untradeable_symbols_are_logged_once_per_trading_day` / `test_the_position_limit_skip_is_logged_once_per_cycle` が番人。
 
 **引け後のサマリは「乖離率の行が0件」を稼働停止と読ませてはならない。** エントリー判定は同時保有数の上限に達しているとその場で return するため、枠が埋まった日は乖離率の行が1件も出ない。2026-08-14のVPSログ（UPS・INTCで枠が埋まった日）では決済判定が77サイクル動いていたのに、サマリは「監視サイクルが回っていない」と報告していた。**決済判定の行を数え、見送り理由と併せて稼働の証拠にすること**（`scripts/daily_report.DayReport.exit_evaluations`）。サマリは故障の切り分けに使う道具なので、正常な稼働を故障として報告すると道具の側が信用できなくなる。`tests/test_daily_report.py` の `test_a_full_position_book_is_not_reported_as_a_dead_monitoring_loop` が番人。
 
@@ -467,7 +475,7 @@ python -m backtest.run --csv-dir bars/intraday --mode walk-forward \
 
 監視枠を食う点は「6.1」の不変条件 `MAX_WATCHLIST_SIZE × (600 / POLL_INTERVAL_SECONDS) ≦ 60` で頭打ちになる（24銘柄・300秒＝48件/10分）。固定リストが上限より長い場合は、株価帯で絞ったうえで記載順に切り詰められる。**それでも枠が足りない場合は `KEEP_UNTRADEABLE_SYMBOLS_IN_WATCHLIST = False` で落とすこと。**
 
-**下降トレンドのログはシグナルが出た銘柄にしか出さない。** 毎サイクル全銘柄について出すと1日数百行になり、「押し目は来たが下降トレンドなので見送った」という判断の記録が埋もれる。
+**下降トレンドのログはシグナルが出た銘柄にしか出さない。** 毎サイクル全銘柄について出すと1日数百行になり、「押し目は来たが下降トレンドなので見送った」という判断の記録が埋もれる。**ウォッチリスト維持側（`_screen_watchlist_symbols_async`）の同じ趣旨の行も、銘柄ごとに取引日1回へ絞ってある**（2026-08-17の実測で208行/日。「3. 実行環境と設定」のログ方針）。
 
 **監視に残すことと、注目銘柄として引き継ぐことは別である**（`WatchlistScreen.untradeable`）。引き継ぎは「押し目が出るまで持ち続ける」ための仕組みなので、建てられない銘柄を引き継ぐと枠を占めたまま毎日組み入れ直すことになる。
 
