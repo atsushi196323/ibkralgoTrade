@@ -16,7 +16,7 @@ import asyncio
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from ib_async import IB, LimitOrder, MarketOrder, Order, Stock, StopOrder
 
@@ -140,8 +140,15 @@ class OrderNotFilledError(RuntimeError):
 def ensure_orders_are_paper_only(port: int) -> None:
     """実発注が有効なら、接続先がペーパーのポートであることを強制する。
 
-    起動時に1度だけ呼ぶ。ドライランのまま本番ポートへつなぐのは（データ取得だけ
+    接続する前に1度だけ呼ぶ。ドライランのまま本番ポートへつなぐのは（データ取得だけ
     なので）従来どおり許すが、実発注が有効な状態での本番ポートは止める。
+
+    **これだけでは実口座への発注を防げない。** ポートで判定できるのは
+    「Gatewayの既定のポート割り当てがモードを表している」場合だけで、
+    IBCの `OverrideTwsApiPort` は**モードと無関係に**ポートを決められる
+    （2026-08-18にVPSで実測。`~/ibc/config.ini` が `TradingMode=paper` かつ
+    `OverrideTwsApiPort=4002`）。設定を live に変えれば、**実口座が
+    4002番で待ち受ける**。接続後に `ensure_account_is_paper` を必ず併用すること。
     """
     if not ENABLE_REAL_ORDERS:
         return
@@ -149,6 +156,49 @@ def ensure_orders_are_paper_only(port: int) -> None:
         raise RuntimeError(
             f"実発注(ENABLE_REAL_ORDERS=True)が有効ですが、接続先ポート {port} は"
             f"ペーパー取引のポート {sorted(PAPER_TRADING_PORTS)} ではありません。"
+            "検証中の実発注はペーパー口座に限ります。"
+        )
+
+
+# ペーパー口座の口座番号の接頭辞。IBKRは検証用口座に DU（個人）/ DF（アドバイザー）
+# を割り当てる。実口座は U / F / I などで始まる。
+PAPER_ACCOUNT_PREFIXES = ("DU", "DF")
+
+
+def ensure_account_is_paper(accounts: Sequence[str]) -> None:
+    """実発注が有効なら、接続先の口座がペーパー口座であることを強制する。
+
+    **接続のたびに呼ぶ。ポートによる判定の代わりではなく、二重化である。**
+    ポートでモードを推定できるのは、Gatewayが既定のポート割り当て
+    （paper=4002 / live=4001）を使っている場合に限られる。IBCの
+    `OverrideTwsApiPort` はモードと無関係にポートを決めるため、
+    **`TradingMode=live` のまま 4002番で待ち受けている実口座**に、
+    こちらは「ペーパーのポートだから安全」と判断して接続しうる。
+    2026-08-18時点のVPSは `TradingMode=paper` / `OverrideTwsApiPort=4002` で、
+    設定を1行変えるだけでこの状態になる。
+
+    口座番号は推定ではなくブローカーが返す事実なので、モードの取り違えに
+    対してポートより強い。
+
+    **口座が読めない場合も止める。** 分からないものを安全側（＝ペーパーである）
+    に倒すと、この検査が黙って素通しになったことに気付けない。実発注が
+    無効なら（ドライラン）何もしない。
+    """
+    if not ENABLE_REAL_ORDERS:
+        return
+
+    if not accounts:
+        raise RuntimeError(
+            "実発注(ENABLE_REAL_ORDERS=True)が有効ですが、接続先の口座番号を"
+            "取得できませんでした。ペーパー口座かどうかを確かめられないため停止します。"
+        )
+
+    live = [a for a in accounts if not str(a).upper().startswith(PAPER_ACCOUNT_PREFIXES)]
+    if live:
+        raise RuntimeError(
+            f"実発注(ENABLE_REAL_ORDERS=True)が有効ですが、接続先の口座 {sorted(live)} は"
+            f"ペーパー口座（{'/'.join(PAPER_ACCOUNT_PREFIXES)} で始まる）ではありません。"
+            "IB Gateway/IBCのTradingModeがliveになっていないか確認してください。"
             "検証中の実発注はペーパー口座に限ります。"
         )
 

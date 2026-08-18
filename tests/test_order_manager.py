@@ -17,6 +17,7 @@ from execution.order_manager import (
     RestingOrdersNotLiveError,
     build_bracket_orders,
     cancel_bracket_orders_async,
+    ensure_account_is_paper,
     ensure_orders_are_paper_only,
     find_filled_resting_exit,
     find_resting_exit_protection_async,
@@ -389,6 +390,45 @@ def test_paper_port_guard_allows_paper_and_blocks_anything_else() -> None:
         for other_port in (7496, 4001, 7495):
             with pytest.raises(RuntimeError):
                 ensure_orders_are_paper_only(other_port)
+
+
+def test_the_account_guard_blocks_a_live_account_on_a_paper_port() -> None:
+    """ポートがペーパーでも、口座が実口座なら止めること。
+
+    ポートでモードを推定できるのは、Gatewayが既定のポート割り当て
+    (paper=4002 / live=4001) を使っている場合だけである。IBCの
+    `OverrideTwsApiPort` はモードと無関係にポートを決めるため、
+    **`TradingMode=live` の実口座が4002番で待ち受ける**設定が成立する
+    （2026-08-18にVPSで実測。現在は paper だが、1行変えればこうなる）。
+    口座番号はブローカーが返す事実なので、ポートより強い判定になる。
+    """
+    with patch("execution.order_manager.ENABLE_REAL_ORDERS", True):
+        ensure_account_is_paper(["DU1234567"])
+        ensure_account_is_paper(["DF1234567"])
+
+        with pytest.raises(RuntimeError, match="ペーパー口座"):
+            ensure_account_is_paper(["U1234567"])
+        # 1つでも実口座が混ざっていれば止める。
+        with pytest.raises(RuntimeError, match="ペーパー口座"):
+            ensure_account_is_paper(["DU1234567", "U1234567"])
+
+
+def test_the_account_guard_stops_when_the_account_cannot_be_read() -> None:
+    """口座が読めない場合も止めること。
+
+    分からないものを安全側（＝ペーパーである）に倒すと、この検査が黙って
+    素通しになったことに気付けない。実弾が出る側の判定なので、
+    「確かめられなかった」は「危険」として扱う。
+    """
+    with patch("execution.order_manager.ENABLE_REAL_ORDERS", True):
+        with pytest.raises(RuntimeError, match="取得できませんでした"):
+            ensure_account_is_paper([])
+
+
+def test_the_account_guard_is_inert_while_dry_running() -> None:
+    """ドライランなら注文を出さないので、どの口座でも止めない。"""
+    ensure_account_is_paper(["U1234567"])
+    ensure_account_is_paper([])
 
 
 def test_guard_is_inert_while_dry_running() -> None:

@@ -12,6 +12,7 @@
 有効化にあたっての条件（いずれも維持すること）:
 
 - **接続先がペーパーのポート(7497 / 4002)でなければ `main()` が起動時に停止する**（`ensure_orders_are_paper_only`）。許可リストで判定しているので、`.env` の打ち間違いも止まる
+- **接続のたびに、ブローカーが返す口座番号がペーパー(`DU` / `DF` で始まる)であることを確かめる**（`ensure_account_is_paper`）。**ポートだけでは実口座への発注を防げない。** ポートでモードを推定できるのはGatewayが既定の割り当て(paper=4002 / live=4001)を使っている場合だけで、IBCの `OverrideTwsApiPort` は**モードと無関係に**ポートを決める。2026-08-18にVPSで実測した `~/ibc/config.ini` は `TradingMode=paper` かつ `OverrideTwsApiPort=4002` で、**`TradingMode` を1行変えれば実口座が4002番で待ち受ける**。口座番号は推定ではなくブローカーが返す事実なので、モードの取り違えに対してポートより強い。口座が読めない場合も止める（「確かめられなかった」を「ペーパーである」として扱わない）。`tests/test_order_manager.py` の `test_the_account_guard_blocks_a_live_account_on_a_paper_port` / `test_the_account_guard_stops_when_the_account_cannot_be_read` が番人
 - 株数(`MAX_POSITION_SIZE` 40株)と金額(`MAX_ORDER_NOTIONAL_USD` 5,000ドル)のクランプは**有効のまま**
 - 建値・決済価格・手数料は実際の `Fill` から取り、待機注文の約定もブローカー側から読む（`find_filled_resting_exit`）。約定しなかった注文の扱い・`parentId`・拒否時の記録は「9. 開発時の禁止事項」に不変条件としてまとめてある
 - **移行時に `logs/positions.json` のドライラン期間の想定ポジションを消すこと。** ブローカーが持っていない建玉へ成行決済を出すと売り建てになる。`PositionManager.is_confirmed_by_broker` がERRORを出して決済を見送るが、その銘柄は監視枠を占め続け、`MAX_CONCURRENT_POSITIONS`（2）を埋めると新規建てが一切起きない。2026-08-05の移行時にはSPCX・AMBQの2件がこれに該当し、両方消してから有効にした
@@ -1260,7 +1261,7 @@ python -m scripts.export_tax_report --all-years
 ## 9. 開発時の禁止事項 (Constraints)
 
 - 実資金の口座ポート (`7496` または `4001`) にハードコーディングで接続してはならない。必ず `.env` ファイル経由でポート番号を読み込むこと。
-- ロジックの検証が完了するまでは、発注処理 (`placeOrder`) を**ペーパー口座に限る**こと（`ENABLE_REAL_ORDERS` と `ensure_orders_are_paper_only`）。併せて、厳格な最大ロット数制限（Max Position Size）と1注文あたりの金額上限をハードコードで設けたまま維持すること。
+- ロジックの検証が完了するまでは、発注処理 (`placeOrder`) を**ペーパー口座に限る**こと（`ENABLE_REAL_ORDERS`・`ensure_orders_are_paper_only`・`ensure_account_is_paper`）。**ポートによる判定を口座による判定の代わりにしてはならない**（IBCの `OverrideTwsApiPort` がモードとポートの対応を壊すため。「1. プロジェクト概要」を参照）。併せて、厳格な最大ロット数制限（Max Position Size）と1注文あたりの金額上限をハードコードで設けたまま維持すること。
 - **最大ロット数制限を決済 (SELL) に適用してはならない。** 呼び出し側は決済成立を前提にローカルのポジションを閉じるため、SELLの数量を丸めるとブローカー側に建玉が残ったまま追跡だけが消え、損切りもトレーリングストップも効かない未追跡ポジションが生まれる。制限は新規建て (BUY) のみに適用すること。決済済み現金によるクランプ（`_clamp_quantity_to_settled_cash_async`）も同じ理由で新規建て専用である。
 - **資金・受渡しに関する制約を「同日決済の禁止」で実装してはならない。** 待機注文を外すか約定を拒否することになり、損切りの無い時間が生まれる。入口（新規建ての資金判定）で止めること。理由は「決済済み現金による建玉の制限」を参照（GFV自体はこの口座に適用されないと判明したが、この禁止事項はGFVとは独立に成立する）。
 - **ブラケット注文の子（損切りの逆指値・利確の指値）を、親より先に送信してはならない。** `transmit=True` を立てるのは最後の子だけ。親を先に送ると、損切りが届く前に建玉ができ、一瞬でも損切りの無い裸のポジションが生まれる。

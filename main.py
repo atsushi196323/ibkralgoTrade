@@ -34,6 +34,7 @@ from execution.order_manager import (
     MAX_POSITION_SIZE,
     RestingExitProtection,
     cancel_bracket_orders_async,
+    ensure_account_is_paper,
     ensure_orders_are_paper_only,
     find_filled_resting_exit,
     find_resting_exit_protection_async,
@@ -1690,6 +1691,12 @@ async def main() -> None:
                 # （connect_async自体は指数的バックオフ付きリトライを内包している）。
                 if ib is None or not ib.isConnected():
                     ib = await connection.connect_async()
+                    # **接続のたびに口座を確かめる。** ポートによる判定
+                    # (ensure_orders_are_paper_only) はGatewayが既定のポート割り当てを
+                    # 使っている前提でしか成立せず、IBCの OverrideTwsApiPort は
+                    # モードと無関係にポートを決める。実口座が4002番で待ち受けていても
+                    # ポートだけでは見抜けないため、ブローカーが返す口座番号で二重化する。
+                    ensure_account_is_paper(ib.managedAccounts())
                     consecutive_connection_failures = 0
 
                 if is_regular_trading_hours():
