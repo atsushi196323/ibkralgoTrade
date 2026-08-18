@@ -175,3 +175,38 @@ def test_money_columns_are_rounded_to_avoid_float_artifacts() -> None:
     # 丸めなければ 27033.250000000004 になる
     assert row.pnl_jpy == 27033.25
     assert row.pnl_usd == 177.5
+
+
+def test_trades_without_an_fx_rate_are_named_in_a_warning(tmp_path, caplog) -> None:
+    """為替レートが欠けた決済は、出力時に名指しで警告すること。
+
+    円換算後の損益が空欄になるだけで出力自体は成功するため、気付かないまま
+    税理士へ渡すと**その行だけ申告額から抜け落ちる**。レートは決済時点にしか
+    取れず、後から推定で埋めることは禁じている（間違ったレートは後から
+    見分けられない）ので、手当てが要る行としてここで名指しする。
+    2026-08-05のAMBQが実例。
+    """
+    import logging
+
+    trades = [
+        _trade("AMBQ", 67.77, 63.38, 3, "2026-08-05T15:00:36+00:00"),
+        _trade("INTC", 96.93, 97.99, 2, "2026-08-10T15:09:19+00:00", usd_jpy_rate=158.99),
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        export_tax_report_csv(trades, str(tmp_path / "tax.csv"), tax_year=2026)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("AMBQ" in message for message in warnings)
+    assert not any("INTC" in message for message in warnings)
+
+
+def test_no_warning_when_every_trade_has_a_rate(tmp_path, caplog) -> None:
+    import logging
+
+    trades = [_trade("INTC", 96.93, 97.99, 2, "2026-08-10T15:09:19+00:00", usd_jpy_rate=158.99)]
+
+    with caplog.at_level(logging.WARNING):
+        export_tax_report_csv(trades, str(tmp_path / "tax.csv"), tax_year=2026)
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

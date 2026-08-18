@@ -119,4 +119,22 @@ def export_tax_report_csv(
         "税理士向け確定申告用CSVを出力しました: file=%s tax_year=%s 件数=%d",
         file_path, tax_year if tax_year is not None else "全期間", len(rows),
     )
+
+    # **為替レートが欠けた行は、黙って渡してはならない。** 円換算後の損益が空欄に
+    # なるだけで出力自体は成功するため、気付かないまま税理士へ渡すと、その行だけ
+    # 申告額から抜け落ちる。レートは決済時点にしか取れず（`main._resolve_usd_jpy_rate_async`）、
+    # 後から推定で埋めることは禁じている（間違ったレートは後から見分けられない）ので、
+    # **公表レートで手当てする必要がある行としてここで名指しする。**
+    # 2026-08-05のAMBQが実例で、当時は為替のマーケットデータ購読が無く
+    # (`Error 162 No market data permissions for IDEALPRO`)、口座サマリーの
+    # ExchangeRate へのフォールバックもまだ無かった。
+    missing = [row for row in rows if row.usd_jpy_rate is None]
+    if missing:
+        logger.warning(
+            "為替レートが記録されていない決済が %d 件あります: %s。"
+            "円換算後の損益(pnl_jpy)が空欄になっているため、"
+            "その日の公表レート(TTM等)で手当てしてから提出してください。",
+            len(missing), ", ".join(f"{row.symbol}({row.exit_date[:10]})" for row in missing),
+        )
+
     return len(rows)
