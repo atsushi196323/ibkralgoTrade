@@ -643,6 +643,7 @@ async def place_bracket_order_async(
 
     fill_price = _fill_price_of(parent_trade)
     commission = _commission_of(parent_trade)
+    oca_group = orders.oca_group
 
     # 子注文の値段は、参照価格ではなく**実約定価格**を基準に置き直す。
     stop_price, take_profit_price, reprice_landed = await _reprice_children_to_fill_async(
@@ -652,7 +653,7 @@ async def place_bracket_order_async(
     if not reprice_landed:
         # 修正が拒否された（10326等）。拒否されても元の注文は生き続けるため、
         # ここで諦めると設計より遠い逆指値がその建玉の一生ぶん残る。
-        replaced_stop, replaced_take_profit, replaced_trades = (
+        replaced_stop, replaced_take_profit, replaced_trades, replaced_oca_group = (
             await _replace_children_at_fill_async(
                 ib, contract, quantity, fill_price, stop_ratio, take_profit_ratio,
             )
@@ -662,20 +663,22 @@ async def place_bracket_order_async(
             # 生存確認は置き直した側に掛ける。取り消し済みの古いTradeを見ると
             # 「子注文が死んでいる」と判定して建玉を成行決済してしまう。
             child_trades = replaced_trades
+            # 記録とログも置き直した側の名前に揃える（元の名前の注文はもう板に無い）。
+            oca_group = replaced_oca_group
 
     # 親が約定した = 建玉ができた時点で、子注文が本当にブローカー側で生きているかを
     # 確かめる。送信が受理されたことと、注文が板に置かれたことは別である
     # （呼値違反・値幅制限・プリセットによる拒否は、ib_asyncからは警告としてしか
     # 見えず、子注文の状態には何も来ないことがある）。
     await _ensure_children_are_live_async(
-        ib, contract, child_trades, quantity, orders.oca_group,
+        ib, contract, child_trades, quantity, oca_group,
     )
     logger.info(
         "[%s] ブラケットの親注文が約定しました: qty=%s fill=%s commission=%.2f "
         "損切り=STP@%.2f 利確=LMT@%.2f oca=%s",
         contract.symbol, quantity,
         f"{fill_price:.2f}" if fill_price is not None else "不明", commission,
-        stop_price, take_profit_price, orders.oca_group,
+        stop_price, take_profit_price, oca_group,
     )
 
     return BracketResult(
@@ -683,7 +686,7 @@ async def place_bracket_order_async(
         quantity=quantity,
         stop_price=stop_price,
         take_profit_price=take_profit_price,
-        oca_group=orders.oca_group,
+        oca_group=oca_group,
         dry_run=False,
         fill_price=fill_price,
         commission=commission,
@@ -808,8 +811,15 @@ async def _replace_children_at_fill_async(
     建玉がブローカーにだけ残り、追跡が消える。値段は設計より遠いが保護はある
     状態なので、記録して次のサイクルの突き合わせに委ねる方が安全側になる。
 
-    戻り値は (損切り, 利確, 置き直した子注文)。置き直せなかった場合の3つ目は
-    None で、呼び出し側は元の子注文で生存確認を続ける。
+    戻り値は (損切り, 利確, 置き直した子注文, 新しいOCAグループ名)。置き直せなかった
+    場合は後ろ2つが None で、呼び出し側は元の子注文で生存確認を続ける。
+
+    **新しいOCAグループ名を返すのは、記録とログを板の実体に合わせるためである。**
+    置き直した注文は元のグループとは別の名前で送られるので、元の名前のまま
+    `positions.json` へ残すと、障害の切り分け時に存在しないグループを探すことになる。
+    突き合わせ自体は銘柄で行う（IBKRが名前を書き換えるため）ので機能には影響しないが、
+    記録がブローカーの実体と食い違う状態を残さない、というこのプロジェクトの
+    約束の側で揃えておく。
     """
     new_stop = round_to_tick(fill_price * stop_ratio)
     new_take_profit = round_to_tick(fill_price * take_profit_ratio)
@@ -822,17 +832,17 @@ async def _replace_children_at_fill_async(
             "板にある値段のまま記録します（生きている注文へ重ねると Error 201 になる）。",
             contract.symbol,
         )
-        return None, None, None
+        return None, None, None, None
 
-    child_trades, _ = _place_resting_children(
+    child_trades, oca_group = _place_resting_children(
         ib, contract, quantity, new_stop, new_take_profit, reference_price=fill_price,
     )
     logger.info(
         "[%s] 意図とずれた待機注文を取り消し、実約定(%.2f)基準で置き直しました: "
-        "損切り=STP@%.2f 利確=LMT@%.2f",
-        contract.symbol, fill_price, new_stop, new_take_profit,
+        "損切り=STP@%.2f 利確=LMT@%.2f oca=%s",
+        contract.symbol, fill_price, new_stop, new_take_profit, oca_group,
     )
-    return new_stop, new_take_profit, child_trades
+    return new_stop, new_take_profit, child_trades, oca_group
 
 
 def _adopt_parent_perm_id_as_oca_group(

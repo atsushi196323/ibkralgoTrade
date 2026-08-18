@@ -982,6 +982,60 @@ def test_a_rejected_reprice_is_replaced_by_cancelling_and_placing_again() -> Non
     assert result.take_profit_price == pytest.approx(67.44 * 1.10, abs=0.01)
 
 
+def test_a_replacement_is_recorded_under_the_group_the_new_orders_were_sent_with() -> None:
+    """置き直したら、記録するOCAグループ名も置き直した側に揃えること。
+
+    元の名前の注文はもう板に無い。突き合わせは銘柄で行う（IBKRが名前を親のpermIdへ
+    書き換えるため）ので機能には影響しないが、`positions.json` に存在しないグループ名が
+    残ると、障害の切り分け時に無いものを探すことになる。
+    """
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(avg_fill_price=67.44), _make_trade(order_type="STP"),
+        _make_trade(order_type="LMT"),
+        _make_trade(), _make_trade(),                       # 拒否された修正
+        _make_trade(order_type="STP"), _make_trade(order_type="LMT"),  # 置き直し
+    ])
+    stale = [
+        _resting_trade("STP", 63.18, perm_id=501, oca_group="267089215"),
+        _resting_trade("LMT", 73.15, perm_id=502, oca_group="267089215"),
+    ]
+    ib.reqAllOpenOrdersAsync = AsyncMock(side_effect=[stale, stale, []])
+
+    with _real_orders_enabled():
+        result = asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AMBQ"), quantity=3,
+            stop_price=66.5 * 0.95, take_profit_price=66.5 * 1.10, reference_price=66.5,
+        ))
+
+    sent_groups = [
+        call.args[1].ocaGroup for call in ib.placeOrder.call_args_list
+        if getattr(call.args[1], "ocaGroup", "")
+    ]
+    # 置き直しは新しいグループ名で送られる（元の名前の注文はもう板に無い）。
+    assert sent_groups[0] != sent_groups[-1]
+    assert result.oca_group == sent_groups[-1]
+
+
+def test_a_bracket_that_needed_no_replacement_keeps_its_original_group() -> None:
+    """置き直しが起きなければ、名前は最初に送ったままであること。"""
+    ib = MagicMock()
+    ib.placeOrder = MagicMock(side_effect=[
+        _make_trade(avg_fill_price=66.5), _make_trade(order_type="STP"),
+        _make_trade(order_type="LMT"),
+    ])
+    ib.reqAllOpenOrdersAsync = AsyncMock(return_value=[])
+
+    with _real_orders_enabled():
+        result = asyncio.run(place_bracket_order_async(
+            ib, MagicMock(symbol="AMBQ"), quantity=3,
+            stop_price=66.5 * 0.95, take_profit_price=66.5 * 1.10, reference_price=66.5,
+        ))
+
+    assert result.oca_group.startswith("BRACKET_AMBQ_")
+    assert ib.cancelOrder.call_count == 0
+
+
 def test_a_reprice_that_never_reached_the_book_is_recorded_at_the_broker_price() -> None:
     """置き直しもできなかったら、要求した値段ではなく板の値段を記録すること。
 
