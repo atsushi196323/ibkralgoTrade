@@ -257,6 +257,7 @@ scripts/
   check_screener.py         スキャナー・PER取得の購読権限を切り分ける診断CLI
   check_deployment.py       VPS移行の設定漏れ（linger・スワップ・タイマー・launchd残存）の点検CLI
   check_positions.py        記録とブローカーの建玉・待機注文を突き合わせる照会CLI（再起動・移行の直後に使う）
+  repair_resting_prices.py  既存の建玉の待機注文を実約定基準の値段へ直す（既定ドライラン。Botを止めてから）
   fetch_bars.py             検証用の日足をCSVへ保存する（yfinance、IBKR接続不要）
   rank_turnover.py          売買代金ランキングの日次記録（yfinance、観測専用）
   daily_report.py           1取引日の稼働サマリ（bot.log + trade_journal.csv を読む。注文層の結果もここに出る）
@@ -611,7 +612,13 @@ python -m backtest.run --csv-dir bars/intraday --mode walk-forward \
 
 **取り消しが確定しなかった場合は置き直さずに諦め、板の値段のまま記録すること。** 生きている注文へ重ねると売り超過で拒否される（`Error 201`）。ここで例外にしないのは、この時点の建玉が**まだローカルに記録されていない**ためである——送出すると、待機注文に守られた建玉がブローカーにだけ残り、追跡が消える。値段は設計より遠いが保護はある状態なので、記録して次のサイクルの突き合わせに委ねる方が安全側になる。**置き直した場合は、生存確認を置き直した側の注文に掛けること**——取り消し済みの古い `Trade` を見ると「子注文が死んでいる」と判定して建玉を成行決済してしまう。`tests/test_order_manager.py` の `test_a_rejected_reprice_is_replaced_by_cancelling_and_placing_again` / `test_a_reprice_that_never_reached_the_book_is_recorded_at_the_broker_price` が番人。
 
-**既に建っている建玉の待機注文は、この経路では直らない。** 毎サイクルの突き合わせは値段を板へ合わせて**記録する**だけで、板を直しには行かない（下記）。**意図どおりに直しに行かせてはならない**——現に保護されている建玉に対して、300秒ごとに取り消し→置き直しの無防備な窓を作ることになる。既存の建玉のずれは手動で直すか、そのまま決済まで持つこと。新規建てでは上記の置き直しが入口で解消する。
+**既に建っている建玉の待機注文は、この経路では直らない。** 毎サイクルの突き合わせは値段を板へ合わせて**記録する**だけで、板を直しには行かない（下記）。**意図どおりに直しに行かせてはならない**——現に保護されている建玉に対して、300秒ごとに取り消し→置き直しの無防備な窓を作ることになる。新規建てでは上記の置き直しが入口で解消するが、**既に建ってしまったものは `python -m scripts.repair_resting_prices` で直すこと**（下記）。
+
+**既存の建玉を直すのは「そのうち決済される」以上の意味がある。** 板の逆指値が設計より下にあると、Bot側のポーリング判定（建値-5%）が常に先に発動し、**ブラケット子注文の約定＝OCAの取消連動が一度も観測できない**。2026-08-05〜08-18の14日間で実際にこれが起き、往復2件はいずれもBot側の成行決済だった。現フェーズの主目的が注文層の検証である以上、ずれた建玉を放置することは検証を止めることと同じである。
+
+`scripts/repair_resting_prices.py` は板から読み直した `Order` の値段だけを差し替えて送り返す（既定はドライラン、`--apply` で送信）。10326を踏まないのは、**IBKRが書き換えた後のOCAグループ名＝親のpermIdをそのまま使う**ためで、前のセッションで発注した注文はその名前で読み直せる（2026-08-18に UPS=1448732136 / INTC=470578601 として実測）。同日 UPS・INTC の4件に実行し、4件とも板への反映を読み直しで確認した（INTC 95.44→97.29 / 110.51→112.66、UPS 98.69→98.86 / 114.27→114.47）。
+
+**修正はBotと同じクライアントIDで送ること。注文IDはクライアントごとの空間である。** 別のIDから他人の注文IDを指定して修正を送ると、IBKRは新規注文の重複と見なして `Error 103（Duplicate order id）` で拒否する（2026-08-18に `clientId=9` で実測。4件とも拒否され、板は元の値段のまま残った）。したがって実行前にBotを停止する必要がある（同じIDで同時に繋ぐと接続そのものが弾かれる）。記録側は触らない——次のサイクルで `main._adopt_broker_resting_prices` が板の値を正として書き戻し、R倍率の分母もそこから取り直す。`tests/test_repair_resting_prices.py` が番人。
 
 **さらに、毎サイクルの突き合わせで値段そのものも照合すること**（`main._adopt_broker_resting_prices`）。**両方が生きていることは、値段が意図どおりであることを意味しない。** 上の10326も呼値違反(`Warning 110`)も、拒否しても元の注文を生かすため、`is_complete` による生存確認だけでは通り抜ける。ずれていたら**板の値を正として記録し直す**——実際に約定するのは板にある注文であって記録ではなく、記録側に寄せるとR倍率が実際に負ったリスクと違う値で残る。読めなかった側は触らない（「確かめられなかった」を「一致した」として扱わないため）。**逆指値を板の値へ寄せたら、R倍率の分母(`Position.risk_per_share`)も同じ値から取り直すこと。** 分母は「実際に置いた待機注文の値段」から取る約束（`main._enter_position_async`）なので、値段だけ直して据え置くと、板を正としておきながらRだけが「置くつもりだった損切り」で残る。INTCの実測では 92.09 → 93.38 でリスクは 4.84 ではなく 3.55 であり、Rが約36%過小に出る。`tests/test_main.py` の `test_recorded_resting_prices_are_corrected_to_the_book` / `test_resting_prices_that_could_not_be_read_are_left_alone` が番人。
 
@@ -1227,6 +1234,12 @@ python -m scripts.check_deployment
 
 # 記録とブローカーの建玉の突き合わせ（照会のみ。再起動・環境の移行の直後に）
 python -m scripts.check_positions
+
+# 既存の建玉の待機注文を実約定基準へ直す（10326で置き直しが拒否された建玉の救済）
+# **先にBotを停止すること**（同じクライアントIDで繋ぐ必要がある）。
+systemctl --user stop ibkralgotrade
+python -m scripts.repair_resting_prices            # 何をするか表示するだけ
+python -m scripts.repair_resting_prices --apply    # 実際に修正を送る
 
 # 確定申告用CSVの出力（既定は前年分。IBKR接続不要）
 python -m scripts.export_tax_report
