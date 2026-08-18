@@ -22,6 +22,7 @@ from execution.order_manager import (
     RestingOrderCancelTimeoutError,
     RestingOrderFill,
 )
+from core.pacing import HISTORICAL_MAX_REQUESTS, HISTORICAL_SAFETY_MARGIN
 from data.rank_history import RankHistoryStore
 from execution.position_manager import PositionManager, STRATEGY_TYPE_DAY, STRATEGY_TYPE_SWING
 from execution.trade_journal import TradeJournal
@@ -1222,6 +1223,29 @@ def test_poll_interval_keeps_watchlist_within_ibkr_pacing_limit() -> None:
     requests_per_10min = MAX_WATCHLIST_SIZE * (600.0 / POLL_INTERVAL_SECONDS)
 
     assert requests_per_10min <= 60
+
+
+def test_the_watchlist_cap_does_not_worsen_the_pacer_backlog_beyond_one_window() -> None:
+    """最悪ケースの需要が、リミッターの実効枠の2倍を超えないこと。
+
+    上の不変条件は「銘柄あたり毎サイクル1リクエスト」を前提にした式である。
+    実際には `get_current_price_async` がヒストリカル終値のフォールバック
+    （購読権限が無い口座で使われる経路。CLAUDE.md「6.2」）まで落ちると、
+    同じ銘柄で日中足とは別にもう1件消費しうる。
+
+    **その最悪ケースは 20銘柄の時点で既に枠(55件/10分)を超えていた**
+    （20銘柄で80件、24銘柄で96件）。これは 24 で新しく生まれた問題ではない。
+    枠が尽きてもリミッターは違反せず**待つ**ので、症状は空のバー列ではなく
+    サイクルが伸びることである。**需要が枠を超え続ければ待ちは積み上がる**ので、
+    これは「安全である」ことの保証ではなく、設定のドリフトがどこまで悪化しうるかの
+    歯止めである。実際にこの経路へ落ちているかは `data.market_data` が毎回出す
+    取得経路のログ（`(streaming)` 等）で分かる。現在は全銘柄がstreamingで、
+    ヒストリカルのフォールバックは使われていない（2026-08-18のVPSログで確認）。
+    """
+    budget = HISTORICAL_MAX_REQUESTS - HISTORICAL_SAFETY_MARGIN
+    worst_case_per_10min = MAX_WATCHLIST_SIZE * 2 * (600.0 / POLL_INTERVAL_SECONDS)
+
+    assert worst_case_per_10min <= budget * 2
 
 
 def test_fallback_watchlist_has_no_duplicates() -> None:
