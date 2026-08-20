@@ -169,8 +169,8 @@
 
 | ジョブ | 日本時間 | 内容 |
 | --- | --- | --- |
-| `com.user.ibkralgotrade` | **月〜金** 22:15 | `scripts/start_bot.sh`（祝日判定 → Botを起動。寄り付き22:30の15分前に接続を確立しておく） |
-| `com.user.ibkralgotrade.afterclose` | **火〜土** 06:05 | `scripts/after_close.sh`（Bot停止 → 祝日判定 → 売買代金ランキング記録 → 稼働サマリ） |
+| `com.<ユーザー名>.ibkralgotrade` | **月〜金** 22:15 | `scripts/start_bot.sh`（祝日判定 → Botを起動。寄り付き22:30の15分前に接続を確立しておく） |
+| `com.<ユーザー名>.ibkralgotrade.afterclose` | **火〜土** 06:05 | `scripts/after_close.sh`（Bot停止 → 祝日判定 → 売買代金ランキング記録 → 稼働サマリ） |
 
 **2本の曜日は1日ずれる。** 金曜22:15に起動したセッションを閉じるのは土曜06:05のジョブなので、締め側を月〜金にすると**金曜のセッションが停止されず週末まで走り続ける**。日曜・月曜の06:05を外しているのは、それぞれ土曜・日曜の引け後にあたり取引が無いためである。
 
@@ -191,17 +191,17 @@
 
 **systemd側の標準出力・標準エラーは journal ではなく `logs/` 配下のファイルへ出す**（`StandardOutput=append:`）。journalに置くと、**改善のためにログを手元へ持ってくるときに `logs/` の同期だけでは拾えない**。ここに出るのは `scripts/start_bot.sh` 自身の出力（祝日でスキップしたのか、取引日を判定できずに失敗したのか）と `configure_logging()` が効く前の例外で、**起動しなかった日を切り分ける唯一の材料**である。launchd側が `logs/launchd.out` へ出しているのと同じ扱いに揃えてある。同期は `scripts/fetch_vps_logs.sh`（`logs_vps/` へ。手元の `logs/` と混ぜると、どちらの環境の記録か区別できなくなる）。
 
-**ラッパーは休場日(終了コード1)と判定失敗を区別すること。** `scripts/is_us_trading_day.py` が返すのは 0=取引日 / 1=休場日 だけなので、それ以外はインタープリタのパス違いや依存関係の欠落を意味する。`if ! python -m scripts.is_us_trading_day` のようにまとめて「起動しない」へ倒すと、**設定を間違えた日が休場日と同じ見た目になり、しかも終了コード0でスケジューラには成功として記録される**——毎日何も起きないまま気付けない。**VPSへ移すときに最も起こりやすい間違いがこれである**（既定値がmacOSのpyenvのパスを指しているため、`IBKRALGO_PYTHON` を渡し忘れると必ず踏む）。判定できなかったときは終了コード1で失敗として残し、`systemctl --user list-units --failed` と journal に出す。
+**ラッパーは休場日(終了コード1)と判定失敗を区別すること。** `scripts/is_us_trading_day.py` が返すのは 0=取引日 / 1=休場日 だけなので、それ以外はインタープリタのパス違いや依存関係の欠落を意味する。`if ! python -m scripts.is_us_trading_day` のようにまとめて「起動しない」へ倒すと、**設定を間違えた日が休場日と同じ見た目になり、しかも終了コード0でスケジューラには成功として記録される**——毎日何も起きないまま気付けない。**VPSへ移すときに最も起こりやすい間違いがこれである**（既定値は `python3` なので、依存関係を入れた仮想環境の外で走ると `ModuleNotFoundError` になる。`IBKRALGO_PYTHON` で明示すること）。判定できなかったときは終了コード1で失敗として残し、`systemctl --user list-units --failed` と journal に出す。
 
-**引け後のサマリは「その取引日のログが存在するか」も判定する**（`scripts/daily_report.last_closed_trading_day`）。`--date` を省略したときの対象日は**ログに書かれている最新の取引日**なので、ボットが起動しなかった日は前日のサマリがそのまま出て、正常な日と区別がつかない。2026-08-06に `com.user.ibkralgotrade` が launchd 側で `disabled` になっていたのを取りこぼしたのがこの穴である（plistは存在するのに `launchctl list` に無い状態で、ファイルを見るだけでは気付けない）。直近の引けた取引日より古ければ、サマリの先頭に警告と確認コマンドを出す。
+**引け後のサマリは「その取引日のログが存在するか」も判定する**（`scripts/daily_report.last_closed_trading_day`）。`--date` を省略したときの対象日は**ログに書かれている最新の取引日**なので、ボットが起動しなかった日は前日のサマリがそのまま出て、正常な日と区別がつかない。2026-08-06に `com.<ユーザー名>.ibkralgotrade` が launchd 側で `disabled` になっていたのを取りこぼしたのがこの穴である（plistは存在するのに `launchctl list` に無い状態で、ファイルを見るだけでは気付けない）。直近の引けた取引日より古ければ、サマリの先頭に警告と確認コマンドを出す。
 
 **この `disabled` は2026-08-10に再発した。** 再発時に分かったのは、**ディスク上のplistと launchd が読み込んでいた定義がずれうる**ことである。`launchctl list` から消えていた一方、`launchd.out` には `scripts/start_bot.sh` 経由でしか出ない `は取引日です。` が残っており、実際に走っていたのは新しい定義、ファイルに残っていたのは `main.py` を直接叩く古い版（祝日判定を経由せず `Weekday` も無い）だった。**そのまま `bootstrap` すると、直したはずの祝日スキップと曜日分割が消えた状態で復帰する。** 復帰させる前に必ずファイル側を確認すること。plistはリポジトリ管理外なので、Gitでは検出できない。
 
 ```bash
 launchctl list | grep ibkr                        # 2本無ければ登録されていない
 launchctl print-disabled gui/$(id -u) | grep ibkr # disabled なら enable が要る
-launchctl print gui/$(id -u)/com.user.ibkralgotrade | grep -A4 '^	program'
-launchctl print gui/$(id -u)/com.user.ibkralgotrade | grep '"Weekday"'
+launchctl print gui/$(id -u)/com.<ユーザー名>.ibkralgotrade | grep -A4 '^	program'
+launchctl print gui/$(id -u)/com.<ユーザー名>.ibkralgotrade | grep '"Weekday"'
 ```
 
 **06:05 なのは、夏時間で17:05 ET・冬時間で16:05 ETとなり、年間を通じて必ず引け(16:00 ET)の後になるため。** 05:05にすると冬時間の間はザラ場の最中に停止することになる。停止に **SIGTERM** を使い、`main.py` がこれを `KeyboardInterrupt` へ変換して `disconnect_async()` まで通す（`_raise_keyboard_interrupt_on_sigterm`）。SIGINTにしないのは、シェルがバックグラウンドで起動した子プロセスのSIGINTを `SIG_IGN` にする場合があるため（実測でcaffeinate配下のプロセスが無視した）。
@@ -729,7 +729,7 @@ python -m backtest.run --csv-dir bars/intraday --mode walk-forward \
 
 **口座の基準通貨は円だが、資金は必ずUSD建てで取得すること**（`execution/account.EQUITY_TAG`）。株価・損切り幅・ポジションサイジングがすべてUSD建てなので、資金だけ円だと数量が為替レート倍になる。
 
-2026-07-31にペーパー口座（`DU1234567`）で実測した値:
+2026-07-31にペーパー口座で実測した値:
 
 | タグ | 値 | 通貨 |
 | --- | --- | --- |
@@ -804,7 +804,7 @@ python -m backtest.run --csv-dir bars/intraday --mode walk-forward \
 - 新規建ては古い価格を掴んだ時点で見送る（`main.REJECT_STALE_ENTRY_PRICE`、既定True）。参照価格がずれると損切り・利確の値段まで実勢からずれたブラケットが並ぶため
 - **決済側には掛けていない。** 古い価格で決済を見送ると、損切りが必要な場面で何もしないことになり、新規建てを見送るのとは危険の向きが逆になる。`tests/test_main.py` の `test_stale_price_does_not_block_exits` が番人
 
-**検証済み（2026-07-31、IB Gatewayペーパー口座 `DU1234567`、遅延データ設定）: 取引時間中のIBKR日足に当日の未確定バーは含まれるが、寄り付き直後は含まれない。**
+**検証済み（2026-07-31、IB Gatewayペーパー口座、遅延データ設定）: 取引時間中のIBKR日足に当日の未確定バーは含まれるが、寄り付き直後は含まれない。**
 
 | 東部時間 | 結果 |
 | --- | --- |

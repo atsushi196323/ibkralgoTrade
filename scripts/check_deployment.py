@@ -42,10 +42,11 @@ load_dotenv()
 
 BOT_UNIT = "ibkralgotrade.timer"
 AFTERCLOSE_UNIT = "ibkralgotrade-afterclose.timer"
-LAUNCHD_LABELS = (
-    "com.user.ibkralgotrade",
-    "com.user.ibkralgotrade.afterclose",
-)
+# launchdのラベルは逆DNS形式で、接頭辞に環境ごとの識別子（macOSのユーザー名など）が
+# 入る。固定のラベルで照合すると、別のユーザーや別の名前で登録された残存ジョブを
+# 見落とす——このチェックが防ぎたいのは「二重ログインで一方のセッションが切られる」
+# ことなので、見落としはそのまま目的の失敗になる。この語を含むラベルを拾う。
+LAUNCHD_LABEL_KEYWORD = "ibkralgotrade"
 
 # OnCalendar末尾のタイムゾーン指定が使えるようになったバージョン。
 SYSTEMD_TZ_SUFFIX_MIN_VERSION = 252
@@ -124,7 +125,7 @@ def evaluate_launchd_jobs(registered: Optional[List[str]]) -> CheckResult:
         "macOS側のlaunchd", STATUS_FAIL,
         f"まだ登録されています: {', '.join(registered)}。"
         "同じ認証情報で二重にログインすると、後勝ちで一方のセッションが切られます。",
-        "launchctl bootout gui/$(id -u)/" + LAUNCHD_LABELS[0],
+        "launchctl bootout gui/$(id -u)/" + registered[0],
     )
 
 
@@ -257,7 +258,9 @@ def read_launchd_jobs() -> Optional[List[str]]:
     out = _run(["launchctl", "list"])
     if out is None:
         return []
-    return [label for label in LAUNCHD_LABELS if re.search(rf"\b{re.escape(label)}$", out, re.MULTILINE)]
+    # `launchctl list` は「PID<TAB>終了コード<TAB>ラベル」。ラベル列だけを見る。
+    labels = [line.split("\t")[-1].strip() for line in out.splitlines()]
+    return [label for label in labels if LAUNCHD_LABEL_KEYWORD in label]
 
 
 def read_timer_states() -> Dict[str, Optional[bool]]:

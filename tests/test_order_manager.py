@@ -410,7 +410,7 @@ def test_the_account_guard_blocks_a_live_account_on_a_paper_port() -> None:
             ensure_account_is_paper(["U1234567"])
         # 1つでも実口座が混ざっていれば止める。
         with pytest.raises(RuntimeError, match="ペーパー口座"):
-            ensure_account_is_paper(["DU1234567", "U1234567"])
+            ensure_account_is_paper(["DU1234567", "U7654321"])
 
 
 def test_the_account_guard_stops_when_the_account_cannot_be_read() -> None:

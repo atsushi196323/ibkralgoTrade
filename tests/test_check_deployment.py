@@ -1,6 +1,7 @@
 """scripts/check_deployment.py の単体テスト（実環境は読まずすべて注入する）。"""
 
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.check_deployment import (
     STATUS_FAIL,
@@ -15,6 +16,7 @@ from scripts.check_deployment import (
     evaluate_timers,
     format_results,
     has_failures,
+    read_launchd_jobs,
     units_use_timezone_suffix,
 )
 
@@ -81,10 +83,35 @@ def test_meminfo_that_could_not_be_read_is_not_counted_as_ok() -> None:
 
 def test_launchd_jobs_still_registered_are_a_failure() -> None:
     """止め忘れると同じ認証情報で二重にログインし、一方が切られる。"""
-    result = evaluate_launchd_jobs(["com.user.ibkralgotrade"])
+    result = evaluate_launchd_jobs(["com.example.ibkralgotrade"])
 
     assert result.status == STATUS_FAIL
     assert "bootout" in result.remedy
+    # 直し方には、実際に見つかったラベルを添えること。逆DNSの接頭辞は環境ごとに
+    # 違うので、固定のラベルを案内すると、そのままでは通らないコマンドになる。
+    assert "com.example.ibkralgotrade" in result.remedy
+
+
+def test_launchd_labels_are_matched_by_keyword_not_by_a_fixed_prefix() -> None:
+    """接頭辞が違っても残存ジョブとして拾うこと。
+
+    ラベルの接頭辞は環境ごとに違う（macOSのユーザー名などが入る）。固定の
+    ラベルで照合すると、別名で登録された残存ジョブを見落とし、二重ログインで
+    一方のセッションが切られる——このチェックが防ぎたい失敗そのものになる。
+    """
+    listing = (
+        "PID\tStatus\tLabel\n"
+        "-\t0\tcom.apple.SafariHistoryServiceAgent\n"
+        "-\t0\tcom.someone-else.ibkralgotrade\n"
+        "1234\t0\tcom.someone-else.ibkralgotrade.afterclose\n"
+    )
+
+    with patch("scripts.check_deployment.sys.platform", "darwin"), \
+        patch("scripts.check_deployment._run", return_value=listing):
+        assert read_launchd_jobs() == [
+            "com.someone-else.ibkralgotrade",
+            "com.someone-else.ibkralgotrade.afterclose",
+        ]
 
 
 def test_launchd_check_is_skipped_off_macos() -> None:

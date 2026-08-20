@@ -219,8 +219,8 @@ python -m scripts.daily_report --log logs_vps/bot.log --journal logs_vps/trade_j
 一方のセッションが切られる。
 
 ```bash
-launchctl bootout gui/$(id -u)/com.user.ibkralgotrade
-launchctl bootout gui/$(id -u)/com.user.ibkralgotrade.afterclose
+launchctl bootout gui/$(id -u)/com.<ユーザー名>.ibkralgotrade
+launchctl bootout gui/$(id -u)/com.<ユーザー名>.ibkralgotrade.afterclose
 
 python -m scripts.check_deployment   # macOS側で実行し、登録が残っていないか確かめる
 ```

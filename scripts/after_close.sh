@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # 米国市場の引け後に1日を締める。launchdから1日1回呼ばれる
-# （com.user.ibkralgotrade.afterclose、日本時間06:05）。
+# （com.<user>.ibkralgotrade.afterclose、日本時間06:05）。
 #
 # 06:05 JST を選んでいるのは、夏時間(EDT)では17:05 ET、冬時間(EST)では16:05 ET と
 # **年間を通じて必ず引け(16:00 ET)の後になる**ため。日本時間05:05にすると
@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.." || exit 1
 # インタープリタの実体を指す。環境変数で上書きできるようにしてあるのは、
 # 手元で別の環境から叩いて動作を確かめられるようにするためと、**Linuxでは
 # パスが違う**ため（VPSでは systemd unit の Environment= で渡す）。
-PYTHON="${IBKRALGO_PYTHON:-/Users/user/.pyenv/versions/3.11.10/bin/python3.11}"
+PYTHON="${IBKRALGO_PYTHON:-python3}"
 
 # systemdで動かしている場合のユニット名（VPS運用。deploy/systemd/ を参照）。
 BOT_UNIT="${IBKRALGO_SYSTEMD_UNIT:-ibkralgotrade.service}"

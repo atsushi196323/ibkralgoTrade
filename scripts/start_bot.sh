@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Botを起動する。launchdから平日22:15(JST)に呼ばれる
-# （com.user.ibkralgotrade）。
+# （com.<user>.ibkralgotrade）。
 #
 # launchdを直接main.pyへ向けずにこのラッパーを挟むのは、**米国市場の祝日を
 # ジョブ定義では表現できない**ためである。StartCalendarInterval が持つのは
@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.." || exit 1
 # インタープリタの実体を指す。環境変数で上書きできるようにしてあるのは、
 # 手元で別の環境から叩いて動作を確かめられるようにするためと、**Linuxでは
 # パスが違う**ため（VPSでは systemd unit の Environment= で渡す）。
-PYTHON="${IBKRALGO_PYTHON:-/Users/user/.pyenv/versions/3.11.10/bin/python3.11}"
+PYTHON="${IBKRALGO_PYTHON:-python3}"
 
 # **休場日(終了コード1)と、判定そのものに失敗した場合を区別する。**
 # `is_us_trading_day` が返すのは 0=取引日 / 1=休場日 だけなので、それ以外は

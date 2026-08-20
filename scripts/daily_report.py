@@ -572,7 +572,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             # 「コマンドが無い」のかを切り分ける手間が増えるため。
             if platform.system() == "Darwin":
                 how_to_check = (
-                    "    launchctl list com.user.ibkralgotrade で登録状態を確認すること。"
+                    "    launchctl list | grep ibkralgotrade で登録状態を確認すること。"
                 )
             else:
                 how_to_check = (
