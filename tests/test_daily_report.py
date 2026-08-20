@@ -311,6 +311,30 @@ def test_the_order_layer_section_reports_a_successful_bracket():
     assert "有効期間の上書き: 検知なし" in text
 
 
+def test_a_resting_exit_fill_is_reported_in_the_order_layer():
+    """待機注文(子)の約定をサマリに出すこと。
+
+    現フェーズの主目的はここで、これが出るまでOCAの取消連動はブローカー側の
+    挙動として確認できない。決済の行だけではBot側の成行決済と区別がつかず、
+    2026-08-18に初めて子注文が約定した日のサマリは「ブラケットの約定: なし」
+    としか報告していなかった（親注文の約定しか数えていなかったため）。
+    """
+    lines = _lines(
+        "2026-08-18 22:51:40,172 [INFO] __main__: "
+        "[INTC] ブローカー側の待機注文が約定していました: "
+        "reason=STOP_LOSS fill=97.33 commission=1.00",
+    )
+
+    report = build_day_report(lines, [], date(2026, 8, 18))
+
+    assert report.resting_exit_fills[0]["symbol"] == "INTC"
+    assert report.resting_exit_fills[0]["reason"] == "STOP_LOSS"
+    assert report.resting_exit_fills[0]["fill"] == 97.33
+
+    text = format_report(report)
+    assert "待機注文(子)の約定: INTC reason=STOP_LOSS @ 97.33" in text
+
+
 def test_a_tif_downgrade_is_called_out_with_the_fix():
     """有効期間の上書きは、直し方(Presets)まで添えて出すこと。
 

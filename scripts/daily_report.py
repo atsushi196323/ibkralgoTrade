@@ -78,6 +78,13 @@ _BRACKET_FILL_RE = re.compile(
     r"qty=(?P<qty>\d+) fill=(?P<fill>[\d.]+|不明) commission=(?P<commission>[\d.]+) "
     r"損切り=STP@(?P<stop>[\d.]+) 利確=LMT@(?P<take_profit>[\d.]+)"
 )
+# 待機注文（ブラケットの子）が約定した決済。**現フェーズの主目的そのもの**で、
+# これが出るまでOCAの取消連動はブローカー側の挙動として確認できない。
+# 決済の行だけでは、Bot側の成行決済と区別がつかない。
+_RESTING_EXIT_FILL_RE = re.compile(
+    r"^\[(?P<symbol>[^\]]+)\] ブローカー側の待機注文が約定していました: "
+    r"reason=(?P<reason>\S+) fill=(?P<fill>[\d.]+) commission=(?P<commission>[\d.]+)"
+)
 _REPRICE_RE = re.compile(
     r"^\[(?P<symbol>[^\]]+)\] 実約定\((?P<fill>[\d.]+)\)に合わせて待機注文を置き直しました: "
     r"損切り [\d.]+ -> (?P<stop>[\d.]+) / 利確 [\d.]+ -> (?P<take_profit>[\d.]+)"
@@ -147,6 +154,7 @@ class DayReport:
     # 注文層の出来事。ペーパーでの実発注検証が現フェーズの主目的であり、
     # 「正しく動いた」ことは WARNING/ERROR の集計には現れないため個別に持つ。
     bracket_fills: List[dict] = field(default_factory=list)
+    resting_exit_fills: List[dict] = field(default_factory=list)
     repricings: List[dict] = field(default_factory=list)
     restored_resting_orders: Counter = field(default_factory=Counter)
     cancels_confirmed: Counter = field(default_factory=Counter)
@@ -266,6 +274,15 @@ def build_day_report(
                 f" → 残り {history.group('remaining')}営業日"
             )
             continue
+
+        resting_exit = _RESTING_EXIT_FILL_RE.match(message)
+        if resting_exit is not None:
+            report.resting_exit_fills.append({
+                "symbol": resting_exit.group("symbol"),
+                "reason": resting_exit.group("reason"),
+                "fill": float(resting_exit.group("fill")),
+                "commission": float(resting_exit.group("commission")),
+            })
 
         bracket = _BRACKET_FILL_RE.match(message)
         if bracket is not None:
@@ -428,7 +445,18 @@ def format_report(report: DayReport) -> str:
                 f"損切り STP@{fill['stop']:.2f} 利確 LMT@{fill['take_profit']:.2f}"
             )
     else:
-        lines.append("  ブラケットの約定: なし")
+        lines.append("  ブラケットの親注文(新規建て)の約定: なし")
+
+    # 子注文の約定は、Bot側の成行決済と決定的に違う。板の逆指値が実勢どおりに
+    # 置けていた証拠であり、OCAの取消連動がブローカー側で観測できた証拠でもある。
+    if report.resting_exit_fills:
+        for fill in report.resting_exit_fills:
+            lines.append(
+                f"  **待機注文(子)の約定: {fill['symbol']} reason={fill['reason']} "
+                f"@ {fill['fill']:.2f} 手数料 {fill['commission']:.2f} USD**"
+            )
+    else:
+        lines.append("  待機注文(子)の約定: なし")
 
     # 参照価格と実約定のずれは、遅延データ(15分)がそのまま待機注文の位置の
     # ずれになる量である。設計上の損切り幅(-5%)からどれだけ離れていたかを

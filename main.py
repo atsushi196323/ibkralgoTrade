@@ -1015,6 +1015,36 @@ async def _restore_missing_resting_orders_async(
             _adopt_broker_resting_prices(position_manager, symbol, state)
             continue
 
+        # 待機注文が約定した直後は、ブローカー側に建玉も待機注文も無い。
+        # そこへ置き直すと**売り建てになる**。2026-08-18のINTCで実測した:
+        # 22:49:37に逆指値が97.33で約定 → 22:51:30の突き合わせが「待機注文が
+        # 無い」と判定してSTP/LMTを再送 → `Error 201` で拒否（この口座は
+        # 評価額が証拠金取引の最低額に届かないため空売りが弾かれただけで、
+        # 資金があれば2株の裸のショートが板に残っていた）。
+        #
+        # `RestingExitProtection.has_filled_exit` はこれを止められない。
+        # 元になる `reqAllOpenOrdersAsync()` が返すのは**板に生きている注文**
+        # だけで、約定済みの注文はそもそも含まれないためである（同日のログでは
+        # 約定の1分53秒後の照会に逆指値が現れていない）。約定はローカルの
+        # 取引ログを見る `find_filled_resting_exit` でしか読めない。
+        if find_filled_resting_exit(ib, symbol) is not None:
+            # 決済の記録はこの後の `_process_exit_async` が行う。
+            logger.info(
+                "[%s] 待機注文が約定済みのため置き直しません（建玉はもう閉じています）。", symbol,
+            )
+            continue
+
+        # ブローカーが持っていない建玉へ売り注文を出すのも同じく売り建てになる。
+        # 上の約定検知で拾えない経路（手動決済・ドライラン期間の想定ポジション）
+        # に対する歯止めで、成行決済側と同じ判定を使う。
+        if not position_manager.is_confirmed_by_broker(symbol):
+            logger.error(
+                "[%s] ローカルには建玉がありますが、ブローカー側に実在しません。"
+                "待機注文の置き直しを見送ります（持っていない株に売り注文を出すと"
+                "売り建てになるため）。", symbol,
+            )
+            continue
+
         position = position_manager.get_position(symbol)
         if state is not None and state.live_order_types:
             # 残っている片方を先に消す。消さずに両方を置き直すと、建玉を超える

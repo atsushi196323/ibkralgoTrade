@@ -2998,6 +2998,17 @@ def _position_manager_with_one_open_position() -> PositionManager:
         "AAPL", entry_price=100.0, quantity=3, risk_per_share=5.0,
         stop_price=95.0, take_profit_price=110.0, strategy_type=STRATEGY_TYPE_SWING,
     )
+    # ブローカー側にも実在する建玉として扱う。置き直しはこの確認を要求するので、
+    # 同期を通さないと「持っていない建玉」として全件見送られる。
+    broker_position = MagicMock()
+    broker_position.contract.symbol = "AAPL"
+    broker_position.contract.secType = "STK"
+    broker_position.contract.currency = "USD"
+    broker_position.position = 3
+    broker_position.avgCost = 100.0
+    ib = MagicMock()
+    ib.reqPositionsAsync = AsyncMock(return_value=[broker_position])
+    asyncio.run(manager.sync_with_broker_async(ib))
     return manager
 
 
@@ -3097,6 +3108,7 @@ def test_restore_places_the_bracket_again_when_nothing_is_live() -> None:
     with patch("main.ENABLE_REAL_ORDERS", True), \
         patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=contract)), \
         patch("main.find_resting_exit_protection_async", new=AsyncMock(return_value={})), \
+        patch("main.find_filled_resting_exit", return_value=None), \
         patch("main.cancel_bracket_orders_async", new=AsyncMock()) as mock_cancel, \
         patch("main.place_resting_exit_orders_async", new=AsyncMock()) as mock_place:
 
@@ -3127,6 +3139,7 @@ def test_restore_cancels_the_surviving_child_before_replacing_the_bracket() -> N
             "main.find_resting_exit_protection_async",
             new=AsyncMock(return_value={"AAPL": _protection(live=("LMT",))}),
         ), \
+        patch("main.find_filled_resting_exit", return_value=None), \
         patch(
             "main.cancel_bracket_orders_async",
             new=AsyncMock(side_effect=lambda *a, **k: calls.append("cancel")),
@@ -3164,3 +3177,58 @@ def test_restore_skips_symbols_whose_resting_exit_already_filled() -> None:
         ))
 
     mock_place.assert_not_awaited()
+
+
+def test_a_filled_resting_exit_is_not_replaced_even_when_the_book_looks_empty() -> None:
+    """約定直後は板が空に見える。それでも置き直してはならない。
+
+    `find_resting_exit_protection_async` の元になる `reqAllOpenOrdersAsync()` は
+    **板に生きている注文しか返さない**ため、約定した待機注文はそこに現れず、
+    `has_filled_exit` は立たない（上のテストが作っている状態は実機では起きない）。
+    2026-08-18のINTCの実測: 22:49:37に逆指値が97.33で約定 → 22:51:30の照会に
+    その注文は現れず → 突き合わせが「待機注文が無い」と判定してSTP/LMTを再送 →
+    建玉が無いので `Error 201` で拒否された。資金があれば裸のショートが残る。
+    """
+    ib = MagicMock()
+    manager = _position_manager_with_one_open_position()
+    fill = RestingOrderFill(order_type="STP", fill_price=97.33, commission=1.0)
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch("main.find_resting_exit_protection_async", new=AsyncMock(return_value={})), \
+        patch("main.find_filled_resting_exit", return_value=fill), \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()) as mock_cancel, \
+        patch("main.place_resting_exit_orders_async", new=AsyncMock()) as mock_place:
+
+        asyncio.run(main_module._restore_missing_resting_orders_async(
+            ib, manager, main_module.MarketDataCaches(),
+        ))
+
+    mock_place.assert_not_awaited()
+    mock_cancel.assert_not_awaited()
+
+
+def test_restore_skips_positions_the_broker_does_not_hold() -> None:
+    """ブローカーが持っていない建玉へ待機注文を置かないこと。
+
+    手動決済やドライラン期間の想定ポジションが記録に残っている場合、そこへ
+    売り注文を出すと売り建てになる。成行決済側と同じ判定で見送る。
+    """
+    ib = MagicMock()
+    manager = PositionManager()
+    manager.open_position(
+        "AAPL", entry_price=100.0, quantity=3, risk_per_share=5.0,
+        stop_price=95.0, take_profit_price=110.0, strategy_type=STRATEGY_TYPE_SWING,
+    )
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch("main.find_resting_exit_protection_async", new=AsyncMock(return_value={})), \
+        patch("main.find_filled_resting_exit", return_value=None), \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()) as mock_cancel, \
+        patch("main.place_resting_exit_orders_async", new=AsyncMock()) as mock_place:
+
+        asyncio.run(main_module._restore_missing_resting_orders_async(
+            ib, manager, main_module.MarketDataCaches(),
+        ))
+
+    mock_place.assert_not_awaited()
+    mock_cancel.assert_not_awaited()
