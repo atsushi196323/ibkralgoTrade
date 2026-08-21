@@ -326,17 +326,52 @@ def _fill_price_of(trade) -> Optional[float]:
 
     IBKRは未受信のフィールドをNaNや0で埋めてくるため、値として採用する前に
     「NaNでない、かつ正の数」を確認する（「6.4」）。
+
+    **`orderStatus.avgFillPrice` が読めなければ Fill から計算し直す。**
+    再接続で取り込んだ注文はこのフィールドを持たない。ib_async 2.1.0 の
+    `Wrapper.completedOrder` は `OrderStatus(orderId=..., status=...)` だけを
+    組み立てるため `avgFillPrice` は 0.0 のままで、その後の `reqExecutions`
+    （`connectAsync` が完了注文の取得後に必ず呼ぶ）は `trade.fills` を
+    埋めるだけで `orderStatus` を更新しない。**約定価格は Fill 側にしか無い。**
+
+    これが無いと、ボットが止まっている間に約定した待機注文を再起動後に
+    読めない。`find_filled_resting_exit` が「約定価格が読めません」で None を
+    返し、決済が `trade_journal.csv` に記録されないまま建玉がローカルに残る。
+    ブローカーはその建玉を持っていないので成行決済も置き直しも見送られ、
+    **同時保有枠(2)を占めたまま毎サイクルERRORを出し続ける**——2枠とも
+    こうなると新規建てが完全に止まる。
     """
-    price = getattr(trade.orderStatus, "avgFillPrice", None)
-    if price is None:
+    price = _positive_float(getattr(trade.orderStatus, "avgFillPrice", None))
+    if price is not None:
+        return price
+
+    # 部分約定では Fill が複数に分かれるため、株数で加重平均する。
+    total_shares = 0.0
+    total_value = 0.0
+    for fill in getattr(trade, "fills", []) or []:
+        execution = getattr(fill, "execution", None)
+        fill_price = _positive_float(getattr(execution, "price", None))
+        shares = _positive_float(getattr(execution, "shares", None))
+        if fill_price is None or shares is None:
+            continue
+        total_shares += shares
+        total_value += fill_price * shares
+    if total_shares <= 0:
+        return None
+    return total_value / total_shares
+
+
+def _positive_float(value) -> Optional[float]:
+    """NaN・0以下・数値でないものを弾いて返す（「6.4」）。"""
+    if value is None:
         return None
     try:
-        price = float(price)
+        value = float(value)
     except (TypeError, ValueError):
         return None
-    if math.isnan(price) or price <= 0:
+    if math.isnan(value) or value <= 0:
         return None
-    return price
+    return value
 
 
 def _commission_of(trade) -> float:

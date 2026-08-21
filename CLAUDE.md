@@ -591,6 +591,10 @@ python -m backtest.run --csv-dir bars/intraday --mode walk-forward \
 
   **`RestingExitProtection.has_filled_exit` はこの判定に使えない。** 元になる `reqAllOpenOrdersAsync()` が返すのは板に生きている注文だけで、**約定済みの注文はそもそも含まれない**。2026-08-18のINTCで実測: 22:49:37に逆指値が97.33で約定 → 22:51:30の照会にその注文は現れず → 突き合わせが「待機注文が無い」と判定してSTP/LMTを再送 → 建玉が無いため `Error 201`（証拠金取引の最低額 200,000 JPY 未満）で拒否された。**資金があれば2株の裸のショートがGTCの売り注文つきで残っていた。** 拒否のおかげで実害が出なかっただけであり、`has_filled_exit` を作るテストは実機で起こらない状態を検証していた。`tests/test_main.py` の `test_a_filled_resting_exit_is_not_replaced_even_when_the_book_looks_empty` / `test_restore_skips_positions_the_broker_does_not_hold` が番人
 
+- **待機注文の約定価格は、`orderStatus.avgFillPrice` が読めなければ `Fill` から計算し直すこと**（`_fill_price_of`）。**再接続で取り込んだ注文はこのフィールドを持たない。** ib_async 2.1.0 の `Wrapper.completedOrder` は `OrderStatus(orderId=..., status=...)` だけを組み立てるため `avgFillPrice` は 0.0 のままで、`connectAsync` がその後に必ず呼ぶ `reqExecutions` は `trade.fills` を埋めるだけで `orderStatus` を更新しない。**約定価格はFill側にしか無い。**
+
+  諦めると静かに止まる。`find_filled_resting_exit` が「約定価格が読めません」でNoneを返し、**ボットが止まっている間に約定した決済が `trade_journal.csv` に記録されないまま建玉がローカルに残る**。ブローカーはその建玉を持っていないので成行決済も置き直しも見送られ（上の2つの歯止めが正しく働くため）、その銘柄は同時保有枠を占めたまま毎サイクルERRORを出し続ける。**2枠とも埋まると新規建てが完全に止まる。** 現フェーズは1日1セッションで再起動するため、セッション中の再起動・クラッシュ・Gatewayの再接続がこの経路に当たる。`tests/test_order_manager.py` の `test_a_resting_exit_restored_on_reconnect_is_priced_from_its_fills` / `test_a_partially_filled_resting_exit_is_averaged_by_shares` が番人
+
 #### 待機注文が「消える」ことと、値段が実約定とずれること（2026-08-05〜06の実測）
 
 **待機注文の値段は参照価格ではなく実約定価格から決めること。** 遅延データ(`IBKR_MARKET_DATA_TYPE=3`)では参照価格が15分古いため、実約定との差がそのまま待機注文の位置のずれになる。AMBQの例:

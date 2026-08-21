@@ -360,13 +360,18 @@ def _make_trade(status: str = "Filled", avg_fill_price: float = 100.0, commissio
                 order_id: int = 42, order_type: str = "MKT", oca_group=None,
                 symbol: str = "AAPL", action: str = "SELL", tif: str = "GTC",
                 # 親のpermIdは置き直しのOCAグループ名になる（実測値を既定に置く）。
-                perm_id: int = 470578601):
+                perm_id: int = 470578601,
+                # 再接続で取り込んだ注文は avgFillPrice を持たず、約定価格は
+                # Fill 側にしか無い。既定は「Fillからも読めない」に倒しておく。
+                fill_price=None, fill_shares=None):
     trade = MagicMock()
     trade.isDone = MagicMock(return_value=True)
     trade.orderStatus.status = status
     trade.orderStatus.avgFillPrice = avg_fill_price
     fill = MagicMock()
     fill.commissionReport.commission = commission
+    fill.execution.price = fill_price
+    fill.execution.shares = fill_shares
     trade.fills = [fill]
     trade.order.orderId = order_id
     trade.order.permId = perm_id
@@ -625,6 +630,45 @@ def test_filled_resting_exit_without_a_readable_price_is_not_reported() -> None:
     ib.trades = MagicMock(return_value=[_make_trade(avg_fill_price=0.0, order_type="STP")])
 
     assert find_filled_resting_exit(ib, "AAPL") is None
+
+
+def test_a_resting_exit_restored_on_reconnect_is_priced_from_its_fills() -> None:
+    """再接続後も、待機注文の約定を読めること。
+
+    ib_async の `Wrapper.completedOrder` は `OrderStatus(orderId=..., status=...)`
+    しか組み立てないため、`connectAsync` が取り込んだ完了注文の avgFillPrice は
+    0.0 のままである。その後の `reqExecutions` は `trade.fills` を埋めるだけで
+    orderStatus を更新しない。ここで諦めると、ボットが止まっている間に約定した
+    決済が記録されず、建玉がローカルに残って同時保有枠を占め続ける。
+    """
+    ib = MagicMock()
+    restored = _make_trade(
+        order_type="STP", avg_fill_price=0.0, commission=1.0,
+        fill_price=97.33, fill_shares=2.0,
+    )
+    ib.trades = MagicMock(return_value=[restored])
+
+    fill = find_filled_resting_exit(ib, "AAPL")
+
+    assert (fill.order_type, fill.fill_price, fill.commission) == ("STP", 97.33, 1.0)
+
+
+def test_a_partially_filled_resting_exit_is_averaged_by_shares() -> None:
+    """Fillが複数に分かれていたら株数で加重平均すること（単純平均だと値がずれる）。"""
+    ib = MagicMock()
+    trade = _make_trade(order_type="STP", avg_fill_price=0.0, commission=0.0)
+    first, second = MagicMock(), MagicMock()
+    first.execution.price, first.execution.shares = 100.0, 1.0
+    second.execution.price, second.execution.shares = 90.0, 3.0
+    first.commissionReport.commission = 0.35
+    second.commissionReport.commission = 0.35
+    trade.fills = [first, second]
+    ib.trades = MagicMock(return_value=[trade])
+
+    fill = find_filled_resting_exit(ib, "AAPL")
+
+    assert fill.fill_price == pytest.approx(92.5)
+    assert fill.commission == pytest.approx(0.70)
 
 
 def test_real_cancel_cancels_only_the_resting_orders_of_that_symbol() -> None:
