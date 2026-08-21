@@ -81,9 +81,13 @@ _BRACKET_FILL_RE = re.compile(
 # 待機注文（ブラケットの子）が約定した決済。**現フェーズの主目的そのもの**で、
 # これが出るまでOCAの取消連動はブローカー側の挙動として確認できない。
 # 決済の行だけでは、Bot側の成行決済と区別がつかない。
+# `source=` は約定価格の取得経路。**再接続で取り込んだ注文は `avgFillPrice` が
+# 空**で、Fillから復元できたかどうかはここにしか現れない。古いログには
+# 付いていないため任意にしてある。
 _RESTING_EXIT_FILL_RE = re.compile(
     r"^\[(?P<symbol>[^\]]+)\] ブローカー側の待機注文が約定していました: "
     r"reason=(?P<reason>\S+) fill=(?P<fill>[\d.]+) commission=(?P<commission>[\d.]+)"
+    r"(?: source=(?P<source>\S+))?"
 )
 _REPRICE_RE = re.compile(
     r"^\[(?P<symbol>[^\]]+)\] 実約定\((?P<fill>[\d.]+)\)に合わせて待機注文を置き直しました: "
@@ -282,6 +286,7 @@ def build_day_report(
                 "reason": resting_exit.group("reason"),
                 "fill": float(resting_exit.group("fill")),
                 "commission": float(resting_exit.group("commission")),
+                "source": resting_exit.group("source"),
             })
 
         bracket = _BRACKET_FILL_RE.match(message)
@@ -455,6 +460,12 @@ def format_report(report: DayReport) -> str:
                 f"  **待機注文(子)の約定: {fill['symbol']} reason={fill['reason']} "
                 f"@ {fill['fill']:.2f} 手数料 {fill['commission']:.2f} USD**"
             )
+            # 取得経路。fills から読めたなら、ボットが止まっている間の約定を
+            # 再起動後に拾えたということ（`_fill_price_with_source`）。
+            if fill.get("source") == "fills":
+                lines.append(
+                    "      約定価格は Fill から復元（avgFillPriceが空＝再接続で取り込んだ注文）。"
+                )
     else:
         lines.append("  待機注文(子)の約定: なし")
 

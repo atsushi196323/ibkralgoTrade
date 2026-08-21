@@ -335,6 +335,39 @@ def test_a_resting_exit_fill_is_reported_in_the_order_layer():
     assert "待機注文(子)の約定: INTC reason=STOP_LOSS @ 97.33" in text
 
 
+def test_a_fill_price_recovered_from_fills_is_called_out():
+    """約定価格をFillから復元した日は、サマリにそう出すこと。
+
+    再接続で取り込んだ注文は avgFillPrice が空で、Fillから復元できたかどうかは
+    ログの source= にしか現れない。ここに出ないと、ボットが止まっている間の
+    約定を拾えたことが1日の要約から消える。
+    """
+    lines = _lines(
+        "2026-08-21 22:51:40,172 [INFO] __main__: "
+        "[INTC] ブローカー側の待機注文が約定していました: "
+        "reason=STOP_LOSS fill=97.33 commission=1.00 source=fills",
+    )
+
+    report = build_day_report(lines, [], date(2026, 8, 21))
+
+    assert report.resting_exit_fills[0]["source"] == "fills"
+    assert "約定価格は Fill から復元" in format_report(report)
+
+
+def test_an_old_log_without_a_price_source_still_parses():
+    """source= の無い過去のログも読めること（付ける前の記録が読めなくなる）。"""
+    lines = _lines(
+        "2026-08-18 22:51:40,172 [INFO] __main__: "
+        "[INTC] ブローカー側の待機注文が約定していました: "
+        "reason=STOP_LOSS fill=97.33 commission=1.00",
+    )
+
+    report = build_day_report(lines, [], date(2026, 8, 18))
+
+    assert report.resting_exit_fills[0]["source"] is None
+    assert "約定価格は Fill から復元" not in format_report(report)
+
+
 def test_a_tif_downgrade_is_called_out_with_the_fix():
     """有効期間の上書きは、直し方(Presets)まで添えて出すこと。
 

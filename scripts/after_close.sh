@@ -113,6 +113,19 @@ echo
 echo "----- 記録の控え -----"
 "${PYTHON}" -m scripts.backup_records || echo "backup_records が失敗しました（控えは更新されていません）。"
 
+# 再接続後に約定価格を読めるかを、その日の実データで確かめる（照会のみ・発注しない）。
+# **ここでしか確かめられない。** 稼働中に約定した注文は `avgFillPrice` が
+# 埋まっているため、Fillからの復元は通常のサイクルでは一度も通らない。
+# Botを止めた直後のこの位置なら、まっさらな接続＝再起動直後と同じ視点で
+# 今日の約定を読み直せる（`scripts/check_fill_price_recovery.py` の冒頭を参照）。
+#
+# IB Gatewayへ繋ぐので失敗しうるが、締めの本体ではないため **1日を失敗扱いに
+# しない**（Gatewayのログアウトは08:00 JSTなのでこの時刻には繋がる）。
+echo
+echo "----- 約定価格の読み取り確認（再接続後） -----"
+"${PYTHON}" -m scripts.check_fill_price_recovery \
+    || echo "check_fill_price_recovery が失敗しました（この日の判定材料はありません）。"
+
 echo
 echo "----- 売買代金ランキングの記録 -----"
 "${PYTHON}" -m scripts.rank_turnover || echo "rank_turnover が失敗しました（履歴は更新されていません）。"

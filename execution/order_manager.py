@@ -16,7 +16,7 @@ import asyncio
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from ib_async import IB, LimitOrder, MarketOrder, Order, Stock, StopOrder
 
@@ -321,6 +321,41 @@ class OrderResult:
     commission: float = 0.0
 
 
+# 約定価格をどこから読んだか。**ログに残す値であり、直したことの唯一の証拠**
+# （下の `_fill_price_of` を参照）。稼働中に約定した注文は AVG_FILL_PRICE、
+# 再接続で取り込んだ注文は FILLS になる。
+PRICE_SOURCE_AVG_FILL_PRICE = "avgFillPrice"
+PRICE_SOURCE_FILLS = "fills"
+PRICE_SOURCE_NONE = "読めない"
+
+
+def _fill_price_with_source(trade) -> Tuple[Optional[float], str]:
+    """約定価格と、それをどこから読んだかを返す。
+
+    経路を呼び出し側へ返すのは、**再接続経由で読めたことをログに残すため**である。
+    値だけを返すと、フォールバックが働いたのか元から `avgFillPrice` が読めたのかを
+    後から区別できず、この経路が生きているかを確かめる手段が無くなる。
+    """
+    price = _positive_float(getattr(trade.orderStatus, "avgFillPrice", None))
+    if price is not None:
+        return price, PRICE_SOURCE_AVG_FILL_PRICE
+
+    # 部分約定では Fill が複数に分かれるため、株数で加重平均する。
+    total_shares = 0.0
+    total_value = 0.0
+    for fill in getattr(trade, "fills", []) or []:
+        execution = getattr(fill, "execution", None)
+        fill_price = _positive_float(getattr(execution, "price", None))
+        shares = _positive_float(getattr(execution, "shares", None))
+        if fill_price is None or shares is None:
+            continue
+        total_shares += shares
+        total_value += fill_price * shares
+    if total_shares <= 0:
+        return None, PRICE_SOURCE_NONE
+    return total_value / total_shares, PRICE_SOURCE_FILLS
+
+
 def _fill_price_of(trade) -> Optional[float]:
     """約定価格を返す。取れなければNone。
 
@@ -341,24 +376,7 @@ def _fill_price_of(trade) -> Optional[float]:
     **同時保有枠(2)を占めたまま毎サイクルERRORを出し続ける**——2枠とも
     こうなると新規建てが完全に止まる。
     """
-    price = _positive_float(getattr(trade.orderStatus, "avgFillPrice", None))
-    if price is not None:
-        return price
-
-    # 部分約定では Fill が複数に分かれるため、株数で加重平均する。
-    total_shares = 0.0
-    total_value = 0.0
-    for fill in getattr(trade, "fills", []) or []:
-        execution = getattr(fill, "execution", None)
-        fill_price = _positive_float(getattr(execution, "price", None))
-        shares = _positive_float(getattr(execution, "shares", None))
-        if fill_price is None or shares is None:
-            continue
-        total_shares += shares
-        total_value += fill_price * shares
-    if total_shares <= 0:
-        return None
-    return total_value / total_shares
+    return _fill_price_with_source(trade)[0]
 
 
 def _positive_float(value) -> Optional[float]:
@@ -1157,6 +1175,8 @@ class RestingOrderFill:
     order_type: str
     fill_price: float
     commission: float
+    # 約定価格をどこから読んだか（`_fill_price_with_source`）。ログにだけ出る。
+    price_source: str = PRICE_SOURCE_AVG_FILL_PRICE
 
 
 def _is_resting_exit_order(trade, symbol: str) -> bool:
@@ -1319,7 +1339,7 @@ def find_filled_resting_exit(ib: IB, symbol: str) -> Optional[RestingOrderFill]:
         if trade.orderStatus.status != _STATUS_FILLED:
             continue
 
-        fill_price = _fill_price_of(trade)
+        fill_price, price_source = _fill_price_with_source(trade)
         if fill_price is None:
             # 約定はしているのに値段が読めない。ここで推定を入れると損益が
             # 静かにずれるため、次のサイクルで読めるまで判断を持ち越す。
@@ -1328,10 +1348,20 @@ def find_filled_resting_exit(ib: IB, symbol: str) -> Optional[RestingOrderFill]:
                 symbol, getattr(order, "orderType", None),
             )
             return None
+        if price_source == PRICE_SOURCE_FILLS:
+            # 再接続で取り込んだ注文からの復元。**この行だけが、ボットが
+            # 止まっている間の約定を読めたことの証拠になる**（稼働中に約定した
+            # 注文は `avgFillPrice` が埋まっているためこの行は出ない）。
+            logger.info(
+                "[%s] 待機注文の約定価格を Fill から復元しました（avgFillPriceが空）: "
+                "type=%s fill=%.2f。再接続で取り込んだ注文です。",
+                symbol, getattr(order, "orderType", None), fill_price,
+            )
         return RestingOrderFill(
             order_type=str(getattr(order, "orderType", "")),
             fill_price=fill_price,
             commission=_commission_of(trade),
+            price_source=price_source,
         )
 
     return None

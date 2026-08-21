@@ -653,6 +653,33 @@ def test_a_resting_exit_restored_on_reconnect_is_priced_from_its_fills() -> None
     assert (fill.order_type, fill.fill_price, fill.commission) == ("STP", 97.33, 1.0)
 
 
+def test_a_resting_exit_records_where_its_price_came_from(caplog) -> None:
+    """約定価格の取得経路をログと戻り値に残すこと。
+
+    Fillからの復元は**通常の稼働では一度も通らない**（稼働中に約定した注文は
+    avgFillPrice が埋まっている）。経路を残さないと、この経路が生きているかを
+    確かめる手段が無くなる。
+    """
+    ib = MagicMock()
+    ib.trades = MagicMock(return_value=[_make_trade(
+        order_type="STP", avg_fill_price=0.0, fill_price=97.33, fill_shares=2.0,
+    )])
+
+    with caplog.at_level(logging.INFO, logger="execution.order_manager"):
+        fill = find_filled_resting_exit(ib, "AAPL")
+
+    assert fill.price_source == "fills"
+    assert "Fill から復元" in caplog.text
+
+
+def test_a_resting_exit_filled_while_running_is_not_reported_as_recovered() -> None:
+    """稼働中の約定は avgFillPrice から読める。復元扱いにしてはならない。"""
+    ib = MagicMock()
+    ib.trades = MagicMock(return_value=[_make_trade(order_type="STP", avg_fill_price=97.33)])
+
+    assert find_filled_resting_exit(ib, "AAPL").price_source == "avgFillPrice"
+
+
 def test_a_partially_filled_resting_exit_is_averaged_by_shares() -> None:
     """Fillが複数に分かれていたら株数で加重平均すること（単純平均だと値がずれる）。"""
     ib = MagicMock()

@@ -170,7 +170,7 @@
 | ジョブ | 日本時間 | 内容 |
 | --- | --- | --- |
 | `com.<ユーザー名>.ibkralgotrade` | **月〜金** 22:15 | `scripts/start_bot.sh`（祝日判定 → Botを起動。寄り付き22:30の15分前に接続を確立しておく） |
-| `com.<ユーザー名>.ibkralgotrade.afterclose` | **火〜土** 06:05 | `scripts/after_close.sh`（Bot停止 → 祝日判定 → 売買代金ランキング記録 → 稼働サマリ） |
+| `com.<ユーザー名>.ibkralgotrade.afterclose` | **火〜土** 06:05 | `scripts/after_close.sh`（Bot停止 → 祝日判定 → 記録の控え → 約定価格の読み取り確認 → 売買代金ランキング記録 → 稼働サマリ） |
 
 **2本の曜日は1日ずれる。** 金曜22:15に起動したセッションを閉じるのは土曜06:05のジョブなので、締め側を月〜金にすると**金曜のセッションが停止されず週末まで走り続ける**。日曜・月曜の06:05を外しているのは、それぞれ土曜・日曜の引け後にあたり取引が無いためである。
 
@@ -279,6 +279,7 @@ scripts/
   check_screener.py         スキャナー・PER取得の購読権限を切り分ける診断CLI
   check_deployment.py       VPS移行の設定漏れ（linger・スワップ・タイマー・launchd残存）の点検CLI
   check_positions.py        記録とブローカーの建玉・待機注文を突き合わせる照会CLI（再起動・移行の直後に使う）
+  check_fill_price_recovery.py  再接続後に約定価格を読めるかを実データで確かめる照会CLI（引け後に自動実行）
   repair_resting_prices.py  既存の建玉の待機注文を実約定基準の値段へ直す（既定ドライラン。Botを止めてから）
   fetch_bars.py             検証用の日足をCSVへ保存する（yfinance、IBKR接続不要）
   rank_turnover.py          売買代金ランキングの日次記録（yfinance、観測専用）
@@ -594,6 +595,8 @@ python -m backtest.run --csv-dir bars/intraday --mode walk-forward \
 - **待機注文の約定価格は、`orderStatus.avgFillPrice` が読めなければ `Fill` から計算し直すこと**（`_fill_price_of`）。**再接続で取り込んだ注文はこのフィールドを持たない。** ib_async 2.1.0 の `Wrapper.completedOrder` は `OrderStatus(orderId=..., status=...)` だけを組み立てるため `avgFillPrice` は 0.0 のままで、`connectAsync` がその後に必ず呼ぶ `reqExecutions` は `trade.fills` を埋めるだけで `orderStatus` を更新しない。**約定価格はFill側にしか無い。**
 
   諦めると静かに止まる。`find_filled_resting_exit` が「約定価格が読めません」でNoneを返し、**ボットが止まっている間に約定した決済が `trade_journal.csv` に記録されないまま建玉がローカルに残る**。ブローカーはその建玉を持っていないので成行決済も置き直しも見送られ（上の2つの歯止めが正しく働くため）、その銘柄は同時保有枠を占めたまま毎サイクルERRORを出し続ける。**2枠とも埋まると新規建てが完全に止まる。** 現フェーズは1日1セッションで再起動するため、セッション中の再起動・クラッシュ・Gatewayの再接続がこの経路に当たる。`tests/test_order_manager.py` の `test_a_resting_exit_restored_on_reconnect_is_priced_from_its_fills` / `test_a_partially_filled_resting_exit_is_averaged_by_shares` が番人
+
+  **この経路は通常の稼働では一度も通らないため、確かめる仕掛けを別に置いてある。** 稼働中に約定した注文は `orderStatus` が更新されて `avgFillPrice` が埋まるので、フォールバックが働く余地が無い。効いているかは**まっさらな接続から今日の約定を読み直す**しかなく、それが `python -m scripts.check_fill_price_recovery`（照会のみ・発注しない）である。Botを止めた直後＝再起動直後と同じ視点になるよう、引け後の締め(`scripts/after_close.sh`)がBot停止のあとに自動で呼ぶ。判定は `logs/fill_price_recovery.jsonl` へ**追記**され、`avgFillPrice` が空の約定をFillから復元できた日だけ「修正が効いています」と出る。**「今日の約定はすべて avgFillPrice から読めた」を「修正が効いた」と読んではならない**——その日は再接続の状況が再現できていないだけで、何も確かめていない。約定価格がどこからも読めなければ終了コード1（＝不具合の再発）。約定が無い日は判定材料が無いだけなので失敗にしない。稼働中の決済がどちらの経路で読まれたかは `bot.log` の `source=` と引け後のサマリにも残る。`tests/test_check_fill_price_recovery.py` と `tests/test_daily_report.py` の `test_a_fill_price_recovered_from_fills_is_called_out` が番人
 
 #### 待機注文が「消える」ことと、値段が実約定とずれること（2026-08-05〜06の実測）
 
@@ -1267,6 +1270,10 @@ python -m scripts.check_deployment
 
 # 記録とブローカーの建玉の突き合わせ（照会のみ。再起動・環境の移行の直後に）
 python -m scripts.check_positions
+
+# 再接続後に約定価格を読めるかの確認（照会のみ。**Botを停止してから**）
+# 引け後の締めが自動で呼ぶ。判定は logs/fill_price_recovery.jsonl へ追記される。
+python -m scripts.check_fill_price_recovery
 
 # 既存の建玉の待機注文を実約定基準へ直す（10326で置き直しが拒否された建玉の救済）
 # **先にBotを停止すること**（同じクライアントIDで繋ぐ必要がある）。

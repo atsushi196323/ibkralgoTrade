@@ -822,8 +822,13 @@ async def _process_exit_async(
                 REASON_TAKE_PROFIT if resting_fill.order_type == "LMT" else REASON_STOP_LOSS
             )
             logger.info(
-                "[%s] ブローカー側の待機注文が約定していました: reason=%s fill=%.2f commission=%.2f",
+                # 約定価格の取得経路(source)まで残す。再接続で取り込んだ注文は
+                # `avgFillPrice` が空で、Fillから復元できたかどうかがここにしか
+                # 現れない（`_fill_price_with_source`）。
+                "[%s] ブローカー側の待機注文が約定していました: reason=%s fill=%.2f "
+                "commission=%.2f source=%s",
                 symbol, reason, resting_fill.fill_price, resting_fill.commission,
+                resting_fill.price_source,
             )
             pnl_pct = (
                 (resting_fill.fill_price - position.entry_price) / position.entry_price * 100.0
