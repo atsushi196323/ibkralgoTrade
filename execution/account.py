@@ -138,33 +138,61 @@ async def get_usd_to_base_rate_async(ib: IB, base_currency: str = "JPY") -> Opti
 
 
 async def get_settled_cash_async(ib: IB) -> Optional[float]:
-    """決済済み現金を返す。取得できなければNoneを返す。
+    """決済済み現金(USD)を返す。取得できなければNoneを返す。
 
     例外ではなくNoneを返すのは、資金の裏付けをどう扱うかの判断を呼び出し側に委ねるため。
     「取得できなかった」と「0ドルしかない」は意味が違い、前者を0として
     扱うと資金があるのに永久に建てられなくなる。
 
-    タグが見つからない場合は、サマリーに実在したタグ名をログに出す。
-    口座種別によってタグの有無が変わりうるため、接続先で何が返っているかを
-    ログだけで切り分けられるようにしておく（この関数が黙ってNoneを返すと、
-    新規エントリーが止まった理由に気付けない）。
+    **USD建ての行でなければNoneを返す。基準通貨の額を使ってはならない。**
+    呼び出し側(`main._clamp_quantity_to_settled_cash_async`)は
+    `floor(決済済み現金 ÷ 株価USD)` で買える株数を出すため、基準通貨が円の口座で
+    円建ての額をそのまま渡すと、クランプが為替レート倍（約160倍）だけ緩くなり
+    **有効にしたつもりで一度も効かない**。これは EQUITY_TAG で
+    NetLiquidation を使えない理由とまったく同じ形の取り違えで、例外もログも
+    出さずに数量だけを狂わせる（2026-08-22に確認: 稼働中のペーパー口座は
+    基準通貨が円で、`accountValues()` の現金系タグは BASE / JPY / USD の
+    3通貨で並ぶ。通貨を見ずに最初の一致を取ると、どれを掴むかは並び順しだいになる）。
+
+    タグが見つからない場合・USD建ての行が無い場合は、サマリーに実在した
+    タグ名（および同じタグの通貨）をログに出す。口座種別によってタグの有無が
+    変わりうるため、接続先で何が返っているかをログだけで切り分けられるように
+    しておく（この関数が黙ってNoneを返すと、新規エントリーの数量が
+    絞られなかった理由に気付けない）。
     """
     summary = await ib.accountSummaryAsync()
     for item in summary:
-        if item.tag == SETTLED_CASH_TAG:
-            try:
-                settled_cash = float(item.value)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "%s の値が数値として解釈できませんでした: %r",
-                    SETTLED_CASH_TAG, item.value,
-                )
-                return None
-            logger.info("決済済み現金(%s)を取得しました: %.2f", SETTLED_CASH_TAG, settled_cash)
-            return settled_cash
+        if item.tag != SETTLED_CASH_TAG:
+            continue
+        if getattr(item, "currency", None) != TRADING_CURRENCY:
+            continue
+        try:
+            settled_cash = float(item.value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "%s の値が数値として解釈できませんでした: %r",
+                SETTLED_CASH_TAG, item.value,
+            )
+            return None
+        logger.info(
+            "決済済み現金(%s, %s)を取得しました: %.2f",
+            SETTLED_CASH_TAG, TRADING_CURRENCY, settled_cash,
+        )
+        return settled_cash
 
-    logger.warning(
-        "アカウントサマリーに %s が見つかりませんでした。存在したタグ: %s",
-        SETTLED_CASH_TAG, sorted({item.tag for item in summary}),
+    currencies = sorted(
+        {str(getattr(i, "currency", None)) for i in summary if i.tag == SETTLED_CASH_TAG}
     )
+    if currencies:
+        logger.warning(
+            "アカウントサマリーの %s に %s 建ての行がありません（存在した通貨: %s）。"
+            "基準通貨の額をUSDとして使うとクランプが為替レート倍だけ緩くなるため、"
+            "決済済み現金による数量の切り下げは行いません。",
+            SETTLED_CASH_TAG, TRADING_CURRENCY, currencies,
+        )
+    else:
+        logger.warning(
+            "アカウントサマリーに %s が見つかりませんでした。存在したタグ: %s",
+            SETTLED_CASH_TAG, sorted({item.tag for item in summary}),
+        )
     return None

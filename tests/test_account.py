@@ -114,6 +114,43 @@ def test_returns_settled_cash() -> None:
     assert asyncio.run(get_settled_cash_async(ib)) == pytest.approx(1234.56)
 
 
+def test_settled_cash_picks_the_usd_row_on_a_jpy_based_account() -> None:
+    """基準通貨が円でも、USD建ての行を選ぶこと。
+
+    呼び出し側は floor(決済済み現金 ÷ 株価USD) で株数を出すので、円建ての額を
+    掴むとクランプが為替レート倍だけ緩くなる（EQUITY_TAG と同じ取り違え）。
+    """
+    ib = MagicMock()
+    ib.accountSummaryAsync = AsyncMock(
+        return_value=[
+            _make_account_value("NetLiquidation", "196059.62", currency="JPY"),
+            _make_account_value("SettledCash", "127772.18", currency="BASE"),
+            _make_account_value("SettledCash", "0.00", currency="JPY"),
+            _make_account_value("SettledCash", "803.71", currency="USD"),
+        ]
+    )
+
+    assert asyncio.run(get_settled_cash_async(ib)) == pytest.approx(803.71)
+
+
+def test_settled_cash_in_another_currency_is_not_used_as_usd() -> None:
+    """USD建ての行が無ければNoneを返し、基準通貨の額へフォールバックしないこと。
+
+    Noneならクランプを掛けずに通すだけ（注文が拒否されうるに留まる）だが、
+    円建ての額をUSDとして使うと、有効にしたつもりのクランプが約160倍だけ
+    緩くなり一度も効かない。
+    """
+    ib = MagicMock()
+    ib.accountSummaryAsync = AsyncMock(
+        return_value=[
+            _make_account_value("NetLiquidation", "196059.62", currency="JPY"),
+            _make_account_value("SettledCash", "127772.18", currency="JPY"),
+        ]
+    )
+
+    assert asyncio.run(get_settled_cash_async(ib)) is None
+
+
 def test_settled_cash_returns_none_when_tag_is_missing() -> None:
     """例外ではなくNoneを返すこと。
 
