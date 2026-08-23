@@ -2575,7 +2575,7 @@ def test_entry_requires_enough_history_to_judge_the_long_term_trend(trade_journa
     """移動平均が確定するだけの本数では新規建てしないこと。
 
     長期トレンドフィルター(STRUGGLING_MA_WINDOW=200本)は本数が足りないと
-    判定不能となり、_drop_struggling_symbols_async はその銘柄を監視対象に
+    判定不能となり、_screen_watchlist_symbols_async はその銘柄を監視対象に
     残す。エントリー側がSWING_MA_WINDOW(30本)で通ってしまうと、
     **トレンド判定を一度も受けていない銘柄がそのまま建つ。**
 

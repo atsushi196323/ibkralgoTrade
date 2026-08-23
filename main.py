@@ -106,7 +106,7 @@ logger = logging.getLogger(__name__)
 #
 # **件数は MAX_WATCHLIST_SIZE を超えてよい。** _refresh_watchlist_async の
 # フォールバック経路が、株価帯で絞ったうえで記載順に切り詰める。資金$1,220では
-# 株価帯($6.10〜$244)を通るのが24銘柄で、そこから20銘柄が監視対象になる。
+# 株価帯($6.10〜$244)を通るのが24銘柄で、MAX_WATCHLIST_SIZE にちょうど収まる。
 # ただし**日足の初回取得はリスト全件に対して発生する**（1日1回・銘柄あたり1件。
 # DailyBarCacheが以降を吸収する）ため、リストを大幅に伸ばすとその日の最初の
 # サイクルがペーサーの待ちで長くなる。
@@ -192,7 +192,7 @@ ATTENTION_SCAN_LOCATIONS: Tuple[str, ...] = ("STK.NASDAQ", "STK.NYSE")
 ATTENTION_SCAN_ROWS: int = 50
 
 # 急上昇の判定条件。rank_ceiling=50 は運用者の指定（1〜50位に入ったもの）。
-# min_rank_improvement は検証で決めた値ではなく、監視枠(20)に収まる件数へ
+# min_rank_improvement は検証で決めた値ではなく、監視枠(MAX_WATCHLIST_SIZE)に収まる件数へ
 # 絞るための足切りである。**成績を見てこの値を刻み直してはならない。**
 ATTENTION_CONFIG: AttentionConfig = AttentionConfig(
     rank_ceiling=50, min_rank_improvement=20, history_window=10, absent_rank=101,
@@ -283,7 +283,7 @@ SWING_THRESHOLD_PCT: float = 5.0
 # (SWING_MA_WINDOW)では足りない。**
 #
 # 長期トレンドフィルター(STRUGGLING_MA_WINDOW=200本)は本数が足りないと
-# Noneを返し、_drop_struggling_symbols_async はその銘柄を監視対象に残す。
+# Noneを返し、_screen_watchlist_symbols_async はその銘柄を監視対象に残す。
 # 残すこと自体は正しい（本数不足は「下降トレンドである」ことを意味しない）
 # が、エントリー側が30本で通ると、**トレンド判定を一度も受けていない銘柄が
 # そのまま建つ**。2026-08-04のペーパー検証で実際に起きており、上場から

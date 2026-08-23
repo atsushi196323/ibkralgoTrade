@@ -93,7 +93,7 @@ def test_pending_symbols_show_how_far_they_are_from_returning():
     捨てた銘柄ではなく順番待ちの銘柄である。距離が出ていないと、
     待てば戻るのか当面戻らないのかを運用者が判断できない。
 
-    文字列は main._drop_struggling_symbols_async が実際に出す書式。
+    文字列は main._screen_watchlist_symbols_async が実際に出す書式。
     """
     lines = _lines(
         "2026-08-03 22:30:20,000 [INFO] __main__: [SPCX] 日足が36本しかなく長期トレンドを"
