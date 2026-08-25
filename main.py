@@ -411,7 +411,7 @@ GROWTH_TRAILING_STOP_PCT: float = 12.0
 #   資金 $3,300 : 105トレード 勝率40.0% PF 0.76 損益 -495.10 USD
 #
 # 解除は None に戻すだけでよい。
-CONCENTRATED_SYMBOL: Optional[str] = "MRNA"
+CONCENTRATED_SYMBOL: Optional[str] = None
 
 # グロース株に割り当てる監視枠。MAX_WATCHLIST_SIZE の内数であり、
 # **合計を超えさせてはならない**（「6.1」のペーシング不変条件は監視銘柄の
