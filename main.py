@@ -47,6 +47,7 @@ from execution.position_manager import (
     Position,
     PositionManager,
     STRATEGY_TYPE_DAY,
+    STRATEGY_TYPE_GROWTH,
     STRATEGY_TYPE_SWING,
 )
 from execution.position_sizing import calculate_position_size
@@ -353,6 +354,46 @@ DAY_TAKE_PROFIT_PCT: float = 3.0
 DAY_STOP_LOSS_PCT: float = 1.5
 DAY_TRAILING_STOP_PCT: float = 2.0
 
+# --- グロース株トラック（日足・持ち越し。損切り-12%固定） -------------------
+#
+# **既定は無効。** 有効化の条件と検証結果は CLAUDE.md「グロース株トラック」節に
+# ある。無効なのは思想の問題ではなく、42銘柄のスイングと同じ基準
+# （銘柄横断・コスト込み・ウォークフォワード）で測った結果によるものである。
+#
+# 損切り-12%は運用者の指定値であり、検証で選んだ値ではない。**この値は
+# 株数計算を通じて買える株価の上限まで変える**——
+#   建玉金額 = 資金 × (リスク% ÷ 損切り%)
+# なので、-5%なら資金の20%、-12%なら8.3%になる。$1,220では建玉予算が
+# $244 -> $101 まで縮み、MRNA($138.89)は1株も買えない。この帯の判定は
+# _growth_price_band() が別に持つ（スイングの帯をそのまま使ってはならない）。
+ENABLE_GROWTH_SWING: bool = False
+
+# グロース株トラックの監視銘柄。**スイングの WATCHLIST とは母集団が別**で、
+# 混ぜてはならない（決済幅も株価帯も違う）。選定基準は「日次SDが高い成長株
+# ／モメンタム株で、ウォークフォワードに必要な315本以上の日足が取れること」。
+GROWTH_WATCHLIST: Tuple[str, ...] = (
+    "AFRM", "ARM", "COIN", "CRWD", "DDOG", "MDB", "MRNA", "NET",
+    "PLTR", "RBLX", "RIVN", "SHOP", "SMCI", "SNOW", "SOFI", "U",
+)
+
+# グロース株の押し目判定。スイングと同じ形（移動平均からの下方乖離）だが、
+# **閾値はスイングの-5%では機能しない。** グロース株の日次SDは中央値3.86%で、
+# 42銘柄の1.70%の2倍以上ある（2026-08-25実測）。-5%乖離はスイング銘柄では
+# 2.9日ぶん＝3σ級の異常事態だが、グロース株では1日強の通常変動でしかなく、
+# シグナルとしての情報が薄い。値はウォークフォワードに選ばせた（CLAUDE.md）。
+GROWTH_MA_WINDOW: int = 30
+GROWTH_THRESHOLD_PCT: float = 10.0
+
+# 損切り-12%は指定値。利確とトレーリングはそれに対する比率で決める。
+GROWTH_TAKE_PROFIT_PCT: float = 24.0
+GROWTH_STOP_LOSS_PCT: float = 12.0
+GROWTH_TRAILING_STOP_PCT: float = 12.0
+
+# グロース株に割り当てる監視枠。MAX_WATCHLIST_SIZE の内数であり、
+# **合計を超えさせてはならない**（「6.1」のペーシング不変条件は監視銘柄の
+# 総数で決まる）。スイング側はこの分だけ枠が減る。
+GROWTH_WATCHLIST_SLOTS: int = 6
+
 
 @dataclass(frozen=True)
 class ExitParams:
@@ -388,7 +429,23 @@ EXIT_PARAMS_BY_STRATEGY_TYPE: Dict[str, ExitParams] = {
         stop_loss_pct=DAY_STOP_LOSS_PCT,
         trailing_stop_pct=DAY_TRAILING_STOP_PCT,
     ),
+    STRATEGY_TYPE_GROWTH: ExitParams(
+        take_profit_pct=GROWTH_TAKE_PROFIT_PCT,
+        stop_loss_pct=GROWTH_STOP_LOSS_PCT,
+        trailing_stop_pct=GROWTH_TRAILING_STOP_PCT,
+    ),
 }
+
+
+def is_growth_symbol(symbol: str) -> bool:
+    """グロース株トラックの銘柄かを返す。
+
+    トラックが無効なときは常にFalse。**判定を1か所に集めているのは、
+    決済幅・株価帯・エントリー閾値の3つが同じ集合で切り替わらなければ
+    ならないため**である。片方だけグロース基準になると、-12%の損切りを
+    置いた建玉をスイングの株価帯（＝2.4倍の予算）で作ることになる。
+    """
+    return ENABLE_GROWTH_SWING and symbol in GROWTH_WATCHLIST
 
 # 1トレードあたり口座資金の何%をリスクに晒すか（ポジションサイジングの基準）
 RISK_PER_TRADE_PCT: float = 1.0
@@ -518,9 +575,16 @@ async def _detect_buy_signal_async(
         )
 
     if len(daily_df) >= SWING_MIN_HISTORY_BARS:
+        # グロース株は同じ日足・同じ判定ロジックで、閾値と決済幅だけが違う。
+        # 本数要件(200本)と長期トレンドフィルターは共通で掛ける——上場直後の
+        # 値付けの途中経過を「押し目」として建てないための歯止めであり、
+        # グロース株でこそ効く（2026-08-04のSPCXが実例）。
+        growth = is_growth_symbol(symbol)
         market_deviation_pct = await _get_market_deviation_pct_async(ib, caches)
         swing_signal = detect_pullback_signal(
-            symbol, daily_df, ma_window=SWING_MA_WINDOW, threshold_pct=SWING_THRESHOLD_PCT,
+            symbol, daily_df,
+            ma_window=GROWTH_MA_WINDOW if growth else SWING_MA_WINDOW,
+            threshold_pct=GROWTH_THRESHOLD_PCT if growth else SWING_THRESHOLD_PCT,
             market_deviation_pct=market_deviation_pct, market_filter=SWING_MARKET_FILTER,
         )
         if swing_signal.should_buy:
@@ -540,6 +604,13 @@ async def _detect_buy_signal_async(
                     _long_term_moving_average(daily_df), _pct_to_long_term_ma(daily_df),
                 )
             else:
+                if growth:
+                    logger.info(
+                        "[%s] グロース株(日足)のプルバックシグナルで買い判定しました"
+                        "（損切り-%.1f%% / 利確+%.1f%%）。",
+                        symbol, GROWTH_STOP_LOSS_PCT, GROWTH_TAKE_PROFIT_PCT,
+                    )
+                    return swing_signal, STRATEGY_TYPE_GROWTH
                 logger.info("[%s] スイング(日足)のプルバックシグナルで買い判定しました。", symbol)
                 return swing_signal, STRATEGY_TYPE_SWING
 
@@ -1148,6 +1219,7 @@ async def run_watchlist_cycle_async(
 
 def resolve_max_affordable_price(
     account_equity: float, settled_cash: Optional[float] = None,
+    stop_loss_pct: float = SWING_STOP_LOSS_PCT,
 ) -> Optional[float]:
     """現在の口座資金で1株でも買える上限株価を返す。
 
@@ -1180,7 +1252,7 @@ def resolve_max_affordable_price(
         )
         return None
 
-    max_price = account_equity * (RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT)
+    max_price = account_equity * (RISK_PER_TRADE_PCT / stop_loss_pct)
 
     if settled_cash is not None and 0 < settled_cash < max_price:
         logger.info(
@@ -1193,7 +1265,9 @@ def resolve_max_affordable_price(
     return max_price
 
 
-def resolve_min_tradeable_price(account_equity: float) -> Optional[float]:
+def resolve_min_tradeable_price(
+    account_equity: float, stop_loss_pct: float = SWING_STOP_LOSS_PCT,
+) -> Optional[float]:
     """株数クランプが掛からずに済む下限株価を返す。
 
     リスクベースのサイジングは
@@ -1220,7 +1294,24 @@ def resolve_min_tradeable_price(account_equity: float) -> Optional[float]:
     if account_equity <= 0:
         return None
 
-    return account_equity * (RISK_PER_TRADE_PCT / SWING_STOP_LOSS_PCT) / MAX_POSITION_SIZE
+    return account_equity * (RISK_PER_TRADE_PCT / stop_loss_pct) / MAX_POSITION_SIZE
+
+
+def growth_price_band(
+    account_equity: float, settled_cash: Optional[float] = None,
+) -> Tuple[Optional[float], Optional[float]]:
+    """グロース株トラックの株価帯を返す（下限, 上限）。
+
+    **スイングの帯を流用してはならない。** 帯は損切り幅から決まり
+    （`建玉金額 = 資金 × (リスク% ÷ 損切り%)`）、-12%の損切りでは
+    予算がスイングの 5/12 = 41.7% になる。$1,220 なら上限が $244 -> $101 で、
+    スイングの帯で通した銘柄はグロース側では数量0になりうる——監視枠を
+    消費したうえで毎サイクル必ずスキップされる状態である。
+    """
+    return (
+        resolve_min_tradeable_price(account_equity, GROWTH_STOP_LOSS_PCT),
+        resolve_max_affordable_price(account_equity, settled_cash, GROWTH_STOP_LOSS_PCT),
+    )
 
 
 # 株価帯で除外した銘柄を、その取引日に1度だけ記録するための印。
@@ -1584,6 +1675,48 @@ class WatchlistRefresh(NamedTuple):
     screened: bool
 
 
+async def _growth_watchlist_async(
+    ib: IB, account_equity: float, settled_cash: Optional[float],
+    caches: MarketDataCaches,
+) -> List[str]:
+    """グロース株トラックの監視銘柄を、専用の株価帯で絞って返す。
+
+    トラックが無効なら空。枠は `GROWTH_WATCHLIST_SLOTS` で頭打ちにする
+    （`MAX_WATCHLIST_SIZE` の内数。総数がペーシングの不変条件を決めるため）。
+    切り詰めは記載順で、**成績を見て決めた順ではない**。
+    """
+    if not ENABLE_GROWTH_SWING:
+        return []
+
+    min_price, max_price = growth_price_band(account_equity, settled_cash)
+    logger.info(
+        "グロース株トラックの株価帯は %s〜%s USD です（損切り-%.1f%%のため"
+        "建玉予算がスイングの%.0f%%になる）。",
+        f"{min_price:.2f}" if min_price is not None else "下限なし",
+        f"{max_price:.2f}" if max_price is not None else "上限なし",
+        GROWTH_STOP_LOSS_PCT, SWING_STOP_LOSS_PCT / GROWTH_STOP_LOSS_PCT * 100.0,
+    )
+    filtered = await _filter_symbols_by_price_band_async(
+        ib, list(GROWTH_WATCHLIST), min_price, max_price, caches,
+    )
+    if len(filtered) > GROWTH_WATCHLIST_SLOTS:
+        logger.info(
+            "グロース株%d件のうち、記載順で上位%d件のみを監視対象にします。",
+            len(filtered), GROWTH_WATCHLIST_SLOTS,
+        )
+        filtered = filtered[:GROWTH_WATCHLIST_SLOTS]
+    if filtered:
+        logger.info("グロース株トラックの監視銘柄: %s", filtered)
+    else:
+        logger.warning(
+            "グロース株トラックが有効ですが、株価帯を通る銘柄が1件もありません"
+            "（損切り-%.1f%%では建玉予算が資金の%.1f%%しかないため、"
+            "高株価の銘柄は1株も買えません）。",
+            GROWTH_STOP_LOSS_PCT, RISK_PER_TRADE_PCT / GROWTH_STOP_LOSS_PCT * 100.0,
+        )
+    return filtered
+
+
 async def _refresh_watchlist_async(
     ib: IB, fallback_watchlist: List[str], account_equity: float,
     settled_cash: Optional[float] = None, caches: Optional[MarketDataCaches] = None,
@@ -1621,6 +1754,14 @@ async def _refresh_watchlist_async(
 
     caches = caches if caches is not None else MarketDataCaches()
 
+    # グロース株はスイングとは別の株価帯で絞り、専用枠を先に確保する。
+    # 後ろに足して全体を切り詰めると、記載順の都合でグロース株だけが
+    # 毎日落ちる（2026-08-18に末尾4銘柄で実際に起きた形と同じ）。
+    growth_symbols = await _growth_watchlist_async(
+        ib, account_equity, settled_cash, caches,
+    )
+    swing_slots = max(0, MAX_WATCHLIST_SIZE - len(growth_symbols))
+
     async def _fallback(cause: str) -> WatchlistRefresh:
         # フォールバックはスクリーニングの判定を通っていないため、株価帯だけは
         # ここで掛け直す。掛けないと固定リストの買えない銘柄がそのまま監視枠に入る。
@@ -1647,19 +1788,19 @@ async def _refresh_watchlist_async(
         # ため、固定リストの長さだけでは「6.1」の不変条件
         # (MAX_WATCHLIST_SIZE × (600 / POLL_INTERVAL_SECONDS) ≦ 60) を保証できない。
         # 切り詰める順序はリストの記載順（＝銘柄選定の結果を見て決めた順ではない）。
-        if len(filtered) > MAX_WATCHLIST_SIZE:
+        if len(filtered) > swing_slots:
             logger.info(
                 "株価帯を通った%d件のうち、記載順で上位%d件のみを監視対象にします"
                 "（IBKRのペーシング制限対策）。",
-                len(filtered), MAX_WATCHLIST_SIZE,
+                len(filtered), swing_slots,
             )
-            filtered = filtered[:MAX_WATCHLIST_SIZE]
+            filtered = filtered[:swing_slots]
         logger.warning(
             "%s、フォールバックの固定ウォッチリストで継続します: %s"
             "（株価帯の判定で %d 件を除外）。",
             cause, filtered, excluded_by_price,
         )
-        return WatchlistRefresh(filtered, screened=False)
+        return WatchlistRefresh(filtered + growth_symbols, screened=False)
 
     try:
         screened = await screen_value_stocks_async(ib, config)
@@ -1673,16 +1814,16 @@ async def _refresh_watchlist_async(
     # 監視銘柄1件につき毎サイクル1回の日中足リクエストが発生するため、
     # スクリーニングが何件返しても監視対象は上限で頭打ちにする。
     # これを外すとIBKRのペーシング制限に張り付き、全銘柄の処理が遅延する。
-    if len(screened) > MAX_WATCHLIST_SIZE:
+    if len(screened) > swing_slots:
         logger.info(
             "スクリーニング結果%d件のうち、上位%d件のみを監視対象にします"
             "（IBKRのペーシング制限対策）。",
-            len(screened), MAX_WATCHLIST_SIZE,
+            len(screened), swing_slots,
         )
-        screened = screened[:MAX_WATCHLIST_SIZE]
+        screened = screened[:swing_slots]
 
     logger.info("スクリーニング結果でウォッチリストを更新しました: %s", screened)
-    return WatchlistRefresh(screened, screened=True)
+    return WatchlistRefresh(screened + growth_symbols, screened=True)
 
 
 async def main() -> None:

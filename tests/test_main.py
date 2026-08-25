@@ -24,7 +24,12 @@ from execution.order_manager import (
 )
 from core.pacing import HISTORICAL_MAX_REQUESTS, HISTORICAL_SAFETY_MARGIN
 from data.rank_history import RankHistoryStore
-from execution.position_manager import PositionManager, STRATEGY_TYPE_DAY, STRATEGY_TYPE_SWING
+from execution.position_manager import (
+    PositionManager,
+    STRATEGY_TYPE_DAY,
+    STRATEGY_TYPE_GROWTH,
+    STRATEGY_TYPE_SWING,
+)
 from execution.trade_journal import TradeJournal
 from strategy.exit_signal import REASON_STOP_LOSS, REASON_TAKE_PROFIT
 from strategy.pullback import MarketFilterConfig
@@ -3232,3 +3237,90 @@ def test_restore_skips_positions_the_broker_does_not_hold() -> None:
 
     mock_place.assert_not_awaited()
     mock_cancel.assert_not_awaited()
+
+
+# --- グロース株トラック（損切り-12%） -------------------------------------
+
+
+def test_the_growth_track_is_disabled_by_default() -> None:
+    """既定は無効であること。
+
+    ENABLE_DAY_TRADING と同じ扱いで、有効化の可否は検証結果で決める。
+    フラグが既定でTrueになると、**検証した母集団の外の銘柄が黙って建つ**——
+    2026-08-04のSPCX（上場35営業日で乖離-16.54%）と同じ形の故障になる。
+    """
+    assert main_module.ENABLE_GROWTH_SWING is False
+    # 無効な間は、リストに載っていてもグロース扱いにならない。
+    assert main_module.is_growth_symbol(main_module.GROWTH_WATCHLIST[0]) is False
+
+
+def test_growth_positions_carry_the_twelve_percent_stop() -> None:
+    """グロース株の決済幅が指定どおり（損切り-12%）であること。"""
+    params = main_module.EXIT_PARAMS_BY_STRATEGY_TYPE[STRATEGY_TYPE_GROWTH]
+
+    assert params.stop_loss_pct == pytest.approx(12.0)
+    # 利確は損切りに対する比率で決める。1R未満にすると、勝率が同じでも
+    # 期待値が負に倒れる（スイングは+10%/-5%＝2R）。
+    assert params.take_profit_pct >= params.stop_loss_pct
+
+
+def test_the_growth_price_band_shrinks_with_the_wider_stop() -> None:
+    """損切りを広げた分だけ、買える株価の上限が下がること。
+
+    建玉金額 = 資金 × (リスク% ÷ 損切り%) なので、-12%では-5%の 5/12 になる。
+    **スイングの帯をそのまま使うと、-12%の損切りを置いた建玉を2.4倍の予算で
+    作ろうとして数量0になり、監視枠を消費したまま毎サイクルスキップされる。**
+    """
+    equity = 3_300.0
+    swing_max = resolve_max_affordable_price(equity)
+    growth_min, growth_max = main_module.growth_price_band(equity)
+
+    assert swing_max is not None and growth_max is not None
+    assert growth_max == pytest.approx(swing_max * SWING_STOP_LOSS_PCT / 12.0)
+    # 下限は上限 ÷ MAX_POSITION_SIZE という関係を保つ（株数クランプ回避）。
+    assert growth_min == pytest.approx(growth_max / MAX_POSITION_SIZE)
+
+
+def test_growth_slots_stay_inside_the_watchlist_cap() -> None:
+    """グロース枠は監視枠の内数であること。
+
+    「6.1」のペーシング不変条件は**監視銘柄の総数**で決まるので、
+    グロース枠を外数にすると総数が上限を超えて空のバー列が返り始める。
+    """
+    assert 0 < main_module.GROWTH_WATCHLIST_SLOTS <= MAX_WATCHLIST_SIZE
+    total = MAX_WATCHLIST_SIZE  # スイング側が枠を分け合うので総数は変わらない
+    assert total * (600 / main_module.POLL_INTERVAL_SECONDS) <= 60
+
+
+def test_a_growth_symbol_is_entered_on_the_growth_track(trade_journal) -> None:
+    """グロース銘柄は growth 種別で建ち、-12%の逆指値が置かれること。"""
+    ib = MagicMock()
+    position_manager = PositionManager()
+    symbol = main_module.GROWTH_WATCHLIST[0]
+    # 上昇トレンドの途中で GROWTH_THRESHOLD_PCT を割る押し目。終値は
+    # 200日平均を上回る（下降トレンドの見送りに掛からない形）。
+    rising = [100.0 + i * (200.0 / 260.0) for i in range(SWING_MIN_HISTORY_BARS + 60)]
+    dip = sum(rising[-29:]) / 29 * 0.85
+    closes = rising + [dip]
+    df = _make_df(closes)
+    assert dip > sum(closes[-STRUGGLING_MA_WINDOW:]) / STRUGGLING_MA_WINDOW
+
+    with patch("main.ENABLE_GROWTH_SWING", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol=symbol))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=df)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(dip))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch(
+            "main.place_bracket_order_async",
+            new=AsyncMock(return_value=_bracket_result(
+                quantity=1, symbol=symbol,
+                stop_price=dip * 0.88, take_profit_price=dip * 1.24,
+            )),
+        ) as mock_order:
+        asyncio.run(process_symbol_async(ib, symbol, position_manager, trade_journal))
+
+    mock_order.assert_awaited()
+    kwargs = mock_order.await_args.kwargs
+    assert kwargs["stop_price"] == pytest.approx(dip * (1 - 12.0 / 100.0), abs=0.01)
+    assert kwargs["take_profit_price"] == pytest.approx(dip * (1 + 24.0 / 100.0), abs=0.01)
+    assert position_manager.get_position(symbol).strategy_type == STRATEGY_TYPE_GROWTH

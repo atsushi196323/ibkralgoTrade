@@ -36,6 +36,11 @@ TRACKED_CURRENCY: str = "USD"
 # 判定に使う。
 STRATEGY_TYPE_SWING: str = "swing"
 STRATEGY_TYPE_DAY: str = "day"
+# グロース株トラック。日足で判定し持ち越す点はスイングと同じで、決済の
+# 幅だけが違う（損切り-12%）。**スイングと同じ種別にしてはならない**——
+# 決済パラメータは strategy_type で引くので、混ぜると建玉ごとに
+# どちらの幅で決済すべきかが分からなくなる（main.EXIT_PARAMS_BY_STRATEGY_TYPE）。
+STRATEGY_TYPE_GROWTH: str = "growth"
 # ブローカー側で発見した未追跡ポジションなど、どちらのシグナルで
 # 建てられたか不明な場合に使う。
 STRATEGY_TYPE_UNKNOWN: str = "unknown"
