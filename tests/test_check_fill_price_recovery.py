@@ -97,3 +97,60 @@ def test_records_are_appended_not_overwritten(tmp_path) -> None:
 
     rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert [row["checked_at"] for row in rows] == ["1", "2"]
+
+
+def test_a_day_with_recorded_exits_but_no_readable_fills_is_not_called_empty(tmp_path) -> None:
+    """決済を記録した日に約定が1件も読めなければ、それは「約定が無かった日」ではない。
+
+    IBKRが返す約定は Gateway のタイムゾーン(Asia/Tokyo)の当日ぶんに限られ、
+    米国のザラ場は日本時間の日付をまたぐ。2026-08-24 のINTC(STP 87.06)は
+    22:30 JST に約定したが、06:05 JST の確認からは読めず「今日の約定はなし」と
+    記録されていた。**確かめられなかったことを、確かめる材料が無かったことと
+    同じに扱ってはならない。**
+    """
+    exit_code, verdict = _verdict([], recent_journal_exits=1)
+
+    assert exit_code == 0
+    assert "判定できません" in verdict
+    assert "判定材料がありません" not in verdict
+
+
+def _write_journal(path, closed_at: str) -> None:
+    path.write_text(
+        "symbol,entry_price,exit_price,quantity,reason,pnl,pnl_pct,r_multiple,"
+        "closed_at,commission,usd_jpy_rate,entry_date\n"
+        f"INTC,91.61,87.06,2,STOP_LOSS,-9.1,-4.97,-0.99,{closed_at},2.0,159.1,"
+        "2026-08-20T13:31:17+00:00\n",
+        encoding="utf-8",
+    )
+
+
+def test_recent_exits_are_counted_from_the_journal(tmp_path) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from scripts.check_fill_price_recovery import count_recent_journal_exits
+
+    now = datetime(2026, 8, 24, 21, 5, tzinfo=timezone.utc)
+    journal = tmp_path / "trade_journal.csv"
+    _write_journal(journal, (now - timedelta(hours=8)).isoformat())
+
+    assert count_recent_journal_exits(str(journal), now=now) == 1
+
+
+def test_older_exits_do_not_make_the_check_look_blind(tmp_path) -> None:
+    """前のセッションの決済まで数えると、毎晩「判定できません」になる。"""
+    from datetime import datetime, timedelta, timezone
+
+    from scripts.check_fill_price_recovery import count_recent_journal_exits
+
+    now = datetime(2026, 8, 24, 21, 5, tzinfo=timezone.utc)
+    journal = tmp_path / "trade_journal.csv"
+    _write_journal(journal, (now - timedelta(days=4)).isoformat())
+
+    assert count_recent_journal_exits(str(journal), now=now) == 0
+
+
+def test_a_missing_journal_is_not_an_error(tmp_path) -> None:
+    from scripts.check_fill_price_recovery import count_recent_journal_exits
+
+    assert count_recent_journal_exits(str(tmp_path / "nope.csv")) == 0

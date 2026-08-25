@@ -606,6 +606,12 @@ python -m backtest.run --csv-dir bars/intraday --mode walk-forward \
 
   **この経路は通常の稼働では一度も通らないため、確かめる仕掛けを別に置いてある。** 稼働中に約定した注文は `orderStatus` が更新されて `avgFillPrice` が埋まるので、フォールバックが働く余地が無い。効いているかは**まっさらな接続から今日の約定を読み直す**しかなく、それが `python -m scripts.check_fill_price_recovery`（照会のみ・発注しない）である。Botを止めた直後＝再起動直後と同じ視点になるよう、引け後の締め(`scripts/after_close.sh`)がBot停止のあとに自動で呼ぶ。判定は `logs/fill_price_recovery.jsonl` へ**追記**され、`avgFillPrice` が空の約定をFillから復元できた日だけ「修正が効いています」と出る。**「今日の約定はすべて avgFillPrice から読めた」を「修正が効いた」と読んではならない**——その日は再接続の状況が再現できていないだけで、何も確かめていない。約定価格がどこからも読めなければ終了コード1（＝不具合の再発）。約定が無い日は判定材料が無いだけなので失敗にしない。稼働中の決済がどちらの経路で読まれたかは `bot.log` の `source=` と引け後のサマリにも残る。`tests/test_check_fill_price_recovery.py` と `tests/test_daily_report.py` の `test_a_fill_price_recovered_from_fills_is_called_out` が番人
 
+  **ただしこの確認は、引け後の時刻では材料を得られない（2026-08-25に実測）。** IBKRが返す約定は **IB Gateway のタイムゾーン（`~/Jts/jts.ini` の `TimeZone`。VPSは `Asia/Tokyo`）で見た当日ぶん**に限られ、米国のザラ場(22:30〜05:00 JST)は日本時間の日付をまたぐ。2026-08-24のINTC（逆指値が22:30 JSTに87.06で約定）は、06:05 JSTの確認から**1件も読めず「今日の約定はなし」として記録されていた**。同日10:28 JSTに `ExecutionFilter(time='20260824-00:00:00')` を明示して照会しても0件で、`AutoRestartTime=12:00 PM` なのでGatewayの再起動でも説明できない。
+
+  **したがって「今日の約定はなし」を、約定が無かった日として扱ってはならない。** `count_recent_journal_exits` が `trade_journal.csv` の直近24時間の決済を数え、記録があるのに1件も読めなければ**判定できませんと報告する**（確かめられなかったことを、確かめる材料が無かったことと同じに扱わない）。`tests/test_check_fill_price_recovery.py` の `test_a_day_with_recorded_exits_but_no_readable_fills_is_not_called_empty` が番人。
+
+  **同じ窓はBot本体の再接続にも効く。** 日本時間の0時（＝11:00 ET）を過ぎてから再起動・再接続すると、**その日の寄り付き〜11:00 ETの約定はもう読めない**——`_fill_price_of` のフォールバック以前に `Fill` そのものが返らない。根治はGatewayのタイムゾーンを米国東部時間へ揃えること（`jts.ini` の `TimeZone`。実約定時刻が9時間ずれて記録される件も同時に直る）だが、**Gatewayの設定変更は運用者が行うものなのでここには書くだけに留める**
+
 #### 待機注文が「消える」ことと、値段が実約定とずれること（2026-08-05〜08-20の実測）
 
 **待機注文の値段は参照価格ではなく実約定価格から決めること。** 遅延データ(`IBKR_MARKET_DATA_TYPE=3`)では参照価格が15分古いため、実約定との差がそのまま待機注文の位置のずれになる。AMBQの例:

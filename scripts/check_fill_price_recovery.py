@@ -29,11 +29,12 @@
 
 import argparse
 import asyncio
+import csv
 import json
 import logging
 import os
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from ib_async import IB
@@ -47,8 +48,13 @@ logging.basicConfig(
 )
 
 DEFAULT_OUT_PATH = os.path.join("logs", "fill_price_recovery.jsonl")
+DEFAULT_JOURNAL_PATH = os.path.join("logs", "trade_journal.csv")
 
 _STATUS_FILLED = "Filled"
+
+# 直近この時間ぶんの決済を「同じセッションのもの」とみなす。引け後の締めは
+# セッション開始(22:15 JST)の約8時間後に走るので、24時間あれば取りこぼさない。
+_JOURNAL_LOOKBACK_HOURS = 24
 
 
 @dataclass
@@ -88,7 +94,42 @@ def _read_fills(ib: IB) -> List[FillReading]:
     return readings
 
 
-def _verdict(readings: List[FillReading]) -> tuple:
+def count_recent_journal_exits(
+    journal_path: str,
+    now: Optional[datetime] = None,
+    lookback_hours: int = _JOURNAL_LOOKBACK_HOURS,
+) -> int:
+    """直近 `lookback_hours` 時間に記録された決済の件数を返す。
+
+    **「約定が読めない」と「そもそも約定が無かった」を区別するために要る。**
+    IBKRが返す約定は Gateway のタイムゾーン（`~/Jts/jts.ini` の `TimeZone`）で
+    見た当日ぶんに限られる。VPSの設定は `Asia/Tokyo` で、米国のザラ場
+    (22:30〜05:00 JST) は日本時間の日付をまたぐため、**引け後(06:05 JST)に走る
+    この確認からは、寄り付き〜11:00 ET の約定がもう見えない**。読めないのに
+    「今日の約定はなし」と報告すると、確認できていないことに気付けない。
+    """
+    if not journal_path or not os.path.exists(journal_path):
+        return 0
+    now = now or datetime.now(timezone.utc)
+    since = now - timedelta(hours=lookback_hours)
+    count = 0
+    with open(journal_path, encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            raw = (row.get("closed_at") or "").strip()
+            if not raw:
+                continue
+            try:
+                closed_at = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if closed_at.tzinfo is None:
+                closed_at = closed_at.replace(tzinfo=timezone.utc)
+            if closed_at >= since:
+                count += 1
+    return count
+
+
+def _verdict(readings: List[FillReading], recent_journal_exits: int = 0) -> tuple:
     """(終了コード, 判定文) を返す。
 
     終了コードが1になるのは**約定価格をどうしても読めなかったとき**だけである。
@@ -97,6 +138,17 @@ def _verdict(readings: List[FillReading]) -> tuple:
     材料の無い日を失敗として積み上げると本当の失敗が埋もれる）。
     """
     if not readings:
+        if recent_journal_exits > 0:
+            return 0, (
+                f"**判定できません（約定の窓を過ぎています）。** Botは直近24時間に "
+                f"{recent_journal_exits}件の決済を記録しているのに、まっさらな接続からは\n"
+                "  約定が1件も読めませんでした。IBKRが返す約定は IB Gateway の\n"
+                "  タイムゾーン（~/Jts/jts.ini の TimeZone。VPSでは Asia/Tokyo）で見た\n"
+                "  当日ぶんに限られ、米国のザラ場(22:30〜05:00 JST)は日本時間の日付を\n"
+                "  またぎます。**この確認は材料を得られていません**（「約定が無かった日」\n"
+                "  ではありません）。同じ窓はBot本体の再接続にも効くため、日本時間の\n"
+                "  0時以降に再起動すると、それ以前の約定は復元できません。"
+            )
         return 0, "今日の約定が1件もないため、判定材料がありません（建玉も決済も無かった日）。"
 
     unreadable = [r for r in readings if r.price is None]
@@ -132,7 +184,7 @@ def _append_record(out_path: str, record: dict) -> None:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-async def check_async(out_path: Optional[str]) -> int:
+async def check_async(out_path: Optional[str], journal_path: Optional[str]) -> int:
     connection = IBKRConnection()
     try:
         ib: IB = await connection.connect_async()
@@ -147,7 +199,8 @@ async def check_async(out_path: Optional[str]) -> int:
     finally:
         await connection.disconnect_async()
 
-    exit_code, verdict = _verdict(readings)
+    recent_journal_exits = count_recent_journal_exits(journal_path or "")
+    exit_code, verdict = _verdict(readings, recent_journal_exits)
 
     print("\n===== 再接続後の約定価格の読み取り =====")
     print("（まっさらな接続から今日の約定を読む＝再起動直後のボットと同じ視点）\n")
@@ -173,6 +226,7 @@ async def check_async(out_path: Optional[str]) -> int:
                 1 for r in readings if r.source == PRICE_SOURCE_FILLS
             ),
             "num_unreadable": sum(1 for r in readings if r.price is None),
+            "num_recent_journal_exits": recent_journal_exits,
             "readings": [asdict(r) for r in readings],
         })
         print(f"\n記録しました: {out_path}")
@@ -187,8 +241,16 @@ def main() -> int:
         "--out", default=DEFAULT_OUT_PATH,
         help=f"結果の追記先（既定 {DEFAULT_OUT_PATH}）。'' を渡すと記録しない。",
     )
+    parser.add_argument(
+        "--journal", default=DEFAULT_JOURNAL_PATH,
+        help=(
+            "決済の記録（既定 %s）。約定が1件も読めなかったときに、"
+            "「無かった」のか「窓を過ぎて見えない」のかを区別するために読む。"
+            % DEFAULT_JOURNAL_PATH
+        ),
+    )
     args = parser.parse_args()
-    return asyncio.run(check_async(args.out or None))
+    return asyncio.run(check_async(args.out or None, args.journal or None))
 
 
 if __name__ == "__main__":
