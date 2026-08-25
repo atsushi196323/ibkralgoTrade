@@ -389,6 +389,30 @@ GROWTH_TAKE_PROFIT_PCT: float = 24.0
 GROWTH_STOP_LOSS_PCT: float = 12.0
 GROWTH_TRAILING_STOP_PCT: float = 12.0
 
+# --- 単一銘柄への集中モード -------------------------------------------------
+#
+# Noneなら通常のウォッチリスト運用。銘柄コードを入れると、**スクリーニングも
+# 固定リストも使わず、その1銘柄だけを監視する。**
+#
+# **これは分散を捨てる設定である。** 本プロジェクトの検証はすべて銘柄横断で
+# 行っており（「複数銘柄での判断」節）、単一銘柄の成績は運である。集中させると
+# 次の3つが同時に起きる:
+#
+#   1. トレード頻度が落ちる。1銘柄では年4〜10件程度で、同時保有枠(2)ではなく
+#      シグナルの供給が律速になる
+#   2. その銘柄固有のドローダウンをそのまま受ける（分散が効かない）
+#   3. 銘柄選定の失敗が損益に直結する
+#
+# 2026-08-25に運用者の指定でMRNAを設定した。**この構成の実測値は下記のとおり
+# マイナスである**（10年・out-of-sample・実測手数料$1.00・ライブと同じ
+# MA30/-5%/+10%/-5%）:
+#
+#   資金 $1,220 : 101トレード 勝率32.7% PF 0.60 損益 -290.75 USD（口座の-24%）
+#   資金 $3,300 : 105トレード 勝率40.0% PF 0.76 損益 -495.10 USD
+#
+# 解除は None に戻すだけでよい。
+CONCENTRATED_SYMBOL: Optional[str] = "MRNA"
+
 # グロース株に割り当てる監視枠。MAX_WATCHLIST_SIZE の内数であり、
 # **合計を超えさせてはならない**（「6.1」のペーシング不変条件は監視銘柄の
 # 総数で決まる）。スイング側はこの分だけ枠が減る。
@@ -1675,6 +1699,55 @@ class WatchlistRefresh(NamedTuple):
     screened: bool
 
 
+async def _concentrated_watchlist_async(
+    ib: IB, symbol: str, account_equity: float, settled_cash: Optional[float],
+    caches: MarketDataCaches,
+) -> WatchlistRefresh:
+    """単一銘柄への集中モードのウォッチリストを返す。
+
+    スクリーニングも固定リストも使わない。**株価帯の判定だけは掛ける**——
+    指定した銘柄が現在の資金で買えなければ、シグナルが出ても数量0で
+    スキップされ続けるだけであり、それを「静かに何も起きない」状態にしない。
+
+    帯を外れた場合は**空を返してERRORにする。42銘柄へフォールバックしない。**
+    運用者が明示的に1銘柄を指定している以上、黙って別の銘柄を売買する方が
+    危険である（保有中の建玉の決済判定は `run_watchlist_cycle_async` が
+    保有銘柄との和集合を取るので継続する）。
+
+    `screened=True` を返すのは、900秒ごとの再試行を止めるためである
+    （集中モードでは再試行しても結果が変わらない）。
+    """
+    if is_growth_symbol(symbol):
+        min_price, max_price = growth_price_band(account_equity, settled_cash)
+        track = f"グロース株(損切り-{GROWTH_STOP_LOSS_PCT:.1f}%)"
+    else:
+        min_price = resolve_min_tradeable_price(account_equity)
+        max_price = resolve_max_affordable_price(account_equity, settled_cash)
+        track = f"スイング(損切り-{SWING_STOP_LOSS_PCT:.1f}%)"
+
+    filtered = await _filter_symbols_by_price_band_async(
+        ib, [symbol], min_price, max_price, caches,
+    )
+    if not filtered:
+        logger.error(
+            "集中モードの銘柄 %s が取引可能な株価帯(%s〜%s USD・%s)から外れています。"
+            "新規エントリーは発生しません。CONCENTRATED_SYMBOL を見直すか、"
+            "損切り幅に見合う資金を用意してください。",
+            symbol,
+            f"{min_price:.2f}" if min_price is not None else "下限なし",
+            f"{max_price:.2f}" if max_price is not None else "上限なし",
+            track,
+        )
+        return WatchlistRefresh([], screened=True)
+
+    logger.warning(
+        "単一銘柄への集中モードで稼働します: %s（%s）。"
+        "**分散は効きません**——銘柄横断で検証したエッジはこの構成には当てはまりません。",
+        symbol, track,
+    )
+    return WatchlistRefresh(filtered, screened=True)
+
+
 async def _growth_watchlist_async(
     ib: IB, account_equity: float, settled_cash: Optional[float],
     caches: MarketDataCaches,
@@ -1753,6 +1826,11 @@ async def _refresh_watchlist_async(
     )
 
     caches = caches if caches is not None else MarketDataCaches()
+
+    if CONCENTRATED_SYMBOL is not None:
+        return await _concentrated_watchlist_async(
+            ib, CONCENTRATED_SYMBOL, account_equity, settled_cash, caches,
+        )
 
     # グロース株はスイングとは別の株価帯で絞り、専用枠を先に確保する。
     # 後ろに足して全体を切り詰めると、記載順の都合でグロース株だけが

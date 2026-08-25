@@ -3324,3 +3324,77 @@ def test_a_growth_symbol_is_entered_on_the_growth_track(trade_journal) -> None:
     assert kwargs["stop_price"] == pytest.approx(dip * (1 - 12.0 / 100.0), abs=0.01)
     assert kwargs["take_profit_price"] == pytest.approx(dip * (1 + 24.0 / 100.0), abs=0.01)
     assert position_manager.get_position(symbol).strategy_type == STRATEGY_TYPE_GROWTH
+
+
+# --- 単一銘柄への集中モード -------------------------------------------------
+
+
+def _band_df(price: float) -> pd.DataFrame:
+    """株価帯の判定にだけ使う日足（終値が price で一定）。"""
+    return _make_df([price] * (SWING_MIN_HISTORY_BARS + 1))
+
+
+def test_the_concentrated_mode_monitors_only_the_named_symbol() -> None:
+    """集中モードでは、指定した1銘柄だけを監視すること。
+
+    スクリーニングも固定リストも使わない。ここで42銘柄が混ざると、
+    運用者が明示的に1銘柄を指定した意図と実際の売買がずれる。
+    """
+    ib = MagicMock()
+
+    with patch("main.CONCENTRATED_SYMBOL", "MRNA"), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="MRNA"))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=_band_df(138.89))), \
+        patch("main.screen_value_stocks_async", new=AsyncMock()) as mock_screen:
+        refresh = asyncio.run(_refresh_watchlist_async(ib, ["AAPL", "MSFT"], 1_220.0))
+
+    assert refresh.symbols == ["MRNA"]
+    # スクリーニングは呼ばない（結果を使わないので、要求も出さない）。
+    mock_screen.assert_not_awaited()
+    # 900秒ごとの再試行を止める（集中モードでは結果が変わらない）。
+    assert refresh.screened is True
+
+
+def test_a_concentrated_symbol_outside_the_price_band_is_not_replaced(caplog) -> None:
+    """帯を外れたら空を返し、42銘柄へ黙って戻らないこと。
+
+    運用者が1銘柄を指定している以上、別の銘柄を勝手に売買する方が危険である。
+    静かに何も起きない状態にしないよう、ここだけはERRORで出す。
+    """
+    ib = MagicMock()
+
+    with caplog.at_level(logging.ERROR, logger="main"), \
+        patch("main.CONCENTRATED_SYMBOL", "MRNA"), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="MRNA"))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=_band_df(138.89))), \
+        patch("main.screen_value_stocks_async", new=AsyncMock()):
+        # 資金$500では上限株価が$100となり、$138.89は買えない。
+        refresh = asyncio.run(_refresh_watchlist_async(ib, ["AAPL"], 500.0))
+
+    assert refresh.symbols == []
+    assert "AAPL" not in caplog.text
+    assert "集中モード" in caplog.text
+
+
+def test_a_concentrated_symbol_uses_the_band_of_its_own_track() -> None:
+    """集中させる銘柄がグロース株なら、グロース側の株価帯で判定すること。
+
+    帯は損切り幅から決まる。スイングの帯で通してしまうと、-12%の損切りを
+    置く建玉を2.4倍の予算で作ろうとして数量0になり、**1銘柄しか見ていない
+    のに毎サイクル必ずスキップされる**状態になる。
+    """
+    ib = MagicMock()
+    symbol = main_module.GROWTH_WATCHLIST[0]
+
+    with patch("main.CONCENTRATED_SYMBOL", symbol), \
+        patch("main.ENABLE_GROWTH_SWING", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol=symbol))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=_band_df(150.0))), \
+        patch("main.screen_value_stocks_async", new=AsyncMock()):
+        # $3,300: スイングの上限は$660で通るが、グロースの上限は$275。
+        ok = asyncio.run(_refresh_watchlist_async(ib, [], 3_300.0))
+        # $1,220: グロースの上限は$101.67なので$150は買えない。
+        ng = asyncio.run(_refresh_watchlist_async(ib, [], 1_220.0))
+
+    assert ok.symbols == [symbol]
+    assert ng.symbols == []

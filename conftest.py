@@ -41,3 +41,20 @@ def _reset_historical_pacer():
     get_historical_pacer().reset()
     yield
     get_historical_pacer().reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_concentrated_symbol_by_default(monkeypatch):
+    """テストは既定で通常のウォッチリスト運用として走らせる。
+
+    `CONCENTRATED_SYMBOL` は運用の設定であって、テストが検証したい対象では
+    ない。既定値に乗せたままにすると、銘柄を1つ指定した瞬間に
+    `_refresh_watchlist_async` が集中モードへ短絡し、スクリーニング・
+    フォールバック・株価帯・グロース枠を検証しているテストが一斉に落ちる
+    （2026-08-25にMRNAを設定した際、実際に13件が落ちた）。
+
+    ここで固定して、**どちらのモードを検証するかをテスト側が明示する**形に
+    揃える。集中モードの経路は
+    `patch("main.CONCENTRATED_SYMBOL", "…")` で個別に上書きすること。
+    """
+    monkeypatch.setattr("main.CONCENTRATED_SYMBOL", None)
