@@ -23,7 +23,10 @@ def test_minimum_commission_dominates_for_small_lots() -> None:
     $1,220の口座では建玉が$244前後（株価$100なら2株）なので、往復コストは
     ほぼ最低手数料の2倍で決まる。
     """
-    costs = CostModel(max_commission_pct_of_notional=0.0)
+    costs = CostModel(
+        commission_per_share=0.0035, min_commission_per_order=0.35,
+        max_commission_pct_of_notional=0.0,
+    )
 
     # 10株 x 0.0035 = 0.035 だが、最低手数料 0.35 が適用される。
     assert costs.commission_for(10, 100.0) == pytest.approx(0.35)
@@ -80,3 +83,16 @@ def test_default_cost_model_is_not_free() -> None:
     assert costs.commission_for(10, 100.0) > 0
     assert costs.buy_fill_price(100.0) > 100.0
     assert costs.sell_fill_price(100.0) < 100.0
+
+
+def test_the_default_minimum_commission_matches_the_measured_round_trip() -> None:
+    """既定の最低手数料は、ペーパー口座で実測した1注文あたりの額と揃える。
+
+    往復4件（2026-08-05〜08-24）の支払い手数料はいずれも $2.004 で、
+    株数(2〜3株)によらず 1注文 $1.00 だった。IBKR Tiered の最低額($0.35)を
+    既定に戻すと、小口座の検証だけが実運用より良く出る（$1,220 で PF 1.18 対 0.97）。
+    """
+    assert CostModel().min_commission_per_order == pytest.approx(1.00)
+
+    # 2〜3株の注文では株数比例分ではなく最低額が効く（実測と同じ形）。
+    assert CostModel().commission_for(3, 67.44) == pytest.approx(1.00)

@@ -26,7 +26,11 @@ class CostModel:
     """
 
     commission_per_share: float = 0.0035
-    min_commission_per_order: float = 0.35
+    # 実測値。ペーパー口座の往復4件（2026-08-05〜08-24、いずれも2〜3株）で
+    # 支払い手数料が往復 $2.004 = 1注文 $1.00 だった。IBKR Tiered の最低額
+    # ($0.35) を既定にしていた間、小口座の成績はこの差だけ楽観に出ていた
+    # （42銘柄・10年・$1,220 で PF 1.18 -> 0.97）。
+    min_commission_per_order: float = 1.00
     # 約定代金に対する手数料の上限（%）。0以下なら上限なしとして扱う。
     max_commission_pct_of_notional: float = 1.0
     # 約定価格が不利な方向へずれる割合（%）。買いは高く、売りは安く約定する。
