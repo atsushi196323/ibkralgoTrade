@@ -101,6 +101,9 @@ class PortfolioResult:
     # 資金のうち建玉に出ていた割合の平均。エッジがあっても稼働率が低ければ
     # 口座の年率は伸びない——同時保有枠を増やす議論はこの数字が起点になる。
     average_exposure_pct: float = 0.0
+    # 日ごとの稼働率(%)。平均だけでは「遊んでいる資金を何かに置いたら
+    # どうなるか」を後から測れないため、系列でも持つ。
+    exposure_curve: pd.Series = field(default_factory=pd.Series)
     # サーキットブレーカーで新規建てを止めた日。**日数だけでなく日付を持つのは、
     # 「発動したのに建っている」という取り違えを検証で潰せるようにするため。**
     circuit_breaker_dates: List[object] = field(default_factory=list)
@@ -344,6 +347,7 @@ def run_portfolio_backtest(
         config=config, initial_equity=config.initial_equity, final_equity=equity,
         trades=trades, equity_curve=equity_curve,
         average_exposure_pct=(sum(exposure_values) / len(exposure_values)) if exposure_values else 0.0,
+        exposure_curve=pd.Series(exposure_values, index=timeline),
         circuit_breaker_dates=circuit_breaker_dates,
     )
     logger.info(
