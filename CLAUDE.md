@@ -282,6 +282,7 @@ backtest/
   walk_forward.py           ウォークフォワード検証（過剰最適化の検出）
   multi_symbol.py           複数銘柄のウォークフォワードと銘柄横断の集計
   portfolio.py              資金を共有するポートフォリオ検証（最大DDと資金稼働率はここでしか出ない）
+  benchmark.py              同期間ベンチマークに対する超過リターン（戦略の採否はここで判断する）
   run.py                    バックテスト/ウォークフォワードのCLI
 scripts/
   check_market_data.py      実機でマーケットデータの取得経路を切り分ける診断CLI
@@ -299,6 +300,7 @@ scripts/
   start_bot.sh              Botの起動（祝日なら起動しない。launchdが平日22:15に呼ぶ）
   after_close.sh            引け後の締め（Bot停止 → ランキング記録 → サマリ出力）
   backup_records.py         失うと復元できない記録を日付つきで控える（引け後に自動実行）
+  measure_alpha.py          戦略を「市場を持っていた場合」と比べる（IBKR接続不要）
   export_tax_report.py      確定申告用CSVを出力するCLI
 deploy/systemd/             VPS(Linux)運用のsystemd unit（現行の稼働環境）。2本のタイマーで1日が閉じる
 deploy/ib-gateway/          IB Gatewayをヘッドレスで動かすdocker-compose（IBCが日次の再ログインを代行する）
@@ -1504,6 +1506,10 @@ python -m backtest.run --csv-dir bars
 
 # 実際に運用する資金額で検証する（既定の100,000ドルのままだと小口座を楽観視する）
 python -m backtest.run --csv-dir bars --initial-equity 1220
+
+# 市場を持っていた場合と比べる（採否はこれで判断する。PFはゼロ基準なので使えない）
+python -m scripts.measure_alpha --csv-dir bars --initial-equity 13300 --slots 3 --watchlist-size 0
+python -m scripts.measure_alpha --csv-dir bars/universe --initial-equity 100000 --slots 10 --watchlist-size 0
 
 # 検証用の日中足を取得する（IBKR接続が要る。購読契約は不要。42銘柄で約48分）
 python -m scripts.fetch_intraday_bars --symbols-from-dir bars --duration "1 Y"
