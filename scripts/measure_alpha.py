@@ -117,6 +117,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial-equity", type=float, default=1_220.0,
                         help="実際に運用する資金額で回すこと（既定は現行資金）")
     parser.add_argument("--slots", type=int, default=2, help="同時保有ポジション数の上限")
+    parser.add_argument(
+        "--risk-pct", type=float, default=1.0,
+        help="1トレードのリスク（資金比）。**小口座ではこれが最大の設計変数である**"
+             "——建玉金額 = 資金 × (リスク% / 損切り%) なので、1%は $1,220 で $244 の"
+             "建玉になり、往復$2.00が約定代金の0.82%を占める。必要な超過リターンが"
+             "そのぶん高くなる。",
+    )
     parser.add_argument("--watchlist-size", type=int, default=24,
                         help="監視銘柄数の上限（0で無制限）")
     parser.add_argument("--min-commission", type=float, default=CostModel.min_commission_per_order,
@@ -138,10 +145,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         initial_equity=args.initial_equity,
         max_concurrent_positions=args.slots,
         max_watchlist_size=args.watchlist_size or None,
+        risk_per_trade_pct=args.risk_pct,
         costs=CostModel(min_commission_per_order=args.min_commission),
     )
+    notional = args.initial_equity * (args.risk_pct / config.stop_loss_pct)
     print(f"銘柄 {len(bars)}件 / 資金 {args.initial_equity:,.0f} / 枠 {args.slots}"
-          f" / 監視上限 {args.watchlist_size or '無制限'}")
+          f" / 監視上限 {args.watchlist_size or '無制限'} / リスク {args.risk_pct}%")
+    print(f"  1建玉 {notional:,.0f}ドル → 往復手数料は約定代金の "
+          f"{args.min_commission * 2 / notional * 100:.2f}%"
+          f"（超過リターンはこれを上回らなければ意味が無い）")
     result = run_portfolio_backtest(bars, config=config)
     _report(result, benchmark, args.initial_equity)
     return 0
