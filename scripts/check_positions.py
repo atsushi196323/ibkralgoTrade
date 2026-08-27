@@ -103,7 +103,7 @@ async def check_async(state_path: str) -> int:
     finally:
         await connection.disconnect_async()
 
-    print(f"\n===== 建玉の突き合わせ =====")
+    print("\n===== 建玉の突き合わせ =====")
     print(f"記録({manager.state_path}): {sorted(recorded) or 'なし'}")
     print(f"ブローカー: {sorted(broker) or 'なし'}")
     print()

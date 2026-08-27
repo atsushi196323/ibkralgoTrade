@@ -20,7 +20,7 @@
 import logging
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Sequence
 
 import pandas as pd
 

@@ -1165,7 +1165,26 @@ N=627 なら 665件（枠の31%。取り切るのに約2時間）
   **モメンタムは60営業日保有なので、その日のどの時刻に建てるかは成績にほぼ影響しない。** ただし**監視銘柄の日足を先に取ること**——順番を逆にすると、押し目買いのシグナル判定が母集団の取得待ちで最大2時間遅れる
 - **押し目買いと同時に動かすかを決めていない。** 資金を共有するので、枠の取り合いと日次サーキットブレーカーが絡む。`backtest/portfolio.py` で先に測ること
 
-`tests/test_momentum.py` と、`tests/test_main.py` の `test_the_momentum_track_is_disabled_by_default` / `test_no_targets_are_computed_while_the_track_is_disabled` / `test_maturity_is_counted_in_trading_days_not_calendar_days` / `test_only_the_momentum_track_exits_on_maturity` が番人。
+#### 母集団の取得が全滅したら ERROR で出す（2026-08-27の実バグ）
+
+`resolve_momentum_targets_async` は銘柄ごとの取得失敗を `except` で握り潰す（1銘柄の欠損で母集団を落とさないため）。**この except が、存在しない定数名による `NameError` を飲み込んでいた。** しかも `logger.debug` で出していたので、`bot.log`（INFO以上）には1行も残らない。**症状は「モメンタムが1銘柄も建てない」だけで、原因に辿り着く手掛かりが無かった。**
+
+**しかもテストは通っていた。** 「母集団が薄い日は建てない」ことを確かめるテストが空リストを期待しており、**バグのおかげで空が返っていた**ためである。
+
+不変条件:
+
+- **銘柄ごとの失敗は WARNING（初回のみ、スタックトレース付き）で残す。** DEBUGは `bot.log` に出ない
+- **全滅は ERROR。** 「データが無い日」と「コードが壊れている」は性質が違う。件数で切り分ける
+- **「母集団が薄い」と「誰も上位に入らなかった」を混ぜない。** 前者は設定か取得の問題、後者は正常。混ぜると件数が足りているのに「届かない」と出て切り分けを誤らせる
+- **空が返ることを確かめるテストは、空である理由まで確かめる**（`test_a_thin_population_produces_no_momentum_targets` が「取得できませんでした」がログに無いことも見る）
+
+#### 12-1 の定義は2か所にしか置かない
+
+`strategy.momentum.momentum_value`（直近1バー・ライブ用）と `momentum_series`（全バー・測定用）だけである。2026-08-27まで `scripts/` の3ファイルに同じ2行が書き写されており、**片方を直すと測っているものとライブで動くものが別々に育つ**状態だった。`tests/test_momentum.py` の `test_the_series_and_scalar_definitions_agree` が2つの一致を固定している。
+
+売買代金の算出（`recent_turnover`）も同じ理由で共有する。
+
+`tests/test_momentum.py` と、`tests/test_main.py` の `test_the_momentum_track_is_disabled_by_default` / `test_no_targets_are_computed_while_the_track_is_disabled` / `test_maturity_is_counted_in_trading_days_not_calendar_days` / `test_only_the_momentum_track_exits_on_maturity` / `test_a_universe_wide_fetch_failure_is_reported_as_an_error` が番人。
 
 ### 市場フィルター（指数の乖離率による追加条件）
 
@@ -1891,6 +1910,13 @@ MAX_WATCHLIST_SIZE × (600 / POLL_INTERVAL_SECONDS) ≦ 60
    本プロジェクトの制約（ペーシング制限、購読権限、ドライラン前提など）は自明でないものが多い。コードから読み取れる「何を」ではなく、その判断に至った理由を残すこと。
 
    裏返しとして、**コードを読めば分かることを言い換えただけのコメントは書かないこと。** 定数名・関数名を和訳しただけの見出し、直後の数行をそのまま説明しただけの一文、型アノテーションの繰り返しはいずれも不要である。これらは情報を足さないまま、実装を変えたときに更新漏れで嘘になる。判断の余地が無い箇所は無言でよい。
+
+   **例外を握り潰すときは、握り潰した事実が INFO 以上で残ること。** 本プロジェクトは
+   「1銘柄の失敗で全体を落とさない」ために `except Exception` を多用するが、
+   その中で `logger.debug` を使うと `bot.log`（INFO以上）に1行も残らない。
+   2026-08-27に、モメンタムの母集団取得で `NameError` がこの形で消え、
+   **常に空を返す状態が実装からデプロイまで気付かれなかった**（テストも空を
+   期待していたため通っていた）。**握り潰す範囲が広いほど、記録は目立つ側へ倒すこと。**
 
    **動かないコードをコメントアウトして残してはならない。** 「将来使うかもしれない」コードはGitの履歴に残っているので消すこと。コメントアウトされたコードは、それが意図的に無効化された仕様なのか消し忘れなのかを後から判別できず、テストも型チェックも通らないまま腐る。意図的に無効化する機能は、`main.ENABLE_DAY_TRADING` のように**フラグと理由のコメントで表現する**（フラグなら分岐が生きたコードとして残り、テストで押さえられる）。
 

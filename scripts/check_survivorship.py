@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 from backtest.csv_source import load_bars_from_csv
-from strategy.momentum import MOMENTUM_LOOKBACK_BARS, MOMENTUM_SKIP_BARS
+from strategy.momentum import momentum_series
 from backtest.signal_study import add_cross_sectional_percentile
 from backtest.survivorship import (
     UNIFORM_TOP_SHARE,
@@ -40,6 +40,16 @@ MIN_BARS: int = 400
 REFERENCE_ANNUAL_DEATH_RATE = (0.005, 0.02)
 
 
+
+def _momentum_of(frame: pd.DataFrame) -> pd.Series:
+    """バーのDataFrameから 12-1 モメンタムの列を作る。
+
+    定義は `strategy/momentum.py` にだけ置く（測定とライブを同一にするため）。
+    ここはその薄い受け口である。
+    """
+    return momentum_series(frame["close"])
+
+
 def _load(path: str) -> Dict[str, pd.DataFrame]:
     bars: Dict[str, pd.DataFrame] = {}
     for csv_path in sorted(glob.glob(os.path.join(path, "*.csv"))):
@@ -52,10 +62,6 @@ def _load(path: str) -> Dict[str, pd.DataFrame]:
     return bars
 
 
-def momentum_12_1(frame: pd.DataFrame) -> pd.Series:
-    """定義は `strategy/momentum.py` から取る（測定とライブを同一にするため）。"""
-    close = frame["close"].astype(float)
-    return close.shift(MOMENTUM_SKIP_BARS) / close.shift(MOMENTUM_LOOKBACK_BARS) - 1.0
 
 
 def collect_period_returns(
@@ -119,7 +125,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not bars:
         print(f"{args.csv_dir} に検証できる銘柄がありません。", file=sys.stderr)
         return 1
-    bars = add_cross_sectional_percentile(bars, momentum_12_1, "cs_momentum_rank")
+    bars = add_cross_sectional_percentile(bars, _momentum_of, "cs_momentum_rank")
 
     # 位相をずらして平均する。1つの位相だけだと37標本の偶然を拾う。
     tops, pops, n_top, n_pop, count = [], [], [], [], 0
@@ -148,7 +154,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print(f"銘柄 {len(bars)}件 / 非重複リバランス {count}期（位相6通り） / 保有 {args.hold}営業日")
     print(f"上位{args.top_pct*100:.0f}%は平均{top_n}銘柄、母集団は平均{pop_n}銘柄\n")
-    print(f"観測（算術・死は含まれていない）:")
+    print("観測（算術・死は含まれていない）:")
     print(f"  上位decile {top_mean:+.2f}% / 母集団 {pop_mean:+.2f}% "
           f"→ 超過 {observed:+.2f}%/期 = {observed*per_year:+.2f}%/年\n")
 

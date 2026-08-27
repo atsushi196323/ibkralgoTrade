@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 from backtest.csv_source import load_bars_from_csv
-from strategy.momentum import MOMENTUM_LOOKBACK_BARS, MOMENTUM_SKIP_BARS
+from strategy.momentum import momentum_series
 from backtest.signal_study import (
     SignalFn,
     add_cross_sectional_percentile,
@@ -102,7 +102,7 @@ def signal_gap_down(frame: pd.DataFrame) -> np.ndarray:
     return ((gap <= -0.03) & _uptrend(close)).fillna(False).to_numpy()
 
 
-def signal_momentum_12_1(frame: pd.DataFrame) -> np.ndarray:
+def signal_momentum_series(frame: pd.DataFrame) -> np.ndarray:
     """12ヶ月モメンタム（直近1ヶ月を除く）が上位。平均回帰の逆の仮説。
 
     押し目買いが効かないなら、逆方向を確かめる価値がある。学術的に最も
@@ -129,7 +129,7 @@ def signal_low_volatility(frame: pd.DataFrame) -> np.ndarray:
 
 
 # --- 横断ランクのモメンタム -----------------------------------------------------
-# 上の `signal_momentum_12_1` は**絶対閾値**（12ヶ月で+30%以上）で測っている。
+# 上の `signal_momentum_series` は**絶対閾値**（12ヶ月で+30%以上）で測っている。
 # モメンタムのアノマリーとして頑健なのは「その日の全銘柄を順位付けして上位を買う」
 # 横断ランクの形であり、両者は別のシグナルである——絶対閾値は相場全体の水準で
 # 意味が変わり、上げ相場では母集団の大半が該当し、下げ相場では誰も該当しない。
@@ -139,14 +139,6 @@ def signal_low_volatility(frame: pd.DataFrame) -> np.ndarray:
 CS_MOMENTUM_COLUMN: str = "cs_momentum_rank"
 
 
-def momentum_12_1_value(frame: pd.DataFrame) -> pd.Series:
-    """12ヶ月モメンタム（直近1ヶ月を除く）。横断ランクの元になる値。
-
-    **定義は `strategy/momentum.py` から取る。** ここで書き直すと、測っている
-    ものとライブで動くものが別々に育つ（CLAUDE.md「レイヤーの責務」）。
-    """
-    close = frame["close"].astype(float)
-    return close.shift(MOMENTUM_SKIP_BARS) / close.shift(MOMENTUM_LOOKBACK_BARS) - 1.0
 
 
 def _cs_momentum_between(frame: pd.DataFrame, low: float, high: float) -> np.ndarray:
@@ -205,13 +197,23 @@ SIGNALS: Dict[str, SignalFn] = {
     "RSI(2) < 5 + 200日線上": signal_rsi2,
     "3日続落 + 200日線上": signal_three_down_days,
     "ギャップダウン -3% + 200日線上": signal_gap_down,
-    "モメンタム 12-1 > 30%（絶対閾値）": signal_momentum_12_1,
+    "モメンタム 12-1 > 30%（絶対閾値）": signal_momentum_series,
     "横断モメンタム 上位10%": signal_cs_momentum_top_decile,
     "横断モメンタム 上位20%": signal_cs_momentum_top_quintile,
     "対照群: 横断モメンタム 下位10%": signal_cs_momentum_bottom_decile,
     "52週高値ブレイク": signal_52w_high_breakout,
     "低ボラ (日次SD<1%) + 200日線上": signal_low_volatility,
 }
+
+
+
+def _momentum_of(frame: pd.DataFrame) -> pd.Series:
+    """バーのDataFrameから 12-1 モメンタムの列を作る。
+
+    定義は `strategy/momentum.py` にだけ置く（測定とライブを同一にするため）。
+    ここはその薄い受け口である。
+    """
+    return momentum_series(frame["close"])
 
 
 def _load_directory(path: str) -> Dict[str, pd.DataFrame]:
@@ -257,7 +259,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     # 横断ランクは1銘柄のDataFrameからは決まらないので、シグナル評価の前に
     # 列として付けておく（`add_cross_sectional_percentile` の説明を参照）。
-    bars = add_cross_sectional_percentile(bars, momentum_12_1_value, CS_MOMENTUM_COLUMN)
+    bars = add_cross_sectional_percentile(bars, _momentum_of, CS_MOMENTUM_COLUMN)
 
     if args.benchmark == "equal-weight":
         benchmark = build_equal_weight_index(bars)
@@ -267,7 +269,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         benchmark_name = os.path.basename(args.benchmark)
 
     print(f"銘柄 {len(bars)}件 / ベンチマーク {benchmark_name}")
-    print(f"エントリーは翌営業日の始値。値はすべて同期間ベンチマークに対する超過リターン。")
+    print("エントリーは翌営業日の始値。値はすべて同期間ベンチマークに対する超過リターン。")
     print(f"必要アルファ {args.required_alpha:.2f}%/trade（これを下回るものは実装しない）\n")
 
     for name, fn in SIGNALS.items():

@@ -74,6 +74,7 @@ from strategy.momentum import (
     MIN_SYMBOLS_FOR_RANKING,
     MomentumConfig,
     momentum_value,
+    recent_turnover,
     select_by_turnover,
     select_targets,
 )
@@ -583,19 +584,6 @@ EXIT_PARAMS_BY_STRATEGY_TYPE: Dict[str, ExitParams] = {
 }
 
 
-def _recent_turnover(bars) -> float:
-    """直近の売買代金（終値 × 出来高）の中央値。読めなければ NaN。
-
-    中央値にするのは、1日の異常出来高で母集団が入れ替わるのを避けるためである。
-    """
-    if "volume" not in bars.columns:
-        return float("nan")
-    window = (bars["close"].astype(float) * bars["volume"].astype(float)).tail(
-        MOMENTUM_TURNOVER_WINDOW_BARS
-    )
-    return float(window.median()) if not window.empty else float("nan")
-
-
 # その取引日に算出済みのモメンタム目標。**1日1回で足りる。**
 # 順位の元になる日足は取引日ごとに1本しか増えず、`DailyBarCache` も
 # 取引日単位でキャッシュするため、サイクルごとに計算し直しても結果は同じで
@@ -642,23 +630,34 @@ async def resolve_momentum_targets_async(
 
     values: Dict[str, float] = {}
     turnovers: Dict[str, float] = {}
+    failures = 0
     for symbol in universe:
         try:
             contract = await caches.contracts.get_async(ib, symbol)
-            bars = await caches.daily_bars.get_async(
-                ib, contract, duration=SWING_BAR_DURATION, bar_size=SWING_BAR_SIZE,
-            )
+            bars = await caches.daily_bars.get_async(ib, contract)
         except Exception:
-            # 1銘柄の失敗で母集団全体を落とさない。件数が減ったことは
-            # 下の min_symbols 判定が拾う。
-            logger.debug("[%s] モメンタムの日足を取得できませんでした。", symbol)
+            # 1銘柄の失敗で母集団全体を落とさない。ただし**DEBUGで消してはならない**——
+            # 2026-08-27に、この except が存在しない定数名による NameError を飲み込み、
+            # 全銘柄がスキップされて常に空を返していた（bot.log はINFO以上なので
+            # DEBUGの行は残らず、症状は「モメンタムが1銘柄も建てない」だけだった）。
+            # 件数の判定は下にあるが、それは「母集団が薄い日」と「コードが壊れている」を
+            # 区別しない。区別するのが下の failures の集計である。
+            failures += 1
+            if failures == 1:
+                logger.warning(
+                    "[%s] モメンタムの日足を取得できませんでした。", symbol, exc_info=True,
+                )
             continue
         if bars is None or bars.empty:
             continue
         value = momentum_value(bars["close"])
         if value is not None:
             values[symbol] = value
-            turnovers[symbol] = _recent_turnover(bars)
+            turnovers[symbol] = (
+                recent_turnover(
+                    bars["close"], bars["volume"], MOMENTUM_TURNOVER_WINDOW_BARS,
+                ) if "volume" in bars.columns else float("nan")
+            )
 
     if MOMENTUM_UNIVERSE_SIZE > 0:
         # **順位はここで絞った後の母集団の中で付く**（select_targets が
@@ -669,13 +668,33 @@ async def resolve_momentum_targets_async(
         ))
         values = {symbol: value for symbol, value in values.items() if symbol in kept}
 
+    if failures:
+        # **全滅は「データが無い日」ではなく「壊れている」である。** 母集団の
+        # 取得が一律に失敗する原因（定数名の誤り・接続断・契約解決の失敗）は
+        # 銘柄ごとの欠損とは性質が違うので、件数で切り分けてERRORで出す。
+        level = logging.ERROR if failures == len(universe) else logging.WARNING
+        logger.log(
+            level,
+            "モメンタムの母集団 %d 件のうち %d 件で日足を取得できませんでした。",
+            len(universe), failures,
+        )
+
     targets = select_targets(values, MOMENTUM_CONFIG)
     if not targets:
-        logger.warning(
-            "モメンタムの順位付けに使えた銘柄が%d件で、必要な%d件に届かないため"
-            "この日は建てません（薄い母集団の中の順位は上位%.0f%%を意味しません）。",
-            len(values), MOMENTUM_CONFIG.min_symbols, MOMENTUM_CONFIG.top_pct * 100,
-        )
+        # **2つの理由を混ぜてはならない。** 母集団が薄い日（設定か取得の問題）と、
+        # 母集団は足りているが誰も上位に入らなかった日（正常）は、対処が違う。
+        # 混ぜると、件数が足りているのに「届かない」と出て切り分けを誤らせる。
+        if len(values) < MOMENTUM_CONFIG.min_symbols:
+            logger.warning(
+                "モメンタムの順位付けに使えた銘柄が%d件で、必要な%d件に届かないため"
+                "この日は建てません（薄い母集団の中の順位は上位%.0f%%を意味しません）。",
+                len(values), MOMENTUM_CONFIG.min_symbols, MOMENTUM_CONFIG.top_pct * 100,
+            )
+        else:
+            logger.info(
+                "モメンタムの母集団%d件に、上位%.0f%%へ入る銘柄がありませんでした。",
+                len(values), MOMENTUM_CONFIG.top_pct * 100,
+            )
         return []
     logger.info(
         "モメンタムの目標銘柄: %s（母集団%d件の上位%.0f%%から%d件）",
@@ -1551,11 +1570,11 @@ def _adopt_broker_resting_prices(
     changed = position_manager.adopt_broker_resting_prices(
         symbol, state.stop_price, state.take_profit_price,
     )
-    for field, (recorded, live_price) in sorted(changed.items()):
+    for price_kind, (recorded, live_price) in sorted(changed.items()):
         logger.warning(
             "[%s] 待機注文の %s が記録(%.2f)と板(%.2f)でずれています。"
             "実際に約定するのは板の注文なので、板の値段で記録し直しました。",
-            symbol, field, recorded, live_price,
+            symbol, price_kind, recorded, live_price,
         )
 
 

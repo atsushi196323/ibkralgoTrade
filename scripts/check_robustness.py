@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from backtest.csv_source import load_bars_from_csv
-from strategy.momentum import MOMENTUM_LOOKBACK_BARS, MOMENTUM_SKIP_BARS
+from strategy.momentum import momentum_series
 from backtest.robustness import (
     RobustnessReport,
     check_benchmark,
@@ -44,14 +44,16 @@ PHASES: Tuple[int, ...] = (0, 10, 20, 30, 40, 50)
 REFERENCE_ANNUAL_DEATH_RATE: float = 0.02
 
 
-def momentum_12_1(frame: pd.DataFrame) -> pd.Series:
-    """12ヶ月モメンタム（直近1ヶ月を除く）。
 
-    **定義は `strategy/momentum.py` から取る。** ここで書き直すと、測っている
-    ものとライブで動くものが別々に育つ（CLAUDE.md「レイヤーの責務」）。
+
+
+def _momentum_of(frame: pd.DataFrame) -> pd.Series:
+    """バーのDataFrameから 12-1 モメンタムの列を作る。
+
+    定義は `strategy/momentum.py` にだけ置く（測定とライブを同一にするため）。
+    ここはその薄い受け口である。
     """
-    close = frame["close"].astype(float)
-    return close.shift(MOMENTUM_SKIP_BARS) / close.shift(MOMENTUM_LOOKBACK_BARS) - 1.0
+    return momentum_series(frame["close"])
 
 
 def _load(path: str) -> Dict[str, pd.DataFrame]:
@@ -214,7 +216,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     global MOMENTUM_TOP_PCT
     MOMENTUM_TOP_PCT = args.top_pct
-    bars = add_cross_sectional_percentile(bars, momentum_12_1, RANK_COLUMN)
+    bars = add_cross_sectional_percentile(bars, _momentum_of, RANK_COLUMN)
     scope = (
         f"全{len(bars)}件" if args.universe_size <= 0
         else f"{len(bars)}件から売買代金で毎回{args.universe_size}件へ絞る"

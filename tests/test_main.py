@@ -1368,6 +1368,47 @@ def test_nothing_is_reported_when_every_symbol_fits(caplog) -> None:
 # --- 横断モメンタムのトラック（既定で無効） -------------------------------------
 
 
+def test_a_universe_wide_fetch_failure_is_reported_as_an_error(caplog) -> None:
+    """母集団の取得が全滅したら ERROR で出すこと。
+
+    **全滅は「データが無い日」ではなく「壊れている」である。** 2026-08-27に、
+    存在しない定数名による NameError を銘柄ごとの except が飲み込み、
+    `logger.debug` で消えていた（bot.log はINFO以上なので行が残らない）。
+    症状は「モメンタムが1銘柄も建てない」だけで、原因に辿り着けなかった。
+    """
+    ib = MagicMock()
+    caches = MagicMock()
+    caches.contracts.get_async = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with patch("main.ENABLE_MOMENTUM_TRACK", True), caplog.at_level(logging.WARNING):
+        targets = asyncio.run(
+            main_module.resolve_momentum_targets_async(ib, caches, ["AAA", "BBB"])
+        )
+
+    assert targets == []
+    assert any(record.levelname == "ERROR" for record in caplog.records)
+    assert "2 件で日足を取得できませんでした" in caplog.text
+
+
+def test_a_partial_fetch_failure_is_only_a_warning(caplog) -> None:
+    """一部の失敗はWARNINGに留めること（銘柄ごとの欠損は日常的に起きる）。"""
+    ib = MagicMock()
+    bars = pd.DataFrame({
+        "close": [100.0 + i for i in range(300)], "volume": [1e6] * 300,
+    })
+    caches = MagicMock()
+    caches.contracts.get_async = AsyncMock(
+        side_effect=[RuntimeError("boom"), MagicMock(symbol="BBB")]
+    )
+    caches.daily_bars.get_async = AsyncMock(return_value=bars)
+
+    with patch("main.ENABLE_MOMENTUM_TRACK", True), caplog.at_level(logging.WARNING):
+        asyncio.run(main_module.resolve_momentum_targets_async(ib, caches, ["AAA", "BBB"]))
+
+    assert not any(record.levelname == "ERROR" for record in caplog.records)
+    assert "1 件で日足を取得できませんでした" in caplog.text
+
+
 def test_momentum_targets_are_computed_once_per_trading_day() -> None:
     """目標の算出を取引日1回に絞ること。
 
@@ -1508,7 +1549,11 @@ def test_a_thin_population_produces_no_momentum_targets(caplog) -> None:
     """
     ib = MagicMock()
     contract = MagicMock(symbol="AAA")
-    bars = pd.DataFrame({"close": [100.0] * 300})
+    # モメンタムが算出できる本数の日足（252+1本以上）。
+    bars = pd.DataFrame({
+        "close": [100.0 + i for i in range(300)],
+        "volume": [1_000_000.0] * 300,
+    })
     caches = MagicMock()
     caches.contracts.get_async = AsyncMock(return_value=contract)
     caches.daily_bars.get_async = AsyncMock(return_value=bars)
@@ -1519,7 +1564,11 @@ def test_a_thin_population_produces_no_momentum_targets(caplog) -> None:
         )
 
     assert targets == []
+    # **「空だった」だけでは足りない。** 2026-08-27に、日足の取得が
+    # NameError で全滅して常に空を返すバグがあったが、このテストは空を
+    # 期待していたため通っていた。母集団が薄いことが理由だと確かめる。
     assert "届かない" in caplog.text
+    assert "取得できませんでした" not in caplog.text
 
 
 def test_momentum_positions_carry_a_protective_stop_not_a_trading_stop() -> None:

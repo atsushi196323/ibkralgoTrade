@@ -12,10 +12,14 @@
 **決済は時間で決まる。** 利確・損切りの水準ではなく、保有日数で降りて
 次のリバランスで入れ替える。したがってブラケットの子注文は**利確・損切り
 としてではなく、プロセスが落ちている間の保護として**置く（`main` 側）。
+
+**満期の判定はここに置かない。** `main.ExitParams.max_hold_days` と
+`core.market_hours.count_trading_days_between` が持つ——建玉日時から
+営業日を数えるのは、純粋なシグナル判定ではなく建玉の状態管理だからである。
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -132,32 +136,25 @@ def select_by_turnover(
     ]
 
 
-def is_rebalance_due(bars_held: int, config: MomentumConfig = MomentumConfig()) -> bool:
-    """保有日数が満期に達したか。
+def momentum_series(closes: pd.Series) -> pd.Series:
+    """各バー時点の 12-1 モメンタムを列で返す（バックテスト・測定用）。
 
-    **モメンタムの決済は時間で決まる。** 利確・損切りの水準で降りるのでは
-    ないので、この判定が唯一の通常の出口である。
+    `momentum_value` は直近1バーの値を返すライブ用で、こちらは全バーぶんを
+    返す測定用である。**定義は必ずこの2つだけに置く**——2026-08-27まで
+    `scripts/` の3ファイルに同じ2行が書き写されており、片方を直すと
+    測っているものとライブで動くものが別々に育つ状態だった。
     """
-    return bars_held >= config.hold_days
+    values = closes.astype(float)
+    return values.shift(MOMENTUM_SKIP_BARS) / values.shift(MOMENTUM_LOOKBACK_BARS) - 1.0
 
 
-def targets_to_trade(
-    held: Sequence[str], targets: Sequence[str], due: Sequence[str],
-) -> Dict[str, List[str]]:
-    """保有中・目標・満期から、売る銘柄と買う銘柄を決める。
+def recent_turnover(closes: pd.Series, volumes: pd.Series, window: int) -> float:
+    """直近の売買代金（終値 × 出来高）の中央値。読めなければ NaN。
 
-    **満期に達していない保有は、目標から外れていても売らない。** 毎日
-    順位を付け直すと保有銘柄は日々出入りするので、目標から外れるたびに
-    売っていると保有期間60日という前提が崩れ、回転だけが上がる
-    （往復$2.00の固定手数料は回転に比例する）。
-
-    買うのは「目標に入っていて、まだ持っていない銘柄」だけである。
+    **中央値にするのは、1日の異常出来高で母集団が入れ替わるのを避けるため**
+    （`strategy.attention` が前日比ではなく中央値を使うのと同じ理由）。
     """
-    held_set, due_set = set(held), set(due)
-    to_sell = [symbol for symbol in held if symbol in due_set]
-    remaining = [symbol for symbol in held if symbol not in due_set]
-    to_buy = [
-        symbol for symbol in targets
-        if symbol not in held_set or symbol in due_set
-    ]
-    return {"sell": to_sell, "buy": to_buy, "hold": remaining}
+    if closes is None or volumes is None or len(closes) == 0:
+        return float("nan")
+    turnover = (closes.astype(float) * volumes.astype(float)).tail(window)
+    return float(turnover.median()) if not turnover.empty else float("nan")

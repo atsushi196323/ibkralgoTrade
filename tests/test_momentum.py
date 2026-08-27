@@ -9,14 +9,14 @@ import pytest
 
 from strategy.momentum import (
     MOMENTUM_LOOKBACK_BARS,
-    select_by_turnover,
     MOMENTUM_SKIP_BARS,
     MomentumConfig,
-    is_rebalance_due,
+    momentum_series,
     momentum_value,
     rank_percentiles,
+    recent_turnover,
+    select_by_turnover,
     select_targets,
-    targets_to_trade,
 )
 
 
@@ -97,44 +97,8 @@ def test_missing_values_do_not_get_a_rank():
     assert set(ranks) == {"A", "C"}
 
 
-def test_the_exit_is_driven_by_holding_time():
-    """満期で降りること。モメンタムの通常の出口はこれだけである。"""
-    config = MomentumConfig(hold_days=60)
-
-    assert is_rebalance_due(59, config) is False
-    assert is_rebalance_due(60, config) is True
 
 
-def test_a_position_that_drops_out_of_the_targets_is_not_sold_early():
-    """満期前の保有を、目標から外れたという理由で売らないこと。
-
-    毎日順位を付け直すと保有銘柄は日々出入りする。外れるたびに売っていると
-    保有期間60日という前提が崩れ、回転だけが上がる——往復$2.00の固定手数料は
-    回転に比例するので、これは直接コストになる。
-    """
-    plan = targets_to_trade(held=["AAA", "BBB"], targets=["CCC"], due=[])
-
-    assert plan["sell"] == []
-    assert plan["hold"] == ["AAA", "BBB"]
-
-
-def test_only_matured_positions_are_sold():
-    plan = targets_to_trade(held=["AAA", "BBB"], targets=["CCC", "AAA"], due=["AAA"])
-
-    assert plan["sell"] == ["AAA"]
-    assert plan["hold"] == ["BBB"]
-    # 満期を迎えた AAA が目標に残っていれば、売って買い直す（保有期間が延びない）。
-    assert plan["buy"] == ["CCC", "AAA"]
-
-
-def test_symbols_already_held_and_not_due_are_not_bought_again():
-    """同じ銘柄を二重に建てないこと。"""
-    plan = targets_to_trade(held=["AAA"], targets=["AAA", "BBB"], due=[])
-
-    assert plan["buy"] == ["BBB"]
-
-
-# --- 流動性の下限 -----------------------------------------------------------------
 
 
 def test_thin_names_are_dropped_even_inside_the_top_n():
@@ -162,3 +126,36 @@ def test_a_zero_size_keeps_everything_above_the_floor():
     kept = select_by_turnover({"A": 5e8, "C": 1e6}, 0, min_turnover_usd=2e7)
 
     assert kept == ["A"]
+
+
+# --- 測定とライブで同じ定義を使う -------------------------------------------------
+
+
+def test_the_series_and_scalar_definitions_agree():
+    """列で返す版と、直近1バーだけを返す版が同じ値になること。
+
+    **2026-08-27まで、この2行が `scripts/` の3ファイルへ書き写されていた。**
+    片方だけ直すと、測っているものとライブで動くものが別々に育つ
+    （CLAUDE.md「レイヤーの責務」）。
+    """
+    closes = _closes([100.0 + i for i in range(300)])
+
+    assert momentum_series(closes).iloc[-1] == pytest.approx(momentum_value(closes))
+
+
+def test_the_turnover_is_a_median_not_a_mean():
+    """売買代金を中央値で取ること。
+
+    平均だと1日の異常出来高で母集団が入れ替わる（`strategy.attention` が
+    前日比ではなく中央値を使うのと同じ理由）。
+    """
+    closes = _closes([10.0] * 5)
+    volumes = _closes([100.0, 100.0, 100.0, 100.0, 10_000.0])
+
+    assert recent_turnover(closes, volumes, window=5) == pytest.approx(1000.0)
+
+
+def test_turnover_of_an_empty_series_is_nan():
+    assert recent_turnover(_closes([]), _closes([]), window=5) != recent_turnover(
+        _closes([]), _closes([]), window=5
+    )

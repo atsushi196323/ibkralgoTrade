@@ -31,7 +31,6 @@ import sys
 from datetime import datetime
 from typing import Dict, List, Optional
 
-import pandas as pd
 
 from core.market_hours import US_EASTERN
 from data.rank_history import DEFAULT_RANK_HISTORY_PATH, RankHistoryStore

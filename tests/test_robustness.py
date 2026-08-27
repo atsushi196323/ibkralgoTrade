@@ -4,8 +4,6 @@
 基準が結果を見てから動くなら、8本並べて最良を拾うのと同じことになる。
 """
 
-import pytest
-
 from backtest.robustness import (
     RobustnessReport,
     check_benchmark,
