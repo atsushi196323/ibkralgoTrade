@@ -1300,6 +1300,70 @@ def test_the_watchlist_cap_does_not_worsen_the_pacer_backlog_beyond_one_window()
     assert worst_case_per_10min <= budget * 2
 
 
+def test_symbols_that_do_not_fit_the_monitoring_cap_are_named(caplog) -> None:
+    """監視枠からあふれた銘柄を、件数ではなく名前で残すこと。
+
+    切り詰めは記載順（＝アルファベット順）なので落ちるのは常に末尾である。
+    件数だけだと、どの銘柄が使われていないのかログを手で数えるしかない。
+    2026-08-18より前は VZ / WFC / WMT / XOM が毎日必ず外れていた。
+
+    **帯を通る件数は資金に比例して増えるので、増資するたびに静かに悪化する。**
+    """
+    ib = MagicMock()
+    main_module._once_per_day_logged = (None, set())
+    symbols = [f"SYM{i:02d}" for i in range(MAX_WATCHLIST_SIZE + 3)]
+
+    # 資金1,220の帯は $6.10〜$244。全銘柄を帯の中に置く。
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
+        _fallback_prices({symbol: 100.0 for symbol in symbols}), \
+        caplog.at_level(logging.WARNING):
+        asyncio.run(_refresh_watchlist_async(ib, symbols, account_equity=1220.0))
+
+    dropped = symbols[MAX_WATCHLIST_SIZE:]
+    assert "監視枠" in caplog.text
+    for symbol in dropped:
+        assert symbol in caplog.text
+    # 枠に入った側は「外します」の行に出てこない。
+    truncation_line = [
+        line for line in caplog.text.splitlines() if "監視対象から外します" in line
+    ]
+    assert len(truncation_line) == 1
+    assert symbols[0] not in truncation_line[0]
+
+
+def test_the_truncation_warning_is_logged_once_per_trading_day(caplog) -> None:
+    """同じ切り詰めを1日に何度も出さないこと。
+
+    スクリーニングが失敗する日はフォールバックが900秒ごとに走るため、
+    絞らないと同じ行が1日26回並び、「読むべき1行」を埋める側に回る。
+    """
+    ib = MagicMock()
+    main_module._once_per_day_logged = (None, set())
+    symbols = [f"SYM{i:02d}" for i in range(MAX_WATCHLIST_SIZE + 3)]
+
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
+        _fallback_prices({symbol: 100.0 for symbol in symbols}), \
+        caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            asyncio.run(_refresh_watchlist_async(ib, symbols, account_equity=1220.0))
+
+    assert caplog.text.count("監視対象から外します") == 1
+
+
+def test_nothing_is_reported_when_every_symbol_fits(caplog) -> None:
+    """枠に収まっている日は何も出さないこと（毎日出ると意味が薄れる）。"""
+    ib = MagicMock()
+    main_module._once_per_day_logged = (None, set())
+    symbols = [f"SYM{i:02d}" for i in range(MAX_WATCHLIST_SIZE)]
+
+    with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
+        _fallback_prices({symbol: 100.0 for symbol in symbols}), \
+        caplog.at_level(logging.WARNING):
+        asyncio.run(_refresh_watchlist_async(ib, symbols, account_equity=1220.0))
+
+    assert "監視対象から外します" not in caplog.text
+
+
 def test_fallback_watchlist_has_no_duplicates() -> None:
     assert len(set(WATCHLIST)) == len(WATCHLIST), "重複した銘柄が監視枠を二重に消費します。"
 

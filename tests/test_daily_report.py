@@ -484,3 +484,32 @@ def test_the_average_divergence_and_the_adverse_total_are_reported():
 
     assert "2件" in rendered
     assert "不利側の合計 +3.42 USD" in rendered
+
+
+def test_symbols_that_never_got_evaluated_are_named_in_the_summary():
+    """監視枠からあふれた銘柄を、引け後のサマリで名指しすること。
+
+    件数だけだと、検証した母集団のどこが使われていないのかが分からない。
+    増資すると帯を通る件数が増えるので、この行は放置されると悪化し続ける。
+    """
+    lines = _lines(
+        "2026-08-27 22:16:01,000 [WARNING] __main__: "
+        "株価帯を通った38件が監視枠(24)に入りきらないため、記載順で末尾の14件を"
+        "監視対象から外します: PFE, PG, RIVN, SBUX。"
+        "**検証した母集団の一部が使われていません。**",
+    )
+
+    report = build_day_report(lines, [], date(2026, 8, 27))
+    rendered = format_report(report)
+
+    assert report.truncated_symbols == ["PFE", "PG", "RIVN", "SBUX"]
+    assert report.truncation_counts == (38, 24)
+    assert "監視枠からあふれた銘柄" in rendered
+    assert "RIVN" in rendered
+
+
+def test_no_truncation_section_when_everything_fits():
+    """あふれていない日はこの節を出さないこと。"""
+    rendered = format_report(build_day_report(_lines(), [], date(2026, 8, 27)))
+
+    assert "監視枠からあふれた銘柄" not in rendered

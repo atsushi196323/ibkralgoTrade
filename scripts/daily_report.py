@@ -167,6 +167,18 @@ class DayReport:
     restored_resting_orders: Counter = field(default_factory=Counter)
     cancels_confirmed: Counter = field(default_factory=Counter)
     tif_downgrades: Dict[str, str] = field(default_factory=dict)
+    # 監視枠に入りきらなかった銘柄。増資すると帯を通る件数が増えるので、
+    # ここが埋まったまま放置されると検証した母集団の一部が使われ続けない。
+    truncated_symbols: List[str] = field(default_factory=list)
+    truncation_counts: Optional[Tuple[int, int]] = None
+
+
+# 監視枠に入りきらず、その日1件も判定されなかった銘柄（`main._log_watchlist_truncation`）。
+# **検証した母集団の一部を使っていない状態**なので、件数ではなく銘柄名を出す。
+_TRUNCATION_RE = re.compile(
+    r"株価帯を通った(?P<passed>\d+)件が監視枠\((?P<slots>\d+)\)に入りきらないため、"
+    r"記載順で末尾の\d+件を監視対象から外します: (?P<dropped>[^。]+)。"
+)
 
 
 def parse_log_lines(
@@ -247,6 +259,16 @@ def build_day_report(
             previous = report.lowest_deviation.get(symbol)
             if previous is None or deviation < previous:
                 report.lowest_deviation[symbol] = deviation
+            continue
+
+        truncation = _TRUNCATION_RE.search(message)
+        if truncation is not None:
+            report.truncated_symbols = [
+                symbol.strip() for symbol in truncation.group("dropped").split(",")
+            ]
+            report.truncation_counts = (
+                int(truncation.group("passed")), int(truncation.group("slots")),
+            )
             continue
 
         evaluation = _EXIT_EVALUATION_RE.match(message)
@@ -497,6 +519,20 @@ def format_report(report: DayReport) -> str:
             )
     else:
         lines.append("なし")
+
+    if report.truncated_symbols:
+        passed, slots = report.truncation_counts or (0, 0)
+        lines.append("")
+        lines.append("--- 監視枠からあふれた銘柄 ---")
+        lines.append(
+            f"株価帯を通った{passed}件のうち{slots}件しか監視できず、"
+            f"{len(report.truncated_symbols)}件が一度も判定されていません: "
+            + ", ".join(report.truncated_symbols)
+        )
+        lines.append(
+            "  検証した母集団の一部が使われていない状態。増資すると帯を通る件数が"
+            "増えるので、枠(MAX_WATCHLIST_SIZE)とポーリング間隔を併せて見直すこと。"
+        )
 
     lines.append("")
     lines.append(_format_fills(report.fills))
