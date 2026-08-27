@@ -13,7 +13,7 @@ from ib_async import IB, Stock
 
 from core.connection import IBKRConnection
 from core.logging_setup import configure_logging
-from core.market_hours import US_EASTERN, is_day_trade_flatten_time, is_regular_trading_hours
+from core.market_hours import count_trading_days_between, US_EASTERN, is_day_trade_flatten_time, is_regular_trading_hours
 from data.cache import ContractCache, DailyBarCache
 from data.fundamentals import run_turnover_scan_async
 from data.rank_history import RankHistoryStore, resolve_store
@@ -48,6 +48,7 @@ from execution.position_manager import (
     PositionManager,
     STRATEGY_TYPE_DAY,
     STRATEGY_TYPE_GROWTH,
+    STRATEGY_TYPE_MOMENTUM,
     STRATEGY_TYPE_SWING,
 )
 from execution.position_sizing import calculate_position_size
@@ -55,6 +56,7 @@ from execution.fill_log import FillLog
 from execution.trade_journal import TradeJournal
 from strategy.exit_signal import (
     REASON_EOD_FLATTEN,
+    REASON_MOMENTUM_REBALANCE,
     REASON_STOP_LOSS,
     REASON_TAKE_PROFIT,
     detect_exit_signal,
@@ -68,6 +70,7 @@ from strategy.attention import (
     detect_rank_surges,
     has_enough_history,
 )
+from strategy.momentum import MomentumConfig, momentum_value, select_targets
 from strategy.pullback import (
     MarketFilterConfig,
     SignalResult,
@@ -441,11 +444,55 @@ CONCENTRATED_SYMBOL: Optional[str] = None
 GROWTH_WATCHLIST_SLOTS: int = 6
 
 
+# --- 横断ランクのモメンタム（既定で無効） --------------------------------------
+#
+# **一貫性テスト8項目のうち7項目を通り、生存バイアス耐性だけが不合格である**
+# （2026-08-27。`python -m scripts.check_robustness`）。押し目買い（対母集団
+# +0.15%・t≒0）とは明確に差があり、本プロジェクトが測定した中で最も強い結果だが、
+# **判定が「不採用」である以上、稼働させない。** デイトレード・グロース株と
+# 同じ扱いで、フラグと理由と有効化の条件で表現する。
+#
+# **実装だけ先に済ませてあるのは、判定が通った瞬間に動かせるようにするため**で、
+# 「そのうち使うかもしれない」からではない（CLAUDE.md「必要でないもの」）。
+ENABLE_MOMENTUM_TRACK: bool = False
+
+# 順位付けの母集団。**押し目買いのウォッチリストとは別物である。**
+# 上位10%を採るので、母集団が薄いと「3銘柄中の1位」が「上位10%」になる。
+# `MIN_SYMBOLS_FOR_RANKING`(100) を下回る日は建てない。
+#
+# **ここを埋めるには、日足を毎日この件数ぶん取得する必要がある**（1日1回・
+# キャッシュ済み）。627銘柄なら実効枠55件/10分に対して約2時間ぶんで、
+# レギュラーセッション(6.5時間)には収まるが監視サイクルの枠を圧迫する。
+# 有効化するときに、ペーシングの実測とセットで決めること。
+MOMENTUM_UNIVERSE: List[str] = []
+
+MOMENTUM_CONFIG: MomentumConfig = MomentumConfig(
+    # 上位10%・保有60営業日・同時5銘柄。**一貫性テストを通した値であり、
+    # グリッド探索で選んだものではない。成績を見て刻み直してはならない。**
+    top_pct=0.10, hold_days=60, slots=5,
+)
+
+# モメンタム建玉に置く待機注文の幅。**これは利確・損切りではなく保護である。**
+# 測定は決済ルールを持たない（60日で降りるだけ）ので、ここが約定する水準まで
+# 動くのは想定外の事態にあたる。**幅を狭めると測定と別の戦略になる**ので、
+# 束縛しない水準に置く。プロセスが落ちている間も建玉を守るという不変条件
+# （CLAUDE.md「決済の置き場所」）は、幅を広げても失われない。
+MOMENTUM_PROTECTIVE_STOP_PCT: float = 25.0
+MOMENTUM_PROTECTIVE_TAKE_PROFIT_PCT: float = 200.0
+# トレーリングは掛けない。高値からの下落で降りるのは値幅ベースの決済であり、
+# 保有60日という前提を壊す。0だと `detect_exit_signal` が作動しない。
+MOMENTUM_TRAILING_STOP_PCT: float = 0.0
+
+
 @dataclass(frozen=True)
 class ExitParams:
     take_profit_pct: float
     stop_loss_pct: float
     trailing_stop_pct: float
+    # 保有日数の上限（営業日）。Noneなら満期による決済を行わない。
+    # **モメンタムだけがこれを持つ。** あの軸は値幅ではなく時間で降りるので、
+    # 利確・損切りは「通常の出口」ではなくプロセスが落ちている間の保護になる。
+    max_hold_days: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -480,7 +527,62 @@ EXIT_PARAMS_BY_STRATEGY_TYPE: Dict[str, ExitParams] = {
         stop_loss_pct=GROWTH_STOP_LOSS_PCT,
         trailing_stop_pct=GROWTH_TRAILING_STOP_PCT,
     ),
+    STRATEGY_TYPE_MOMENTUM: ExitParams(
+        take_profit_pct=MOMENTUM_PROTECTIVE_TAKE_PROFIT_PCT,
+        stop_loss_pct=MOMENTUM_PROTECTIVE_STOP_PCT,
+        trailing_stop_pct=MOMENTUM_TRAILING_STOP_PCT,
+        max_hold_days=MOMENTUM_CONFIG.hold_days,
+    ),
 }
+
+
+async def resolve_momentum_targets_async(
+    ib: IB, caches: MarketDataCaches, universe: Sequence[str],
+) -> List[str]:
+    """その日に保有すべきモメンタム銘柄を返す。無効なら空。
+
+    **押し目買いと違い、銘柄単体では判定できない。** 「その日の全銘柄の中で
+    上位何%か」なので、監視ループが銘柄を独立に回す前に母集団のスナップショットを
+    取る必要がある。日足は `DailyBarCache` を通すので、取引日あたり銘柄1回に収まる
+    （「6.1」のペーシング制限）。
+
+    **価格が取れない銘柄は母集団から落ちる。** 落ちた結果 `min_symbols` を
+    下回れば、その日は建てない——薄い母集団の中の順位は上位10%を意味しない。
+    """
+    if not ENABLE_MOMENTUM_TRACK or not universe:
+        return []
+
+    values: Dict[str, float] = {}
+    for symbol in universe:
+        try:
+            contract = await caches.contracts.get_async(ib, symbol)
+            bars = await caches.daily_bars.get_async(
+                ib, contract, duration=SWING_BAR_DURATION, bar_size=SWING_BAR_SIZE,
+            )
+        except Exception:
+            # 1銘柄の失敗で母集団全体を落とさない。件数が減ったことは
+            # 下の min_symbols 判定が拾う。
+            logger.debug("[%s] モメンタムの日足を取得できませんでした。", symbol)
+            continue
+        if bars is None or bars.empty:
+            continue
+        value = momentum_value(bars["close"])
+        if value is not None:
+            values[symbol] = value
+
+    targets = select_targets(values, MOMENTUM_CONFIG)
+    if not targets:
+        logger.warning(
+            "モメンタムの順位付けに使えた銘柄が%d件で、必要な%d件に届かないため"
+            "この日は建てません（薄い母集団の中の順位は上位%.0f%%を意味しません）。",
+            len(values), MOMENTUM_CONFIG.min_symbols, MOMENTUM_CONFIG.top_pct * 100,
+        )
+        return []
+    logger.info(
+        "モメンタムの目標銘柄: %s（母集団%d件の上位%.0f%%から%d件）",
+        ", ".join(targets), len(values), MOMENTUM_CONFIG.top_pct * 100, len(targets),
+    )
+    return targets
 
 
 def is_growth_symbol(symbol: str) -> bool:
@@ -1071,6 +1173,25 @@ async def _process_exit_async(
             symbol, DEFAULT_STATE_PATH,
         )
         return
+    # モメンタム建玉は**保有日数**で降りる。値幅ではないので、他のどの決済判定
+    # より先に見る（待機注文は保護であって通常の出口ではない）。
+    matured = _momentum_position_is_matured(position)
+    if matured:
+        logger.info(
+            "[%s] モメンタム建玉が保有%d営業日に達したため決済します。",
+            symbol, MOMENTUM_CONFIG.hold_days,
+        )
+        exit_result = await _market_exit_async(ib, contract, position, price)
+        exit_price = exit_result.fill_price if exit_result.fill_price is not None else price
+        pnl_pct = (exit_price - position.entry_price) / position.entry_price * 100.0
+        closed_position = position_manager.close_position(symbol)
+        _record_market_exit_fill(closed_position, price, exit_result)
+        await _record_closed_trade(
+            ib, trade_journal, closed_position, exit_price, REASON_MOMENTUM_REBALANCE,
+            pnl_pct, exit_commission=exit_result.commission,
+        )
+        return
+
     if position.strategy_type == STRATEGY_TYPE_DAY and is_day_trade_flatten_time():
         logger.info(
             "[%s] デイトレードポジションが大引け前の強制決済時刻に達したため決済します。", symbol,
@@ -1113,6 +1234,35 @@ async def _process_exit_async(
         ib, trade_journal, closed_position, exit_price, result.reason, pnl_pct,
         exit_commission=exit_result.commission,
     )
+
+
+def _momentum_position_is_matured(position, now: Optional[datetime] = None) -> bool:
+    """モメンタム建玉が満期に達したか。
+
+    **営業日で数える。** 暦日で数えると週末と祝日のぶんだけ早く降りることになり、
+    保有60営業日という測定の前提とずれる（10年で約4%の差になる）。
+
+    建玉日時が読めない場合は False に倒す。**「分からない」を「満期」として
+    扱うと、建てた直後に決済しうる。**
+    """
+    params = EXIT_PARAMS_BY_STRATEGY_TYPE.get(position.strategy_type)
+    if params is None or params.max_hold_days is None:
+        return False
+    if not position.entry_date:
+        logger.warning(
+            "[%s] 建玉日時が読めないため満期を判定できません。", position.symbol,
+        )
+        return False
+    try:
+        entered = datetime.fromisoformat(position.entry_date)
+    except ValueError:
+        logger.warning(
+            "[%s] 建玉日時 %s を解釈できません。", position.symbol, position.entry_date,
+        )
+        return False
+    today = (now or datetime.now(US_EASTERN)).astimezone(US_EASTERN).date()
+    held = count_trading_days_between(entered.astimezone(US_EASTERN).date(), today)
+    return held >= params.max_hold_days
 
 
 def _record_market_exit_fill(closed_position, observed_price: float, exit_result) -> None:

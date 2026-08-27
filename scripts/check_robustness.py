@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from backtest.csv_source import load_bars_from_csv
+from strategy.momentum import MOMENTUM_LOOKBACK_BARS, MOMENTUM_SKIP_BARS
 from backtest.robustness import (
     RobustnessReport,
     check_benchmark,
@@ -43,9 +44,13 @@ REFERENCE_ANNUAL_DEATH_RATE: float = 0.02
 
 
 def momentum_12_1(frame: pd.DataFrame) -> pd.Series:
-    """12ヶ月モメンタム（直近1ヶ月を除く）。値はその行までの情報だけで決まる。"""
+    """12ヶ月モメンタム（直近1ヶ月を除く）。
+
+    **定義は `strategy/momentum.py` から取る。** ここで書き直すと、測っている
+    ものとライブで動くものが別々に育つ（CLAUDE.md「レイヤーの責務」）。
+    """
     close = frame["close"].astype(float)
-    return close.shift(21) / close.shift(252) - 1.0
+    return close.shift(MOMENTUM_SKIP_BARS) / close.shift(MOMENTUM_LOOKBACK_BARS) - 1.0
 
 
 def _load(path: str) -> Dict[str, pd.DataFrame]:

@@ -35,6 +35,11 @@ REASON_NONE: str = "NONE"
 # detect_exit_signal自体はこの理由を返さない（時刻を扱わない価格ベースの判定のため）。
 REASON_EOD_FLATTEN: str = "EOD_FLATTEN"
 
+# 保有日数の満期による決済（横断モメンタム）。**利確・損切りと別の理由にする。**
+# 同じ名前にすると、trade_journal の集計で「値幅で降りた」ものと
+# 「時間で降りた」ものが混ざり、どちらの設計が効いたのか読めなくなる。
+REASON_MOMENTUM_REBALANCE: str = "MOMENTUM_REBALANCE"
+
 
 @dataclass
 class ExitSignalResult:

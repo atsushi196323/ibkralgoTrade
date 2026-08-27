@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from backtest.csv_source import load_bars_from_csv
+from strategy.momentum import MOMENTUM_LOOKBACK_BARS, MOMENTUM_SKIP_BARS
 from backtest.signal_study import (
     SignalFn,
     add_cross_sectional_percentile,
@@ -141,11 +142,11 @@ CS_MOMENTUM_COLUMN: str = "cs_momentum_rank"
 def momentum_12_1_value(frame: pd.DataFrame) -> pd.Series:
     """12ヶ月モメンタム（直近1ヶ月を除く）。横断ランクの元になる値。
 
-    直近1ヶ月を除くのは短期反転を避けるためで、文献の標準的な定義に合わせてある。
-    値はその行までの情報だけで決まる（`shift`）。
+    **定義は `strategy/momentum.py` から取る。** ここで書き直すと、測っている
+    ものとライブで動くものが別々に育つ（CLAUDE.md「レイヤーの責務」）。
     """
     close = frame["close"].astype(float)
-    return close.shift(21) / close.shift(252) - 1.0
+    return close.shift(MOMENTUM_SKIP_BARS) / close.shift(MOMENTUM_LOOKBACK_BARS) - 1.0
 
 
 def _cs_momentum_between(frame: pd.DataFrame, low: float, high: float) -> np.ndarray:

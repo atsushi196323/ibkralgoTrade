@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from core.market_hours import (
+    count_trading_days_between,
     is_day_trade_flatten_time,
     is_japan_market_holiday,
     is_japan_regular_trading_hours,
@@ -250,3 +251,34 @@ def test_is_us_trading_day_rejects_weekends_and_holidays(closed_day) -> None:
     `holidays` パッケージへ委譲していることの確認でもある。
     """
     assert is_us_trading_day(closed_day) is False
+
+
+# --- 保有期間を営業日で数える -----------------------------------------------------
+
+
+def test_trading_days_skip_weekends_and_holidays():
+    """暦日ではなく取引日を数えること。
+
+    保有期間を暦日で数えると、週末と祝日のぶんだけ早く満期になり、営業日で
+    測ったバックテストと前提がずれる（60営業日は暦でおよそ84日）。
+    """
+    # 2026-08-10(月) の翌日から 2026-08-14(金) まで = 火水木金の4日。
+    assert count_trading_days_between(date(2026, 8, 10), date(2026, 8, 14)) == 4
+    # 週末をまたぐと、暦7日でも取引日は5日。
+    assert count_trading_days_between(date(2026, 8, 10), date(2026, 8, 17)) == 5
+
+
+def test_the_start_day_itself_is_not_counted():
+    """建玉日そのものを数えないこと（建てた当日は保有0日）。"""
+    assert count_trading_days_between(date(2026, 8, 10), date(2026, 8, 10)) == 0
+
+
+def test_a_reversed_range_is_zero_rather_than_negative():
+    """逆順で負の値を返さないこと。負だと満期判定が常に偽になる。"""
+    assert count_trading_days_between(date(2026, 8, 27), date(2026, 8, 10)) == 0
+
+
+def test_a_holiday_is_not_counted():
+    """独立記念日(2026-07-03が振替)を数えないこと。"""
+    # 2026-07-02(木) の翌日から 2026-07-06(月) まで。7/3は振替休場。
+    assert count_trading_days_between(date(2026, 7, 2), date(2026, 7, 6)) == 1

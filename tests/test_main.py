@@ -4,7 +4,7 @@ import asyncio
 import logging
 import signal
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
@@ -28,6 +28,7 @@ from execution.position_manager import (
     PositionManager,
     STRATEGY_TYPE_DAY,
     STRATEGY_TYPE_GROWTH,
+    STRATEGY_TYPE_MOMENTUM,
     STRATEGY_TYPE_SWING,
 )
 from execution.trade_journal import TradeJournal
@@ -1362,6 +1363,127 @@ def test_nothing_is_reported_when_every_symbol_fits(caplog) -> None:
         asyncio.run(_refresh_watchlist_async(ib, symbols, account_equity=1220.0))
 
     assert "監視対象から外します" not in caplog.text
+
+
+# --- 横断モメンタムのトラック（既定で無効） -------------------------------------
+
+
+def test_the_momentum_track_is_disabled_by_default() -> None:
+    """既定で無効であること。
+
+    一貫性テスト8項目のうち生存バイアス耐性が不合格なので、判定は「不採用」で
+    ある。**実装が済んでいることを稼働してよい理由にしてはならない**
+    （デイトレード・グロース株と同じ扱い）。
+    """
+    assert main_module.ENABLE_MOMENTUM_TRACK is False
+
+
+def test_no_targets_are_computed_while_the_track_is_disabled() -> None:
+    """無効な間は日足の取得すら行わないこと。
+
+    順位付けには母集団ぶんの日足が要る（1日1回・銘柄1件）。無効なのに
+    取得すると、使わないデータのためにペーシング枠を消費する。
+    """
+    ib = MagicMock()
+    caches = MagicMock()
+    caches.contracts.get_async = AsyncMock(side_effect=AssertionError("取得してはならない"))
+
+    targets = asyncio.run(
+        main_module.resolve_momentum_targets_async(ib, caches, ["AAA", "BBB"])
+    )
+
+    assert targets == []
+
+
+def test_a_thin_population_produces_no_momentum_targets(caplog) -> None:
+    """順位付けに使えた銘柄が少ない日は建てないこと。
+
+    ライブでは価格が取れない銘柄が出る。落ちた結果が少数になっても順位自体は
+    付くので、**件数を見ないと「3銘柄中の1位」を上位10%として扱う。**
+    """
+    ib = MagicMock()
+    contract = MagicMock(symbol="AAA")
+    bars = pd.DataFrame({"close": [100.0] * 300})
+    caches = MagicMock()
+    caches.contracts.get_async = AsyncMock(return_value=contract)
+    caches.daily_bars.get_async = AsyncMock(return_value=bars)
+
+    with patch("main.ENABLE_MOMENTUM_TRACK", True), caplog.at_level(logging.WARNING):
+        targets = asyncio.run(
+            main_module.resolve_momentum_targets_async(ib, caches, ["AAA", "BBB"])
+        )
+
+    assert targets == []
+    assert "届かない" in caplog.text
+
+
+def test_momentum_positions_carry_a_protective_stop_not_a_trading_stop() -> None:
+    """モメンタムの待機注文が、束縛しない幅であること。
+
+    測定は決済ルールを持たない（60日で降りるだけ）。狭い損切りを置くと
+    **測定と別の戦略になる**——降りる理由が時間ではなく値幅になる。
+    """
+    params = main_module.EXIT_PARAMS_BY_STRATEGY_TYPE[STRATEGY_TYPE_MOMENTUM]
+    swing = main_module.EXIT_PARAMS_BY_STRATEGY_TYPE[STRATEGY_TYPE_SWING]
+
+    assert params.stop_loss_pct > swing.stop_loss_pct * 4
+    assert params.max_hold_days == main_module.MOMENTUM_CONFIG.hold_days
+    # トレーリングは掛けない（高値からの下落で降りるのは値幅ベースの決済）。
+    assert params.trailing_stop_pct == 0.0
+
+
+def test_only_the_momentum_track_exits_on_maturity() -> None:
+    """満期による決済を、他のトラックへ波及させないこと。
+
+    `max_hold_days` を持つのはモメンタムだけである。スイングに満期が付くと
+    持ち越し前提の戦略が別物になる。
+    """
+    for strategy_type, params in main_module.EXIT_PARAMS_BY_STRATEGY_TYPE.items():
+        if strategy_type == STRATEGY_TYPE_MOMENTUM:
+            assert params.max_hold_days is not None
+        else:
+            assert params.max_hold_days is None
+
+
+def test_maturity_is_counted_in_trading_days_not_calendar_days() -> None:
+    """満期を営業日で数えること。
+
+    暦日で数えると週末と祝日のぶんだけ早く降り、営業日で測ったバックテストと
+    前提がずれる（60営業日は暦でおよそ84日）。
+    """
+    position = MagicMock(
+        symbol="AAA", strategy_type=STRATEGY_TYPE_MOMENTUM,
+        entry_date="2026-06-01T13:30:00+00:00",
+    )
+    # 暦で60日後は2026-07-31だが、営業日では約41日しか経っていない。
+    not_yet = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+    assert main_module._momentum_position_is_matured(position, not_yet) is False
+
+    later = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+    assert main_module._momentum_position_is_matured(position, later) is True
+
+
+def test_an_unreadable_entry_date_does_not_count_as_matured(caplog) -> None:
+    """建玉日時が読めないときに満期へ倒さないこと。
+
+    「分からない」を「満期」として扱うと、建てた直後に決済しうる。
+    """
+    position = MagicMock(
+        symbol="AAA", strategy_type=STRATEGY_TYPE_MOMENTUM, entry_date=None,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert main_module._momentum_position_is_matured(position) is False
+    assert "満期を判定できません" in caplog.text
+
+
+def test_a_swing_position_never_matures() -> None:
+    position = MagicMock(
+        symbol="AAA", strategy_type=STRATEGY_TYPE_SWING,
+        entry_date="2020-01-01T13:30:00+00:00",
+    )
+
+    assert main_module._momentum_position_is_matured(position) is False
 
 
 def test_fallback_watchlist_has_no_duplicates() -> None:

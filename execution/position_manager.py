@@ -41,6 +41,12 @@ STRATEGY_TYPE_DAY: str = "day"
 # 決済パラメータは strategy_type で引くので、混ぜると建玉ごとに
 # どちらの幅で決済すべきかが分からなくなる（main.EXIT_PARAMS_BY_STRATEGY_TYPE）。
 STRATEGY_TYPE_GROWTH: str = "growth"
+
+# 横断ランクのモメンタム。**決済が値幅ではなく保有日数で決まる**ため、
+# スイング/グロースと同じ種別にしてはならない（main.EXIT_PARAMS_BY_STRATEGY_TYPE
+# はこの値で決済パラメータを引く）。状態ファイルに永続化されるので、
+# 持ち越した建玉でも満期の判定が復元できる。
+STRATEGY_TYPE_MOMENTUM: str = "momentum"
 # ブローカー側で発見した未追跡ポジションなど、どちらのシグナルで
 # 建てられたか不明な場合に使う。
 STRATEGY_TYPE_UNKNOWN: str = "unknown"

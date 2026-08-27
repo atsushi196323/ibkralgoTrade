@@ -6,7 +6,7 @@
 実装に任せる方が安全なため。
 """
 
-from datetime import date, datetime, time
+from datetime import date, timedelta, datetime, time
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -72,6 +72,27 @@ def is_us_trading_day(check_date: Optional[date] = None) -> bool:
     if target.weekday() >= 5:
         return False
     return not is_us_market_holiday(target)
+
+
+def count_trading_days_between(start: date, end: date) -> int:
+    """start(除く)からend(含む)までの米国の取引日数。
+
+    **暦日ではなく営業日で数える。** 保有期間を暦日で数えると、週末と祝日の
+    ぶんだけ早く満期になり、営業日で測ったバックテストと前提がずれる
+    （60営業日は暦でおよそ84日）。
+
+    `end` が `start` 以前なら0。祝日の判定は `holidays` パッケージへ委譲する
+    （移動祝日と振替休日を自前計算しない）。
+    """
+    if end <= start:
+        return 0
+    days = 0
+    current = start + timedelta(days=1)
+    while current <= end:
+        if is_us_trading_day(current):
+            days += 1
+        current += timedelta(days=1)
+    return days
 
 
 def is_japan_market_holiday(check_date: Optional[date] = None) -> bool:

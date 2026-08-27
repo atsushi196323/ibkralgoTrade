@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 from backtest.csv_source import load_bars_from_csv
+from strategy.momentum import MOMENTUM_LOOKBACK_BARS, MOMENTUM_SKIP_BARS
 from backtest.signal_study import add_cross_sectional_percentile
 from backtest.survivorship import (
     UNIFORM_TOP_SHARE,
@@ -52,8 +53,9 @@ def _load(path: str) -> Dict[str, pd.DataFrame]:
 
 
 def momentum_12_1(frame: pd.DataFrame) -> pd.Series:
+    """定義は `strategy/momentum.py` から取る（測定とライブを同一にするため）。"""
     close = frame["close"].astype(float)
-    return close.shift(21) / close.shift(252) - 1.0
+    return close.shift(MOMENTUM_SKIP_BARS) / close.shift(MOMENTUM_LOOKBACK_BARS) - 1.0
 
 
 def collect_period_returns(
