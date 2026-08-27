@@ -100,6 +100,30 @@ def select_targets(
     return eligible[: max(0, config.slots)]
 
 
+def select_by_turnover(
+    turnovers: Dict[str, float], size: int,
+) -> List[str]:
+    """直近の売買代金が大きい順に `size` 銘柄を返す（母集団の絞り込み）。
+
+    **成績と無関係な軸で絞ること。** 売買代金は流動性の指標であり、
+    2026-08-27の測定では上位100〜400のどこで切っても結論が変わらなかった。
+    成績を見てサイズや銘柄を選ぶと、それ自体が過剰最適化になる。
+
+    **売買代金は `終値 × 出来高` なので、値上がりした銘柄は価格の分だけ
+    機械的に増える。** 上位N件を採る操作には、モメンタムと相関する選択が
+    弱く混ざっている（未検証の懸念として `CLAUDE.md` に記録済み）。
+
+    値が読めない銘柄は落とす。順位を付けられないものを残すと、
+    「売買代金が最小」として扱うか「最大」として扱うかで結果が変わる。
+    """
+    ranked = [
+        (symbol, value) for symbol, value in turnovers.items()
+        if value is not None and value == value and value > 0
+    ]
+    ranked.sort(key=lambda row: row[1], reverse=True)
+    return [symbol for symbol, _ in ranked[: max(0, size)]]
+
+
 def is_rebalance_due(bars_held: int, config: MomentumConfig = MomentumConfig()) -> bool:
     """保有日数が満期に達したか。
 

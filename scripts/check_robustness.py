@@ -37,7 +37,7 @@ from backtest.survivorship import annualised_death_rate, break_even_death_rate
 logger = logging.getLogger(__name__)
 
 MIN_BARS: int = 400
-MOMENTUM_TOP_PCT: float = 0.10
+MOMENTUM_TOP_PCT: float = 0.10  # --top-pct で上書きできる
 RANK_COLUMN: str = "cs_momentum_rank"
 PHASES: Tuple[int, ...] = (0, 10, 20, 30, 40, 50)
 # 現実の「株主価値がゼロになる」上場廃止率の上限側（`scripts/check_survivorship`）。
@@ -72,6 +72,7 @@ TURNOVER_WINDOW_BARS: int = 60
 
 def _periods(
     bars: Dict[str, pd.DataFrame], hold: int, offset: int, universe_size: int = 0,
+    min_population: int = 100,
 ) -> List[Tuple[pd.Timestamp, Dict[str, float], List[float]]]:
     """非重複リバランスの各期で (日付, {銘柄: 順位と騰落率}, 母集団の騰落率) を返す。
 
@@ -144,7 +145,7 @@ def _periods(
             if effective is not None and np.isfinite(effective):
                 ranked[symbol] = float(effective)
                 changes[symbol] = change
-        if len(everyone) >= 100 and len(ranked) >= 100:
+        if len(everyone) >= min_population and len(ranked) >= min_population:
             out.append((pd.Timestamp(day), {s: (ranked[s], changes[s]) for s in ranked}, everyone))
     return out
 
@@ -187,6 +188,16 @@ def build_parser() -> argparse.ArgumentParser:
              "規模でもエッジが残るかを見る",
     )
     parser.add_argument(
+        "--top-pct", type=float, default=MOMENTUM_TOP_PCT,
+        help="上位何割を保有するか。**成績を見て刻み直してはならない**"
+             "（母集団を小さくしたときに保有件数を確保する用途に限る）",
+    )
+    parser.add_argument(
+        "--min-population", type=int, default=100,
+        help="1期あたりの母集団の下限。**下げると横断ランクの意味が薄れる**"
+             "（20銘柄中の上位10%は2銘柄で、測定した構成ではない）",
+    )
+    parser.add_argument(
         "--no-prior", action="store_true",
         help="事前の根拠が無い仮説として判定する（新しい仮説はまずこちらで測ること）",
     )
@@ -201,6 +212,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not bars:
         print(f"{args.csv_dir} に検証できる銘柄がありません。", file=sys.stderr)
         return 1
+    global MOMENTUM_TOP_PCT
+    MOMENTUM_TOP_PCT = args.top_pct
     bars = add_cross_sectional_percentile(bars, momentum_12_1, RANK_COLUMN)
     scope = (
         f"全{len(bars)}件" if args.universe_size <= 0
@@ -212,19 +225,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     # **時系列で並べ直す。** 位相ごとに連結したままだと、部分期間の分割が
     # 「リストの中央」になって暦の中央にならない（前半・後半が混ざる）。
     base = sorted(
-        (p for phase in PHASES for p in _periods(bars, args.hold, phase, args.universe_size)),
+        (p for phase in PHASES for p in _periods(bars, args.hold, phase, args.universe_size, args.min_population)),
         key=lambda row: row[0],
     )
 
     # 1. 保有期間
     by_horizon = {}
     for horizon in args.horizons:
-        rows = [p for phase in PHASES for p in _periods(bars, horizon, phase, args.universe_size)]
+        rows = [p for phase in PHASES for p in _periods(bars, horizon, phase, args.universe_size, args.min_population)]
         by_horizon[horizon] = float(np.mean(_bucket_excess(rows, 1.0 - MOMENTUM_TOP_PCT, 1.01)))  # 対数
 
     # 2. 位相
     by_phase = [
-        float(np.mean(_bucket_excess(_periods(bars, args.hold, phase, args.universe_size), 1.0 - MOMENTUM_TOP_PCT, 1.01)))
+        float(np.mean(_bucket_excess(_periods(bars, args.hold, phase, args.universe_size, args.min_population), 1.0 - MOMENTUM_TOP_PCT, 1.01)))
         for phase in PHASES
     ]
 
@@ -241,8 +254,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         float(np.mean(_bucket_excess(base, -0.01, 0.10))),
     ]
 
+    if not base:
+        # **落ちるのではなく理由を出す。** 母集団を絞りすぎると1期も作れず、
+        # 以前はここで AttributeError になっていた（何が起きたか読めない）。
+        print(
+            f"母集団の下限({args.min_population}件)を満たす期が1つもありません。"
+            f"--universe-size {args.universe_size} は下限より小さい可能性があります。"
+            "--min-population を下げれば測れますが、**横断ランクの意味は薄れます**"
+            f"（{args.universe_size}銘柄中の上位{MOMENTUM_TOP_PCT*100:.0f}%は"
+            f"{max(1, int(args.universe_size * MOMENTUM_TOP_PCT))}銘柄です）。",
+            file=sys.stderr,
+        )
+        return 1
+
     # 5. 部分期間（`base` は暦順に並べてある）
-    midpoint = base[len(base) // 2][0] if base else None
+    midpoint = base[len(base) // 2][0]
     halves = {
         f"前半(〜{midpoint.date()})": float(np.mean(
             _bucket_excess([p for p in base if p[0] <= midpoint], 1.0 - MOMENTUM_TOP_PCT, 1.01))),

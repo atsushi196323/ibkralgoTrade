@@ -1368,6 +1368,111 @@ def test_nothing_is_reported_when_every_symbol_fits(caplog) -> None:
 # --- 横断モメンタムのトラック（既定で無効） -------------------------------------
 
 
+def test_momentum_targets_are_computed_once_per_trading_day() -> None:
+    """目標の算出を取引日1回に絞ること。
+
+    順位の元になる日足は取引日ごとに1本しか増えず `DailyBarCache` も取引日単位で
+    キャッシュするので、サイクルごとに計算し直しても結果は同じで、母集団ぶんの
+    ループだけが繰り返される（母集団は数百件ありうる）。
+    """
+    ib = MagicMock()
+    caches = MagicMock()
+    main_module._momentum_targets_for_day = (None, [])
+
+    with patch("main.resolve_momentum_targets_async", new=AsyncMock(return_value=["AAA"])) as mock:
+        for _ in range(3):
+            targets = asyncio.run(
+                main_module.momentum_targets_for_today_async(ib, caches, ["AAA", "BBB"])
+            )
+
+    assert targets == ["AAA"]
+    assert mock.await_count == 1
+
+
+def test_momentum_targets_are_recomputed_on_the_next_trading_day() -> None:
+    """取引日が変わったら捨てること。
+
+    持ち越すと、順位が前日のまま固定された目標で建て続けることになる。
+    """
+    ib, caches = MagicMock(), MagicMock()
+    main_module._momentum_targets_for_day = (None, [])
+    monday = datetime(2026, 8, 24, 18, 0, tzinfo=timezone.utc)
+    tuesday = datetime(2026, 8, 25, 18, 0, tzinfo=timezone.utc)
+
+    with patch("main.resolve_momentum_targets_async", new=AsyncMock(return_value=["AAA"])) as mock:
+        asyncio.run(main_module.momentum_targets_for_today_async(ib, caches, ["AAA"], monday))
+        asyncio.run(main_module.momentum_targets_for_today_async(ib, caches, ["AAA"], tuesday))
+
+    assert mock.await_count == 2
+
+
+def test_a_momentum_target_is_entered_without_a_pullback_signal(trade_journal) -> None:
+    """モメンタムの目標を、押し目の判定を経由せずに建てること。
+
+    押し目は「移動平均から下方乖離したか」、モメンタムは「その日の順位が
+    上位か」を問う。両方を満たすことを条件にすると、測定した戦略とは別のものに
+    なる（実測は押し目の条件を課していない）。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    # 横ばい＝押し目シグナルは出ない。
+    flat = _make_daily_df(drop=False)
+
+    with patch("main.ENABLE_MOMENTUM_TRACK", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAA"))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=flat)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.0))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main._detect_buy_signal_async", new=AsyncMock(return_value=None)) as pullback, \
+        patch(
+            "main.place_bracket_order_async",
+            new=AsyncMock(return_value=_bracket_result(symbol="AAA", quantity=10)),
+        ):
+        asyncio.run(process_symbol_async(
+            ib, "AAA", position_manager, trade_journal, momentum_targets=["AAA"],
+        ))
+
+    assert position_manager.has_position("AAA") is True
+    assert position_manager.get_position("AAA").strategy_type == STRATEGY_TYPE_MOMENTUM
+    # 押し目の判定は呼ばれない。
+    pullback.assert_not_awaited()
+
+
+def test_a_symbol_outside_the_momentum_targets_still_needs_a_pullback_signal(
+    trade_journal,
+) -> None:
+    """目標に入っていない銘柄まで押し目判定を飛ばさないこと。
+
+    飛ばすと、監視銘柄すべてが無条件に建つ。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+
+    with patch("main.ENABLE_MOMENTUM_TRACK", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="BBB"))), \
+        patch("main._detect_buy_signal_async", new=AsyncMock(return_value=None)) as pullback:
+        asyncio.run(process_symbol_async(
+            ib, "BBB", position_manager, trade_journal, momentum_targets=["AAA"],
+        ))
+
+    assert position_manager.has_position("BBB") is False
+    pullback.assert_awaited_once()
+
+
+def test_the_universe_is_narrowed_by_turnover_before_ranking() -> None:
+    """順位を付ける前に売買代金で母集団を絞ること。
+
+    絞る前の順位を使うと、「絞った母集団に元の上位10%が何件残るか」が
+    日によって変わる。
+    """
+    from strategy.momentum import select_by_turnover
+
+    kept = select_by_turnover({"A": 10.0, "B": 30.0, "C": 20.0, "D": float("nan")}, 2)
+
+    assert kept == ["B", "C"]
+
+
 def test_the_momentum_track_is_disabled_by_default() -> None:
     """既定で無効であること。
 

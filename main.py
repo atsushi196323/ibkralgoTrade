@@ -70,7 +70,12 @@ from strategy.attention import (
     detect_rank_surges,
     has_enough_history,
 )
-from strategy.momentum import MomentumConfig, momentum_value, select_targets
+from strategy.momentum import (
+    MomentumConfig,
+    momentum_value,
+    select_by_turnover,
+    select_targets,
+)
 from strategy.pullback import (
     MarketFilterConfig,
     SignalResult,
@@ -466,10 +471,46 @@ ENABLE_MOMENTUM_TRACK: bool = False
 # 有効化するときに、ペーシングの実測とセットで決めること。
 MOMENTUM_UNIVERSE: List[str] = []
 
+# 母集団を、直近の売買代金で上位N銘柄へ毎日絞り込む（0なら絞らない）。
+#
+# **サイズは成績で決めてはならない。** 2026-08-27の測定では上位100〜400の
+# どこで切っても一貫性テストの結論が変わらなかった（`CLAUDE.md`「母集団を
+# 絞ってもエッジは残る」）ので、**運用条件で決めてよい**軸である。
+#
+# **現在の値(20)は運用者の指定であり、一貫性テストを通っていない。**
+# 2026-08-27に実測した結果:
+#
+#   母集団 100〜400 : 8項目すべて合格（年率超過 対数 +8.9〜+27.0%）
+#   母集団 20・上位10%: **測定不能**。目標が2銘柄になり、バケット平均の下限
+#                       (5銘柄)に届かず全項目が nan になる
+#   母集団 20・上位25%: 7項目合格・1項目**測定不能**。落ちるのは
+#                       **順位の単調性**——上位20%が4件・下位10%が2件で
+#                       やはり下限に届かない
+#
+# **単調性は8項目で最も強い検定である**（上位10% > 上位20% > 母集団 > 下位10%が
+# 偶然そろう確率は低く、「順位付けそのものに情報がある」ことを直接示す）。
+# 20銘柄ではその検定を**評価できない**——不合格ではなく、測れない。
+#
+# **したがってこの設定は「測って良かった構成」ではなく「測れない構成」である。**
+# `ENABLE_MOMENTUM_TRACK` が False の間は実害が無いが、有効化する前に
+# 母集団を100件以上へ戻すか、20件で測れる別の判定基準を用意すること。
+MOMENTUM_UNIVERSE_SIZE: int = 20
+
+# 売買代金を測る窓（営業日）。中央値を使うのは、1日の異常値で母集団が
+# 入れ替わるのを避けるため（`strategy.attention` が前日比ではなく中央値を
+# 使うのと同じ理由）。
+MOMENTUM_TURNOVER_WINDOW_BARS: int = 60
+
 MOMENTUM_CONFIG: MomentumConfig = MomentumConfig(
     # 上位10%・保有60営業日・同時5銘柄。**一貫性テストを通した値であり、
     # グリッド探索で選んだものではない。成績を見て刻み直してはならない。**
     top_pct=0.10, hold_days=60, slots=5,
+    # **本来は100。母集団20の指定に合わせて下げてある。**
+    # この下限は「薄い母集団の中の順位は上位10%を意味しない」という歯止めで、
+    # 下げると歯止めそのものが無くなる。**下げずに20を指定すると、毎日
+    # WARNINGを出して1銘柄も建てないだけの設定になる**ため、静かな縮退を
+    # 避ける意味でここを合わせている。母集団を戻すときはこの値も戻すこと。
+    min_symbols=20,
 )
 
 # モメンタム建玉に置く待機注文の幅。**これは利確・損切りではなく保護である。**
@@ -536,6 +577,47 @@ EXIT_PARAMS_BY_STRATEGY_TYPE: Dict[str, ExitParams] = {
 }
 
 
+def _recent_turnover(bars) -> float:
+    """直近の売買代金（終値 × 出来高）の中央値。読めなければ NaN。
+
+    中央値にするのは、1日の異常出来高で母集団が入れ替わるのを避けるためである。
+    """
+    if "volume" not in bars.columns:
+        return float("nan")
+    window = (bars["close"].astype(float) * bars["volume"].astype(float)).tail(
+        MOMENTUM_TURNOVER_WINDOW_BARS
+    )
+    return float(window.median()) if not window.empty else float("nan")
+
+
+# その取引日に算出済みのモメンタム目標。**1日1回で足りる。**
+# 順位の元になる日足は取引日ごとに1本しか増えず、`DailyBarCache` も
+# 取引日単位でキャッシュするため、サイクルごとに計算し直しても結果は同じで
+# 母集団ぶんのループだけが繰り返される。
+_momentum_targets_for_day: Tuple[Optional[str], List[str]] = (None, [])
+
+
+async def momentum_targets_for_today_async(
+    ib: IB, caches: MarketDataCaches, universe: Sequence[str],
+    now: Optional[datetime] = None,
+) -> List[str]:
+    """その取引日のモメンタム目標を返す（同じ取引日なら再計算しない）。
+
+    **取引日が変わったら捨てる。** 持ち越すと、順位が前日のまま固定された
+    目標で建て続けることになる。
+    """
+    global _momentum_targets_for_day
+
+    trading_day = (now or datetime.now(US_EASTERN)).astimezone(US_EASTERN).date().isoformat()
+    cached_day, cached_targets = _momentum_targets_for_day
+    if cached_day == trading_day:
+        return cached_targets
+
+    targets = await resolve_momentum_targets_async(ib, caches, universe)
+    _momentum_targets_for_day = (trading_day, targets)
+    return targets
+
+
 async def resolve_momentum_targets_async(
     ib: IB, caches: MarketDataCaches, universe: Sequence[str],
 ) -> List[str]:
@@ -553,6 +635,7 @@ async def resolve_momentum_targets_async(
         return []
 
     values: Dict[str, float] = {}
+    turnovers: Dict[str, float] = {}
     for symbol in universe:
         try:
             contract = await caches.contracts.get_async(ib, symbol)
@@ -569,6 +652,14 @@ async def resolve_momentum_targets_async(
         value = momentum_value(bars["close"])
         if value is not None:
             values[symbol] = value
+            turnovers[symbol] = _recent_turnover(bars)
+
+    if MOMENTUM_UNIVERSE_SIZE > 0:
+        # **順位はここで絞った後の母集団の中で付く**（select_targets が
+        # 渡された辞書の中だけで百分位を出す）。絞る前の順位を使うと、
+        # 「絞った母集団に元の上位10%が何件残るか」が日によって変わる。
+        kept = set(select_by_turnover(turnovers, MOMENTUM_UNIVERSE_SIZE))
+        values = {symbol: value for symbol, value in values.items() if symbol in kept}
 
     targets = select_targets(values, MOMENTUM_CONFIG)
     if not targets:
@@ -808,6 +899,7 @@ def _record_fill(record: Callable[[], object]) -> None:
 async def _process_entry_async(
     ib: IB, symbol: str, position_manager: PositionManager, trade_journal: TradeJournal,
     caches: MarketDataCaches,
+    momentum_targets: Sequence[str] = (),
 ) -> None:
     if position_manager.count_open_positions() >= MAX_CONCURRENT_POSITIONS:
         # **銘柄ごとではなくサイクルごとに1行だけ出す。** 条件は口座全体のもので
@@ -848,10 +940,17 @@ async def _process_entry_async(
 
     contract = await caches.contracts.get_async(ib, symbol)
 
-    signal_result = await _detect_buy_signal_async(ib, contract, symbol, caches)
-    if signal_result is None:
-        return
-    _signal, strategy_type = signal_result
+    # モメンタムの目標銘柄は**押し目の判定を経由しない。** あちらは「移動平均から
+    # 下方乖離したか」を問うもので、モメンタムは「その日の順位が上位か」を問う。
+    # 両方を満たすことを条件にすると、測定した戦略と別のものになる
+    # （実測は押し目の条件を課していない）。
+    if ENABLE_MOMENTUM_TRACK and symbol in momentum_targets:
+        strategy_type = STRATEGY_TYPE_MOMENTUM
+    else:
+        signal_result = await _detect_buy_signal_async(ib, contract, symbol, caches)
+        if signal_result is None:
+            return
+        _signal, strategy_type = signal_result
 
     quote = await get_current_price_quote_async(ib, contract)
     if quote is None:
@@ -1455,13 +1554,17 @@ def _adopt_broker_resting_prices(
 async def process_symbol_async(
     ib: IB, symbol: str, position_manager: PositionManager, trade_journal: TradeJournal,
     caches: Optional[MarketDataCaches] = None,
+    momentum_targets: Sequence[str] = (),
 ) -> None:
     caches = caches if caches is not None else MarketDataCaches()
 
     if position_manager.has_position(symbol):
         await _process_exit_async(ib, symbol, position_manager, trade_journal, caches)
     else:
-        await _process_entry_async(ib, symbol, position_manager, trade_journal, caches)
+        await _process_entry_async(
+            ib, symbol, position_manager, trade_journal, caches,
+            momentum_targets=momentum_targets,
+        )
 
 
 # 同時保有上限による見送りを、サイクルごとに1行へ絞るための印。
@@ -1487,14 +1590,37 @@ async def run_watchlist_cycle_async(
     except Exception:
         logger.exception("待機注文の突き合わせに失敗しました。決済判定は継続します。")
 
+    # モメンタムの目標は**銘柄ループの前**に決める。「その日の全銘柄の中で
+    # 上位何%か」は1銘柄では決まらないためで、これが押し目買いとの最大の
+    # 構造的な差である（`resolve_momentum_targets_async`）。
+    #
+    # **監視銘柄より後に取る。** 母集団の日足取得はペーシング枠を数百件
+    # 消費しうるので、順番を逆にすると押し目買いのシグナル判定が母集団の
+    # 取得待ちで最大2時間遅れる（「6.1」）。
+    momentum_targets: List[str] = []
+    if ENABLE_MOMENTUM_TRACK:
+        try:
+            momentum_targets = await momentum_targets_for_today_async(
+                ib, caches, MOMENTUM_UNIVERSE,
+            )
+        except Exception:
+            # 目標が出せない日は押し目買いだけで続ける。ここで落とすと、
+            # モメンタムの不調が既存トラックの決済判定まで止める。
+            logger.exception("モメンタムの目標銘柄を算出できませんでした。")
+
     # スクリーニング結果でウォッチリストが日次で入れ替わっても、既に保有中の
     # ポジションは（ウォッチリストから外れていても）決済判定を継続する必要が
     # あるため、ウォッチリストと保有中銘柄の和集合を処理対象にする。
-    symbols_to_process = list(dict.fromkeys([*watchlist, *position_manager.open_symbols()]))
+    symbols_to_process = list(dict.fromkeys([
+        *watchlist, *momentum_targets, *position_manager.open_symbols(),
+    ]))
 
     for symbol in symbols_to_process:
         try:
-            await process_symbol_async(ib, symbol, position_manager, trade_journal, caches)
+            await process_symbol_async(
+                ib, symbol, position_manager, trade_journal, caches,
+                momentum_targets=momentum_targets,
+            )
         except Exception:
             logger.exception("%s の処理中にエラーが発生しました。", symbol)
 
