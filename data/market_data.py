@@ -228,7 +228,15 @@ async def _get_streaming_price_async(
         try:
             ib.cancelMktData(contract)
         except Exception:
-            logger.debug("%s のストリーミング購読の解除に失敗しました。", contract.symbol)
+            # **DEBUGで消してはならない。** 解除に失敗した購読は張りっぱなしに
+            # なり、積み上がるとIBKRの同時購読数上限を食い潰す（「6.4」）。
+            # そうなると症状は「価格が取れない銘柄が増える」で、原因が
+            # ここだと分かる手掛かりは1行も残らない。
+            logger.warning(
+                "%s のストリーミング購読を解除できませんでした。"
+                "積み上がるとIBKRの同時購読数の上限に達します。",
+                contract.symbol, exc_info=True,
+            )
 
 
 async def _get_snapshot_price_async(ib: IB, contract: Contract) -> Optional[Tuple[float, bool]]:

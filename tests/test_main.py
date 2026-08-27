@@ -1368,6 +1368,33 @@ def test_nothing_is_reported_when_every_symbol_fits(caplog) -> None:
 # --- 横断モメンタムのトラック（既定で無効） -------------------------------------
 
 
+def test_enabling_the_track_with_an_empty_universe_is_an_error(caplog) -> None:
+    """フラグを立てたのに母集団が空なら ERROR で出すこと。
+
+    **「無効だから静か」と「有効なのに何も起きない」はまったく違う。**
+    後者を無言にすると、フラグを立てた人が原因に辿り着けない。
+    2026-08-27に同じ形の欠陥（NameError を握り潰して常に空を返す）を
+    1件踏んでいる。
+    """
+    with patch("main.ENABLE_MOMENTUM_TRACK", True), caplog.at_level(logging.ERROR):
+        targets = asyncio.run(
+            main_module.resolve_momentum_targets_async(MagicMock(), MagicMock(), [])
+        )
+
+    assert targets == []
+    assert "MOMENTUM_UNIVERSE が空" in caplog.text
+
+
+def test_a_disabled_track_stays_silent(caplog) -> None:
+    """無効な間は何も出さないこと（毎サイクル出ると意味が薄れる）。"""
+    with patch("main.ENABLE_MOMENTUM_TRACK", False), caplog.at_level(logging.INFO):
+        assert asyncio.run(
+            main_module.resolve_momentum_targets_async(MagicMock(), MagicMock(), [])
+        ) == []
+
+    assert caplog.text == ""
+
+
 def test_a_universe_wide_fetch_failure_is_reported_as_an_error(caplog) -> None:
     """母集団の取得が全滅したら ERROR で出すこと。
 

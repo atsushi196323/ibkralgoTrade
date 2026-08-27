@@ -1,6 +1,7 @@
 """data/market_data.py の単体テスト（IB呼び出しはすべてモック化）。"""
 
 import asyncio
+import logging
 from datetime import date, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,6 +9,7 @@ import pandas as pd
 import pytest
 
 from core.market_hours import US_EASTERN
+from data import market_data
 from data.market_data import (
     DEFAULT_HISTORICAL_TIMEOUT_SECONDS,
     PRICE_SOURCE_HISTORICAL,
@@ -564,3 +566,22 @@ def test_historical_bars_pass_the_timeout_through() -> None:
     ))
 
     assert ib.reqHistoricalDataAsync.await_args.kwargs["timeout"] == 300.0
+
+
+def test_a_failed_subscription_cancel_is_reported(caplog) -> None:
+    """購読の解除に失敗したらWARNINGで残すこと。
+
+    **DEBUGだと `bot.log`（INFO以上）に1行も残らない。** 解除に失敗した購読は
+    張りっぱなしになり、積み上がるとIBKRの同時購読数の上限を食い潰す（「6.4」）。
+    そうなったときの症状は「価格が取れない銘柄が増える」で、原因がここだと
+    分かる手掛かりが無くなる。
+    """
+    ib = MagicMock()
+    ib.reqMktData = MagicMock(return_value=MagicMock(marketPrice=lambda: float("nan"), close=None))
+    ib.cancelMktData = MagicMock(side_effect=RuntimeError("boom"))
+    contract = MagicMock(symbol="AAPL")
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(market_data._get_streaming_price_async(ib, contract, timeout_seconds=0.01))
+
+    assert "解除できませんでした" in caplog.text

@@ -625,7 +625,16 @@ async def resolve_momentum_targets_async(
     **価格が取れない銘柄は母集団から落ちる。** 落ちた結果 `min_symbols` を
     下回れば、その日は建てない——薄い母集団の中の順位は上位10%を意味しない。
     """
-    if not ENABLE_MOMENTUM_TRACK or not universe:
+    if not ENABLE_MOMENTUM_TRACK:
+        return []
+    if not universe:
+        # **フラグを立てたのに何も起きない状態を、無言にしてはならない。**
+        # 「無効だから静か」と「有効なのに母集団が空」はまったく違う。
+        # 直前に同じ形（`NameError` を握り潰して常に空を返す）で1件やっている。
+        logger.error(
+            "モメンタムトラックが有効ですが MOMENTUM_UNIVERSE が空です。"
+            "1銘柄も建ちません。売買代金で絞る元になる銘柄リストを設定してください。",
+        )
         return []
 
     values: Dict[str, float] = {}
