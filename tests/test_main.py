@@ -2330,6 +2330,159 @@ def test_entry_records_the_actual_fill_not_the_reference_price(trade_journal) ->
     assert position.entry_commission == pytest.approx(0.70)
 
 
+# --- 約定の乖離の記録（想定価格 vs 実約定） -------------------------------------
+
+
+def test_an_entry_records_the_gap_between_the_reference_price_and_the_fill(
+    trade_journal, fill_log,
+) -> None:
+    """建てたときの参照価格と実約定のずれ、そして待機注文が実際に置かれた
+    位置を記録すること。
+
+    **遅延データの参照価格は実約定と数%ずれる。** そのずれがそのまま逆指値の
+    位置のずれになり、1トレードのリスクが設計値(1%)を超える。決済単位の
+    `trade_journal.csv` には参照価格が残らないので、この記録が無いと
+    「意図した -5% のはずの逆指値が、建値から見て -6.3% に並んでいる」ことに
+    気付けない（2026-08-05のAMBQ）。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    daily_df = _make_daily_df(drop=True)
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.0))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
+        patch(
+            "main.place_bracket_order_async",
+            new=AsyncMock(return_value=BracketResult(
+                symbol="AAPL", quantity=200, stop_price=95.0, take_profit_price=110.0,
+                oca_group="OCA_AAPL", dry_run=False, fill_price=101.25, commission=0.70,
+            )),
+        ):
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    records = fill_log.load()
+    assert len(records) == 1
+    record = records[0]
+    assert record.event == "entry"
+    assert record.intended_price == pytest.approx(100.0)
+    assert record.fill_price == pytest.approx(101.25)
+    assert record.deviation_pct == pytest.approx(1.25)
+    # 200株を1.25ドル高く買った分が、乖離による不利。
+    assert record.adverse_usd == pytest.approx(250.0)
+    # 参照価格ベースで置かれた逆指値(95.00)は、実約定(101.25)から見ると
+    # 設計の -5% ではなく -6.17% の位置にある。
+    assert record.effective_stop_pct == pytest.approx(-6.17, abs=0.01)
+    assert record.designed_stop_pct == pytest.approx(-5.0)
+    # 価格の取得経路と鮮度も残す（乖離の原因が遅延データかスリッページか）。
+    assert record.is_stale is False
+
+
+def test_a_resting_exit_records_the_order_price_as_the_intended_price(
+    trade_journal, fill_log,
+) -> None:
+    """待機注文の約定は、板に置いてあった値段を想定として記録すること。
+
+    逆指値はトリガー後に成行へ変わるため値段が保証されない。ここの乖離が
+    そのスリッページそのもので、観測価格を想定にするとポーリング間隔による
+    遅れと混ざって切り分けられなくなる。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=10, risk_per_share=5.0,
+        strategy_type=STRATEGY_TYPE_SWING,
+        stop_price=95.0, take_profit_price=110.0, oca_group="OCA_AAPL",
+    )
+    # 逆指値95.00がトリガーされ、94.80まで滑って約定した。
+    resting_fill = RestingOrderFill(order_type="STP", fill_price=94.80, commission=1.00)
+
+    with patch("main.ENABLE_REAL_ORDERS", True), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=94.0)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch("main.find_filled_resting_exit", return_value=resting_fill), \
+        patch("main.place_market_order_async", new=AsyncMock()):
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    record = fill_log.load()[0]
+    assert record.event == "exit"
+    assert record.order_type == "STP"
+    # 観測価格(94.0)ではなく、置いてあった逆指値(95.0)が想定。
+    assert record.intended_price == pytest.approx(95.0)
+    assert record.fill_price == pytest.approx(94.80)
+    # 10株を0.20ドル安く売った分が不利。
+    assert record.adverse_usd == pytest.approx(2.0)
+
+
+def test_a_bot_side_market_exit_records_the_observed_price_as_the_intended_price(
+    trade_journal, fill_log,
+) -> None:
+    """Bot側の成行決済は、判断に使った観測価格を想定として記録すること。
+
+    こちらの乖離には成行のスリッページに加えて、300秒のポーリング間隔で
+    価格を見ていることによる遅れも含まれる。待機注文の約定とは性質が違うので
+    `order_type` で区別できるようにしてある。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    position_manager.open_position(
+        "AAPL", entry_price=100.0, quantity=10, risk_per_share=5.0,
+        strategy_type=STRATEGY_TYPE_SWING,
+        stop_price=95.0, take_profit_price=110.0, oca_group="OCA_AAPL",
+    )
+    # 高値106.0から-5%のトレーリングに掛かる位置まで下げた。
+    position_manager.update_highest_price("AAPL", 106.0)
+
+    exit_result = OrderResult(
+        symbol="AAPL", action="SELL", quantity=10, order_type="MKT",
+        dry_run=False, fill_price=100.30, commission=1.00,
+    )
+
+    with patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("main.get_current_price_async", new=AsyncMock(return_value=100.50)), \
+        patch("main.get_usd_jpy_rate_async", new=AsyncMock(return_value=150.0)), \
+        patch("main.cancel_bracket_orders_async", new=AsyncMock()), \
+        patch("main.place_market_order_async", new=AsyncMock(return_value=exit_result)):
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    record = fill_log.load()[0]
+    assert record.event == "exit"
+    assert record.order_type == "MKT"
+    assert record.intended_price == pytest.approx(100.50)
+    assert record.fill_price == pytest.approx(100.30)
+    assert record.adverse_usd == pytest.approx(2.0)
+
+
+def test_a_failure_to_record_a_fill_does_not_break_the_entry(trade_journal) -> None:
+    """約定記録が書けなくても、建玉の記録と発注は通ること。
+
+    これは観測専用の記録であり、書けなかったことで売買を止めてはならない。
+    止めると、観測を足したせいで建玉が無防備になる。
+    """
+    ib = MagicMock()
+    position_manager = PositionManager()
+    daily_df = _make_daily_df(drop=True)
+    broken = MagicMock()
+    broken.record_entry.side_effect = OSError("disk full")
+
+    with patch("main.FILL_LOG", broken), \
+        patch("data.cache.qualify_stock_async", new=AsyncMock(return_value=MagicMock(symbol="AAPL"))), \
+        patch("data.cache.get_historical_bars_async", new=AsyncMock(return_value=daily_df)), \
+        patch("main.get_current_price_quote_async", new=AsyncMock(return_value=_fresh_quote(100.0))), \
+        patch("main.get_account_equity_async", new=AsyncMock(return_value=100_000.0)), \
+        patch("main.get_settled_cash_async", new=AsyncMock(return_value=100_000.0)), \
+        patch(
+            "main.place_bracket_order_async",
+            new=AsyncMock(return_value=_bracket_result(quantity=200)),
+        ):
+        asyncio.run(process_symbol_async(ib, "AAPL", position_manager, trade_journal))
+
+    assert position_manager.has_position("AAPL") is True
+
+
 def test_rejected_entry_order_does_not_create_a_local_position(trade_journal) -> None:
     """注文が拒否されたらローカルに建玉を記録しないこと。
 

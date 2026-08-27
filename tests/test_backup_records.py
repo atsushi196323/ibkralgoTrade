@@ -19,13 +19,14 @@ def _setup(tmp_path, journal: str = "a,b\n1,2\n"):
     _write(os.path.join(source, "trade_journal.csv"), journal)
     _write(os.path.join(source, "positions.json"), "{}")
     _write(os.path.join(source, "turnover_ranks.json"), "{}")
+    _write(os.path.join(source, "fills.jsonl"), '{"symbol": "INTC"}\n')
     # 大きいうえに同じ出来事がローテーションで残るので、控えの対象ではない。
     _write(os.path.join(source, "bot.log"), "x" * 1000)
     return source, os.path.join(tmp_path, "backups")
 
 
 def test_only_the_records_that_cannot_be_regenerated_are_copied(tmp_path) -> None:
-    """再生成できない3ファイルだけを控えること（bot.log は対象外）。"""
+    """再生成できない記録だけを控えること（bot.log は対象外）。"""
     source, backup = _setup(str(tmp_path))
     day = datetime(2026, 8, 17, 17, 5, tzinfo=US_EASTERN)
 

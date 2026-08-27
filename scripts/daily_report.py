@@ -30,6 +30,7 @@ from datetime import date, datetime, timedelta, tzinfo
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 from core.market_hours import MARKET_CLOSE, US_EASTERN, is_us_market_holiday
+from execution.fill_log import DEFAULT_FILL_LOG_PATH, EVENT_ENTRY, FillLog, FillRecord
 from execution.trade_journal import DEFAULT_JOURNAL_PATH, TradeJournal, TradeRecord
 
 DEFAULT_LOG_PATH: str = "logs/bot.log"
@@ -155,6 +156,9 @@ class DayReport:
     warnings: Counter = field(default_factory=Counter)
     errors: Counter = field(default_factory=Counter)
     trades: List[TradeRecord] = field(default_factory=list)
+    # その取引日の約定（想定価格との乖離込み）。決済単位の `trades` とは粒度が
+    # 違い、1往復で2行以上になる。建てただけで決済していない日も残る。
+    fills: List[FillRecord] = field(default_factory=list)
     # 注文層の出来事。ペーパーでの実発注検証が現フェーズの主目的であり、
     # 「正しく動いた」ことは WARNING/ERROR の集計には現れないため個別に持つ。
     bracket_fills: List[dict] = field(default_factory=list)
@@ -218,8 +222,12 @@ def last_closed_trading_day(now: Optional[datetime] = None) -> date:
 
 def build_day_report(
     log_lines: Iterable[LogLine], trades: Iterable[TradeRecord], trading_day: date,
+    fills: Iterable[FillRecord] = (),
 ) -> DayReport:
     report = DayReport(trading_day=trading_day)
+    report.fills = [
+        fill for fill in fills if fill.trading_day == trading_day.isoformat()
+    ]
 
     for line in log_lines:
         if line.trading_day != trading_day:
@@ -386,6 +394,81 @@ def _counted_in_order(messages: Iterable[str]) -> List[Tuple[str, int]]:
     return [(message, counts[message]) for message in seen]
 
 
+# 実際に置かれた逆指値が設計値からこれ以上離れていたら名指しで報告する。
+# 呼値への丸め（$0.01）と実約定価格からの再計算で1ポイント未満のずれは常に出るため、
+# それを毎日報告すると本当にずれた建玉が埋もれる。実測でずれた3件（2026-08-06 INTC
+# -6.81% / 08-10 UPS -5.16% / 08-12 INTC -6.81%）はいずれも0.16ポイント以上離れている。
+_STOP_DRIFT_TOLERANCE_PCT: float = 0.15
+
+
+def _format_fills(fills: List[FillRecord]) -> str:
+    """約定の乖離（想定価格 vs 実約定）を1ブロックにまとめる。
+
+    **見るべきは平均乖離そのものより、待機注文が実際に置かれた位置である。**
+    参照価格は遅延データ由来で実約定と数%ずれるため、そのずれがそのまま
+    逆指値の位置のずれになり、1トレードのリスクが設計値を超える
+    （2026-08-10のUPSは資金の1.16%だった）。設計値から離れている建玉は
+    名指しで出す——平均に混ぜると、ずれた1件が薄まって見えなくなる。
+    """
+    lines: List[str] = ["--- 約定の乖離（想定価格 vs 実約定） ---"]
+    if not fills:
+        lines.append("なし")
+        return "\n".join(lines)
+
+    measured = [f for f in fills if f.deviation_pct is not None]
+    if measured:
+        average = sum(f.deviation_pct for f in measured) / len(measured)
+        adverse = sum(f.adverse_usd for f in measured if f.adverse_usd is not None)
+        lines.append(
+            f"{len(fills)}件（乖離を測れたもの {len(measured)}件） / "
+            f"平均乖離 {average:+.2f}% / 不利側の合計 {adverse:+.2f} USD"
+        )
+    else:
+        lines.append(f"{len(fills)}件（実約定価格が読めた約定はまだありません）")
+
+    for fill in fills:
+        label = "建て" if fill.event == EVENT_ENTRY else f"決済({fill.order_type})"
+        actual = f"{fill.fill_price:.2f}" if fill.fill_price is not None else "不明"
+        divergence = (
+            f"{fill.deviation_pct:+.2f}%" if fill.deviation_pct is not None else "乖離不明"
+        )
+        lines.append(
+            f"  {fill.symbol} {label}: 想定 {fill.intended_price:.2f} -> "
+            f"実約定 {actual} ({divergence})"
+        )
+        if fill.effective_stop_pct is not None:
+            designed = (
+                f"設計 {fill.designed_stop_pct:+.2f}%"
+                if fill.designed_stop_pct is not None else "設計不明"
+            )
+            risk = (
+                f" / リスク 資金の {fill.risk_pct_of_equity:.2f}%"
+                if fill.risk_pct_of_equity is not None else ""
+            )
+            lines.append(
+                f"    実際に置かれた逆指値: 建値から {fill.effective_stop_pct:+.2f}% "
+                f"({designed}){risk}"
+            )
+
+    drifted = [
+        f for f in fills
+        if f.effective_stop_pct is not None and f.designed_stop_pct is not None
+        and abs(f.effective_stop_pct - f.designed_stop_pct) >= _STOP_DRIFT_TOLERANCE_PCT
+    ]
+    if drifted:
+        lines.append(
+            "  ※ 逆指値が設計値から "
+            f"{_STOP_DRIFT_TOLERANCE_PCT:.2f}ポイント以上ずれた建玉があります: "
+            + ", ".join(sorted({f.symbol for f in drifted}))
+        )
+        lines.append(
+            "    参照価格が実勢とずれたまま待機注文が置かれた可能性がある。"
+            "  python -m scripts.repair_resting_prices で板を確認すること"
+            "（Botを停止してから）。"
+        )
+    return "\n".join(lines)
+
+
 def format_report(report: DayReport) -> str:
     lines: List[str] = []
     lines.append(f"===== {report.trading_day} (米国東部時間) の稼働サマリ =====")
@@ -414,6 +497,9 @@ def format_report(report: DayReport) -> str:
             )
     else:
         lines.append("なし")
+
+    lines.append("")
+    lines.append(_format_fills(report.fills))
 
     lines.append("")
     lines.append("--- 新規建て ---")
@@ -556,6 +642,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log", default=DEFAULT_LOG_PATH)
     parser.add_argument("--journal", default=DEFAULT_JOURNAL_PATH)
+    parser.add_argument("--fills", default=DEFAULT_FILL_LOG_PATH)
     parser.add_argument("--date", help="対象の取引日(YYYY-MM-DD, 米国東部時間)。省略時はログ内の直近")
     args = parser.parse_args(argv)
 
@@ -596,7 +683,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
 
     trades = TradeJournal(args.journal).load_trades()
-    report = build_day_report(log_lines, trades, trading_day)
+    fills = FillLog(args.fills).load()
+    report = build_day_report(log_lines, trades, trading_day, fills)
     if warning:
         print(warning)
         print()

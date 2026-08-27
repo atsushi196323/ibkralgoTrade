@@ -6,7 +6,7 @@ import math
 import signal
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from ib_async import IB, Stock
@@ -51,6 +51,7 @@ from execution.position_manager import (
     STRATEGY_TYPE_SWING,
 )
 from execution.position_sizing import calculate_position_size
+from execution.fill_log import FillLog
 from execution.trade_journal import TradeJournal
 from strategy.exit_signal import (
     REASON_EOD_FLATTEN,
@@ -652,6 +653,35 @@ async def _detect_buy_signal_async(
     return None
 
 
+# 約定の記録先（想定価格と実約定価格の乖離）。**観測専用であり、売買の判断には
+# 一切使わない。** `TradeJournal` のように引数で引き回していないのはそのためで、
+# あちらは日次損益サーキットブレーカーの**入力**だが、こちらは出力しかない。
+# 判断に使わないものを判断の経路へ通すと、記録が読めないことを理由に発注や
+# 決済が止まりうる（それは観測を足したせいで建玉が無防備になることを意味する）。
+#
+# インスタンス生成ではファイルもディレクトリも作らない（追記時に作る）。
+# import しただけで作業ディレクトリに logs/ を作らないためで、
+# `core.logging_setup.configure_logging` をエントリーポイントから呼ぶのと同じ理由。
+FILL_LOG = FillLog()
+
+
+def _record_fill(record: Callable[[], object]) -> None:
+    """約定記録の呼び出しを、売買の経路から隔離する。
+
+    `FillLog` 自身も書き込み失敗を握り潰すが、**隔離は呼び出し側にも要る。**
+    記録の組み立てで例外が出れば（値の取り違え・将来の改修）、それは
+    `FillLog` の中まで届かずにここで発注・決済の流れを止める。止まる場所が
+    悪く、新規建てなら「建玉はできたのにローカルへ記録されない」、決済なら
+    「待機注文を取り消した直後に落ちる」——**どちらも建玉が無防備になる**。
+
+    観測のために売買を止めないことがこの記録の前提なので、二重に囲う。
+    """
+    try:
+        record()
+    except Exception:
+        logger.exception("約定の記録に失敗しました（売買は続行します）。")
+
+
 async def _process_entry_async(
     ib: IB, symbol: str, position_manager: PositionManager, trade_journal: TradeJournal,
     caches: MarketDataCaches,
@@ -782,6 +812,26 @@ async def _process_entry_async(
         entry_commission=order_result.commission,
         entry_price_is_fill=order_result.fill_price is not None,
     )
+
+    # 参照価格と実約定のずれ、そしてその結果として待機注文が実際に置かれた
+    # 位置を残す。**遅延データの参照価格は実約定と数%ずれるため、この記録が
+    # 無いと「意図した -5%/+10% のはずの注文が、建値から見て -6.3%/+8.5% に
+    # 並んでいる」ことに気付けない**（2026-08-05のAMBQ。`execution/fill_log.py`）。
+    _record_fill(lambda: FILL_LOG.record_entry(
+        symbol=symbol,
+        quantity=order_result.quantity,
+        intended_price=price,
+        fill_price=order_result.fill_price,
+        stop_price=order_result.stop_price,
+        take_profit_price=order_result.take_profit_price,
+        designed_stop_pct=exit_params.stop_loss_pct,
+        designed_take_profit_pct=exit_params.take_profit_pct,
+        account_equity=account_equity,
+        commission=order_result.commission,
+        dry_run=order_result.dry_run,
+        quote_source=quote.source,
+        is_stale=quote.is_stale,
+    ))
 
 
 async def _clamp_quantity_to_settled_cash_async(
@@ -930,6 +980,23 @@ async def _process_exit_async(
             )
             # OCAグループの相方はIBKR側が自動で取り消すため、ここでの取り消しは不要。
             closed_position = position_manager.close_position(symbol)
+            # 想定は「板に置いてあった注文の値段」。逆指値はトリガー後に成行へ
+            # 変わるため値段が保証されず、ここの乖離がそのスリッページになる。
+            # ブローカー同期で取り込んだ建玉は値段を持たない(0)ので、乖離は
+            # 記録されず約定だけが残る。
+            _record_fill(lambda: FILL_LOG.record_exit(
+                symbol=symbol,
+                quantity=closed_position.quantity,
+                order_type=resting_fill.order_type,
+                intended_price=(
+                    closed_position.take_profit_price
+                    if resting_fill.order_type == "LMT" else closed_position.stop_price
+                ),
+                fill_price=resting_fill.fill_price,
+                commission=resting_fill.commission,
+                dry_run=False,
+                price_source=resting_fill.price_source,
+            ))
             await _record_closed_trade(
                 ib, trade_journal, closed_position, resting_fill.fill_price, reason, pnl_pct,
                 exit_commission=resting_fill.commission,
@@ -991,6 +1058,7 @@ async def _process_exit_async(
         exit_price = exit_result.fill_price if exit_result.fill_price is not None else price
         pnl_pct = (exit_price - position.entry_price) / position.entry_price * 100.0
         closed_position = position_manager.close_position(symbol)
+        _record_market_exit_fill(closed_position, price, exit_result)
         await _record_closed_trade(
             ib, trade_journal, closed_position, exit_price, REASON_EOD_FLATTEN, pnl_pct,
             exit_commission=exit_result.commission,
@@ -1019,10 +1087,29 @@ async def _process_exit_async(
     exit_price = exit_result.fill_price if exit_result.fill_price is not None else price
     pnl_pct = (exit_price - position.entry_price) / position.entry_price * 100.0
     closed_position = position_manager.close_position(symbol)
+    _record_market_exit_fill(closed_position, price, exit_result)
     await _record_closed_trade(
         ib, trade_journal, closed_position, exit_price, result.reason, pnl_pct,
         exit_commission=exit_result.commission,
     )
+
+
+def _record_market_exit_fill(closed_position, observed_price: float, exit_result) -> None:
+    """Bot側の判断で出した成行決済の約定を記録する。
+
+    想定価格には**判断に使った観測価格**を渡す。ここの乖離は成行のスリッページ
+    だけでなく、300秒のポーリング間隔で価格を見ていることによる遅れも含む
+    （待機注文の約定と性質が違うので、`order_type` で区別できるようにしてある）。
+    """
+    _record_fill(lambda: FILL_LOG.record_exit(
+        symbol=closed_position.symbol,
+        quantity=closed_position.quantity,
+        order_type="MKT",
+        intended_price=observed_price,
+        fill_price=exit_result.fill_price,
+        commission=exit_result.commission,
+        dry_run=exit_result.dry_run,
+    ))
 
 
 async def _market_exit_async(ib: IB, contract, position, reference_price: float):

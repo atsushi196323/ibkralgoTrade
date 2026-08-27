@@ -58,3 +58,22 @@ def _no_concentrated_symbol_by_default(monkeypatch):
     `patch("main.CONCENTRATED_SYMBOL", "…")` で個別に上書きすること。
     """
     monkeypatch.setattr("main.CONCENTRATED_SYMBOL", None)
+
+
+@pytest.fixture(autouse=True)
+def fill_log(tmp_path, monkeypatch):
+    """約定記録の書き込み先をテストごとの一時ディレクトリへ向ける。
+
+    `main.FILL_LOG` はモジュールレベルの実体なので、固定しないとテストが
+    作業ディレクトリの `logs/fills.jsonl` へ追記する。`configure_logging` を
+    import 時に呼ばない理由（`tests/test_logging_setup.py`）と同じで、
+    **テストが実際の運用記録のあるディレクトリを触ってはならない。**
+
+    autouse だが名前で受け取れる。乖離の記録そのものを検証するテストは
+    `fill_log` を引数に取り、`fill_log.load()` を読めばよい。
+    """
+    from execution.fill_log import FillLog
+
+    fill_log = FillLog(str(tmp_path / "fills.jsonl"))
+    monkeypatch.setattr("main.FILL_LOG", fill_log)
+    return fill_log

@@ -7,6 +7,7 @@
 
 from datetime import date, datetime, timedelta, timezone
 
+from execution.fill_log import FillRecord
 from execution.trade_journal import TradeRecord
 from scripts.daily_report import (
     build_day_report,
@@ -411,3 +412,75 @@ def test_the_tif_warning_the_bot_emits_is_the_one_the_report_parses(caplog):
     lines = _lines(f"2026-08-06 22:36:00,000 [WARNING] execution.order_manager: {emitted}")
 
     assert build_day_report(lines, [], date(2026, 8, 6)).tif_downgrades == {"INTC": "DAY"}
+
+
+# --- 約定の乖離 -----------------------------------------------------------------
+
+
+def _fill(**overrides) -> FillRecord:
+    payload = dict(
+        recorded_at="2026-08-05T23:00:00+00:00", trading_day="2026-08-05",
+        symbol="AMBQ", event="entry", action="BUY", order_type="MKT", quantity=3,
+        intended_price=66.50, fill_price=67.44, deviation_pct=1.41, adverse_usd=2.82,
+        dry_run=False,
+    )
+    payload.update(overrides)
+    return FillRecord(**payload)
+
+
+def test_a_stop_placed_away_from_its_designed_distance_is_called_out():
+    """逆指値が設計値からずれた建玉を名指しで出すこと。
+
+    参照価格が実勢とずれたまま待機注文が置かれると、1トレードのリスクが
+    設計値(1%)を超える。平均乖離に混ぜるとその1件が薄まって消えるため、
+    平均とは別に名前で出す。
+    """
+    fills = [_fill(
+        effective_stop_pct=-6.33, designed_stop_pct=-5.0, risk_pct_of_equity=1.27,
+        stop_price=63.17,
+    )]
+
+    report = build_day_report(_lines(), [], date(2026, 8, 5), fills)
+    rendered = format_report(report)
+
+    assert "AMBQ" in rendered
+    assert "-6.33%" in rendered
+    assert "設計値から" in rendered
+    assert "repair_resting_prices" in rendered
+
+
+def test_a_stop_within_the_rounding_tolerance_is_not_called_out():
+    """呼値への丸めぶんのずれを毎日報告しないこと（本当のずれが埋もれる）。"""
+    fills = [_fill(effective_stop_pct=-5.01, designed_stop_pct=-5.0, stop_price=64.07)]
+
+    rendered = format_report(build_day_report(_lines(), [], date(2026, 8, 5), fills))
+
+    assert "設計値から" not in rendered
+
+
+def test_fills_from_another_trading_day_are_not_counted():
+    """対象の取引日の約定だけを集計すること。"""
+    fills = [_fill(trading_day="2026-08-04")]
+
+    report = build_day_report(_lines(), [], date(2026, 8, 5), fills)
+
+    assert report.fills == []
+    assert "--- 約定の乖離（想定価格 vs 実約定） ---\nなし" in format_report(report)
+
+
+def test_the_average_divergence_and_the_adverse_total_are_reported():
+    """平均乖離と不利側の合計を出すこと。
+
+    往復で符号が打ち消し合わないよう、不利側は `adverse_usd` で符号を
+    揃えてある（`execution/fill_log.py`）。
+    """
+    fills = [
+        _fill(),
+        _fill(event="exit", action="SELL", order_type="STP", intended_price=63.17,
+              fill_price=62.97, deviation_pct=-0.32, adverse_usd=0.60),
+    ]
+
+    rendered = format_report(build_day_report(_lines(), [], date(2026, 8, 5), fills))
+
+    assert "2件" in rendered
+    assert "不利側の合計 +3.42 USD" in rendered
