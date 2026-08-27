@@ -12,6 +12,7 @@ from ib_async import IB, Contract, Forex, Stock
 from ib_async import util as ib_util
 
 from core.market_hours import US_EASTERN
+from core.logging_setup import should_log_once_per_trading_day
 from core.pacing import RequestPacer
 
 logger = logging.getLogger(__name__)
@@ -232,11 +233,17 @@ async def _get_streaming_price_async(
             # なり、積み上がるとIBKRの同時購読数上限を食い潰す（「6.4」）。
             # そうなると症状は「価格が取れない銘柄が増える」で、原因が
             # ここだと分かる手掛かりは1行も残らない。
-            logger.warning(
-                "%s のストリーミング購読を解除できませんでした。"
-                "積み上がるとIBKRの同時購読数の上限に達します。",
-                contract.symbol, exc_info=True,
-            )
+            #
+            # **ただし取引日1回へ絞る。** この経路は監視銘柄×毎サイクルで走るので
+            # （38銘柄×52サイクル＝1976回/日）、系統的に失敗し始めると
+            # WARNINGだけで1日2000行になり、「読むべき1行」を埋める側に回る
+            # （CLAUDE.md「3. 実行環境と設定」のログ方針）。
+            if should_log_once_per_trading_day("cancel_mkt_data", contract.symbol):
+                logger.warning(
+                    "%s のストリーミング購読を解除できませんでした。"
+                    "積み上がるとIBKRの同時購読数の上限に達します。",
+                    contract.symbol, exc_info=True,
+                )
 
 
 async def _get_snapshot_price_async(ib: IB, contract: Contract) -> Optional[Tuple[float, bool]]:

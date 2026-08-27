@@ -1931,6 +1931,13 @@ MAX_WATCHLIST_SIZE × (600 / POLL_INTERVAL_SECONDS) ≦ 60
      と2つの条件を混ぜており、フラグを立てたのに母集団が空の場合も無言だった。
      **前者は静かでよいが、後者はフラグを立てた人が原因に辿り着けない。**
 
+   **引き上げた WARNING は、頻度も同時に決めること。** `cancelMktData` の経路は
+   監視銘柄×毎サイクルで走るので（38銘柄×52サイクル＝**1976回/日**）、絞らないと
+   系統的な失敗が1日2000行のWARNINGになり、**「読むべき1行」を埋める側へ回る**。
+   取引日1回へ絞る仕組みは `core.logging_setup.should_log_once_per_trading_day` にある
+   （`main` ではなくここに置くのは、`data/` からも使うため——`data/` が `main` を
+   import すると依存が逆流する）。
+
    `tests/test_main.py` の `test_enabling_the_track_with_an_empty_universe_is_an_error` /
    `test_a_disabled_track_stays_silent`、`tests/test_market_data.py` の
    `test_a_failed_subscription_cancel_is_reported` が番人。

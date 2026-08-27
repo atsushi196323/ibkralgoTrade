@@ -15,11 +15,13 @@
 """
 
 import logging
+from datetime import datetime
 import logging.handlers
 import re
 import sys
 from pathlib import Path
-from typing import Optional
+from core.market_hours import US_EASTERN
+from typing import Optional, Set, Tuple
 
 DEFAULT_LOG_PATH: str = "logs/bot.log"
 
@@ -200,3 +202,49 @@ def configure_logging(
         stream_handler.addFilter(noise_filter)
         stream_handler.addFilter(escape_filter)
         root.addHandler(stream_handler)
+
+
+# 繰り返し出るログを、取引日ごとに1回へ絞るための印。
+#
+# **本プロジェクトのログは、繰り返しで埋まると目的を失う。** 2026-08-17の
+# VPSログ(2773行)では、同時保有上限の見送りだけで1386行＝全体の50%を占め、
+# その日の「なぜ1件も建たなかったのか」の答えが1行だけ埋もれていた
+# （CLAUDE.md「3. 実行環境と設定」のログ方針）。
+#
+# `main` ではなくここに置くのは、`data/` からも使うためである
+# （`data/` が `main` を import すると依存が逆流する）。
+_once_per_day_logged: Tuple[Optional[str], Set[Tuple[str, str]]] = (None, set())
+
+
+def should_log_once_per_trading_day(
+    kind: str, symbol: str, now: Optional[datetime] = None,
+) -> bool:
+    """その取引日にまだ記録していない (種類, 銘柄) なら True を返す。
+
+    **取引日が変わったら印を捨てる。** 持ち越すと翌日の1行目が出なくなり、
+    条件が変わって状況が変わったことに気付けなくなる。
+
+    `kind` で種類を分けるのは、同じ銘柄に別の理由が同時に起きうるためである
+    （株価帯の除外と長期トレンドの見送りなど）。まとめると片方しか出ない。
+
+    取引日の区切りは**米国東部時間**で採る（市場時間・クールダウン・控えと同じ）。
+    """
+    global _once_per_day_logged
+
+    trading_day = (now or datetime.now(US_EASTERN)).astimezone(US_EASTERN).date().isoformat()
+    logged_day, logged_keys = _once_per_day_logged
+    if logged_day != trading_day:
+        logged_keys = set()
+        _once_per_day_logged = (trading_day, logged_keys)
+
+    key = (kind, symbol)
+    if key in logged_keys:
+        return False
+    logged_keys.add(key)
+    return True
+
+
+def reset_once_per_day_log_marks() -> None:
+    """印を捨てる（テスト用）。"""
+    global _once_per_day_logged
+    _once_per_day_logged = (None, set())

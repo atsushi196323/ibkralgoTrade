@@ -12,7 +12,7 @@ import pandas as pd
 from ib_async import IB, Stock
 
 from core.connection import IBKRConnection
-from core.logging_setup import configure_logging
+from core.logging_setup import configure_logging, should_log_once_per_trading_day
 from core.market_hours import count_trading_days_between, US_EASTERN, is_day_trade_flatten_time, is_regular_trading_hours
 from data.cache import ContractCache, DailyBarCache
 from data.fundamentals import run_turnover_scan_async
@@ -1786,39 +1786,10 @@ def growth_price_band(
     )
 
 
-# 株価帯で除外した銘柄を、その取引日に1度だけ記録するための印。
-# スクリーニングが失敗した日はこのフィルターが900秒ごとに再実行され
-# （`SCREENING_RETRY_INTERVAL_SECONDS`）、同じ除外が1日26回ぶん並ぶ。
-# 2026-08-12〜14のVPSログでは18銘柄×26回＝468行/日がWARNINGを占めており、
-# 「読むべき1行」を埋める側に回っていた（「3. 実行環境と設定」のログ方針）。
-# 株価帯は資金と終値から1日1回決まるので、同じ日の2回目以降は情報が無い。
-_once_per_day_logged: Tuple[Optional[str], Set[Tuple[str, str]]] = (None, set())
-
-
-def _should_log_once_per_trading_day(
-    kind: str, symbol: str, now: Optional[datetime] = None,
-) -> bool:
-    """その取引日にまだ記録していない (種類, 銘柄) なら True を返す。
-
-    取引日が変わったら印を捨てる。持ち越すと翌日の1行目が出なくなり、
-    条件が変わって監視候補が痩せたことに気付けなくなる。
-
-    `kind` で種類を分けるのは、株価帯の除外と長期トレンドの見送りが同じ銘柄に
-    同時に起きうるためである。まとめると片方しか出ない。
-    """
-    global _once_per_day_logged
-
-    trading_day = (now or datetime.now(US_EASTERN)).astimezone(US_EASTERN).date().isoformat()
-    logged_day, logged_keys = _once_per_day_logged
-    if logged_day != trading_day:
-        logged_keys = set()
-        _once_per_day_logged = (trading_day, logged_keys)
-
-    key = (kind, symbol)
-    if key in logged_keys:
-        return False
-    logged_keys.add(key)
-    return True
+# 繰り返し出るログを取引日1回へ絞る仕組みは `core.logging_setup` にある。
+# **`data/` からも使うためそちらへ置いた**（`data/` が `main` を import すると
+# 依存が逆流する）。呼び出し側の名前は変えていない。
+_should_log_once_per_trading_day = should_log_once_per_trading_day
 
 
 def _should_log_price_band_exclusion(symbol: str, now: Optional[datetime] = None) -> bool:

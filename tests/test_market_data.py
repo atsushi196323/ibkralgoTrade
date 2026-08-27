@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from core.market_hours import US_EASTERN
+from core.logging_setup import reset_once_per_day_log_marks
 from data import market_data
 from data.market_data import (
     DEFAULT_HISTORICAL_TIMEOUT_SECONDS,
@@ -581,7 +582,30 @@ def test_a_failed_subscription_cancel_is_reported(caplog) -> None:
     ib.cancelMktData = MagicMock(side_effect=RuntimeError("boom"))
     contract = MagicMock(symbol="AAPL")
 
+    reset_once_per_day_log_marks()
     with caplog.at_level(logging.WARNING):
         asyncio.run(market_data._get_streaming_price_async(ib, contract, timeout_seconds=0.01))
 
     assert "解除できませんでした" in caplog.text
+
+
+def test_a_repeated_cancel_failure_is_logged_once_per_trading_day(caplog) -> None:
+    """同じ銘柄で繰り返し失敗しても1日1行に絞ること。
+
+    この経路は監視銘柄×毎サイクルで走る（38銘柄×52サイクル＝1976回/日）。
+    絞らないと、系統的に失敗し始めたときWARNINGだけで1日2000行になり、
+    「読むべき1行」を埋める側に回る。
+    """
+    ib = MagicMock()
+    ib.reqMktData = MagicMock(return_value=MagicMock(marketPrice=lambda: float("nan"), close=None))
+    ib.cancelMktData = MagicMock(side_effect=RuntimeError("boom"))
+    contract = MagicMock(symbol="AAPL")
+
+    reset_once_per_day_log_marks()
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            asyncio.run(
+                market_data._get_streaming_price_async(ib, contract, timeout_seconds=0.01)
+            )
+
+    assert caplog.text.count("解除できませんでした") == 1

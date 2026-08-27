@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 import main as main_module
+from core.logging_setup import reset_once_per_day_log_marks
 
 from core.market_hours import US_EASTERN
 from data.market_data import PRICE_SOURCE_HISTORICAL, PRICE_SOURCE_STREAMING, PriceQuote
@@ -906,7 +907,7 @@ def test_price_band_exclusions_are_logged_once_per_trading_day(caplog) -> None:
     決まるので、同じ日の2回目以降に新しい情報は無い。
     """
     ib = MagicMock()
-    main_module._once_per_day_logged = (None, set())
+    reset_once_per_day_log_marks()
 
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
         _fallback_prices({"NORMAL": 100.0, "PRICEY": 336.91}), \
@@ -929,7 +930,7 @@ def test_untradeable_symbols_are_logged_once_per_trading_day(caplog) -> None:
     """
     ib = MagicMock()
     caches = MarketDataCaches()
-    main_module._once_per_day_logged = (None, set())
+    reset_once_per_day_log_marks()
 
     with _fallback_prices({"SHORT": 100.0}), caplog.at_level(logging.INFO):
         for _ in range(3):
@@ -945,7 +946,7 @@ def test_price_band_exclusions_are_logged_again_on_the_next_trading_day() -> Non
     持ち越すと翌日の除外が1行も出なくなり、株価帯が動いて監視候補が
     痩せたことに気付けない。
     """
-    main_module._once_per_day_logged = (None, set())
+    reset_once_per_day_log_marks()
     day1 = datetime(2026, 8, 14, 10, 0, tzinfo=US_EASTERN)
     day2 = datetime(2026, 8, 15, 10, 0, tzinfo=US_EASTERN)
 
@@ -1311,7 +1312,7 @@ def test_symbols_that_do_not_fit_the_monitoring_cap_are_named(caplog) -> None:
     **帯を通る件数は資金に比例して増えるので、増資するたびに静かに悪化する。**
     """
     ib = MagicMock()
-    main_module._once_per_day_logged = (None, set())
+    reset_once_per_day_log_marks()
     symbols = [f"SYM{i:02d}" for i in range(MAX_WATCHLIST_SIZE + 3)]
 
     # 資金1,220の帯は $6.10〜$244。全銘柄を帯の中に置く。
@@ -1339,7 +1340,7 @@ def test_the_truncation_warning_is_logged_once_per_trading_day(caplog) -> None:
     絞らないと同じ行が1日26回並び、「読むべき1行」を埋める側に回る。
     """
     ib = MagicMock()
-    main_module._once_per_day_logged = (None, set())
+    reset_once_per_day_log_marks()
     symbols = [f"SYM{i:02d}" for i in range(MAX_WATCHLIST_SIZE + 3)]
 
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
@@ -1354,7 +1355,7 @@ def test_the_truncation_warning_is_logged_once_per_trading_day(caplog) -> None:
 def test_nothing_is_reported_when_every_symbol_fits(caplog) -> None:
     """枠に収まっている日は何も出さないこと（毎日出ると意味が薄れる）。"""
     ib = MagicMock()
-    main_module._once_per_day_logged = (None, set())
+    reset_once_per_day_log_marks()
     symbols = [f"SYM{i:02d}" for i in range(MAX_WATCHLIST_SIZE)]
 
     with patch("main.screen_value_stocks_async", new=AsyncMock(return_value=[])), \
