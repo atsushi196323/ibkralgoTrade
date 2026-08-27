@@ -101,7 +101,7 @@ def select_targets(
 
 
 def select_by_turnover(
-    turnovers: Dict[str, float], size: int,
+    turnovers: Dict[str, float], size: int, min_turnover_usd: float = 0.0,
 ) -> List[str]:
     """直近の売買代金が大きい順に `size` 銘柄を返す（母集団の絞り込み）。
 
@@ -113,15 +113,23 @@ def select_by_turnover(
     機械的に増える。** 上位N件を採る操作には、モメンタムと相関する選択が
     弱く混ざっている（未検証の懸念として `CLAUDE.md` に記録済み）。
 
+    **効くのは上位に絞ることではなく、下限を切ることである**（2026-08-06の
+    層別測定: 1–100位 PF 1.26 / 201–400位 1.30 / **401位以下 1.10**）。
+    `min_turnover_usd` はその下限で、上位N件の枠に入っても流動性が細い銘柄を
+    落とす。**スプレッドの差はこの測定に入っていないので、実際の下位はこの
+    数字よりさらに悪い**——下限を切る根拠はより強く、上位に絞る根拠はより弱い。
+
     値が読めない銘柄は落とす。順位を付けられないものを残すと、
     「売買代金が最小」として扱うか「最大」として扱うかで結果が変わる。
     """
     ranked = [
         (symbol, value) for symbol, value in turnovers.items()
-        if value is not None and value == value and value > 0
+        if value is not None and value == value and value > min_turnover_usd
     ]
     ranked.sort(key=lambda row: row[1], reverse=True)
-    return [symbol for symbol, _ in ranked[: max(0, size)]]
+    return [symbol for symbol, _ in ranked[: max(0, size)]] if size > 0 else [
+        symbol for symbol, _ in ranked
+    ]
 
 
 def is_rebalance_due(bars_held: int, config: MomentumConfig = MomentumConfig()) -> bool:

@@ -9,6 +9,7 @@ import pytest
 
 from strategy.momentum import (
     MOMENTUM_LOOKBACK_BARS,
+    select_by_turnover,
     MOMENTUM_SKIP_BARS,
     MomentumConfig,
     is_rebalance_due,
@@ -131,3 +132,33 @@ def test_symbols_already_held_and_not_due_are_not_bought_again():
     plan = targets_to_trade(held=["AAA"], targets=["AAA", "BBB"], due=[])
 
     assert plan["buy"] == ["BBB"]
+
+
+# --- 流動性の下限 -----------------------------------------------------------------
+
+
+def test_thin_names_are_dropped_even_inside_the_top_n():
+    """上位N件の枠に入っていても、売買代金が下限に届かなければ落とすこと。
+
+    **効くのは上位に絞ることではなく、下限を切ることである**（2026-08-06の
+    層別測定: 1–100位 PF 1.26 / 201–400位 1.30 に対し 401位以下 1.10）。
+    件数の枠だけだと、相場が薄い日にたまたま枠内へ入った細い銘柄が混じる。
+    """
+    turnovers = {"A": 5e8, "B": 3e7, "C": 1e6}
+
+    assert select_by_turnover(turnovers, 500, min_turnover_usd=2e7) == ["A", "B"]
+
+
+def test_unreadable_turnover_is_dropped_rather_than_treated_as_zero_or_infinite():
+    """売買代金が読めない銘柄を残さないこと。
+
+    残すと「最小」として扱うか「最大」として扱うかで母集団が変わる。
+    """
+    assert select_by_turnover({"A": 5e8, "B": float("nan")}, 500) == ["A"]
+
+
+def test_a_zero_size_keeps_everything_above_the_floor():
+    """件数の上限を外しても、下限は効き続けること。"""
+    kept = select_by_turnover({"A": 5e8, "C": 1e6}, 0, min_turnover_usd=2e7)
+
+    assert kept == ["A"]
