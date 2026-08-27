@@ -37,6 +37,7 @@ from backtest.survivorship import annualised_death_rate, break_even_death_rate
 logger = logging.getLogger(__name__)
 
 MIN_BARS: int = 400
+MOMENTUM_TOP_PCT: float = 0.10
 RANK_COLUMN: str = "cs_momentum_rank"
 PHASES: Tuple[int, ...] = (0, 10, 20, 30, 40, 50)
 # 現実の「株主価値がゼロになる」上場廃止率の上限側（`scripts/check_survivorship`）。
@@ -65,26 +66,49 @@ def _load(path: str) -> Dict[str, pd.DataFrame]:
     return bars
 
 
+# 母集団を絞るときの、直近の売買代金を測る窓（営業日）。
+TURNOVER_WINDOW_BARS: int = 60
+
+
 def _periods(
-    bars: Dict[str, pd.DataFrame], hold: int, offset: int,
+    bars: Dict[str, pd.DataFrame], hold: int, offset: int, universe_size: int = 0,
 ) -> List[Tuple[pd.Timestamp, Dict[str, float], List[float]]]:
-    """非重複リバランスの各期で (日付, {銘柄: 順位と騰落率}, 母集団の騰落率) を返す。"""
+    """非重複リバランスの各期で (日付, {銘柄: 順位と騰落率}, 母集団の騰落率) を返す。
+
+    `universe_size` が正なら、**その日までの売買代金**で上位N銘柄に絞る。
+    ライブでは母集団を毎日その件数ぶん取得する必要があるので、実運用可能な
+    規模でもエッジが残るかを見るための引数である。
+
+    **絞り込みは先読みになってはならない。** 「10年通しての売買代金上位」で
+    選ぶと、後から大きくなった銘柄を最初から知っていたことになる。**その日
+    までの直近60営業日の中央値**で毎回選び直す（`RankHistoryStore` が
+    前日比ではなく中央値を使うのと同じ理由——1日の異常値で母集団が入れ替わる
+    のを避ける）。
+
+    **成績で選んではならない。** 売買代金は成績と無関係な軸であり、しかも
+    2026-08-06の測定で「上位100位と201–400位に有意差なし」と分かっている
+    （効くのは下限を切ることであって、上位に絞ることではない）。
+    """
     frames = {}
     for symbol, frame in bars.items():
+        close = frame["close"].to_numpy(float)
+        volume = (
+            frame["volume"].to_numpy(float)
+            if "volume" in frame.columns else np.full(len(close), np.nan)
+        )
         frames[symbol] = (
             pd.to_datetime(frame["date"]).dt.normalize().to_numpy(),
             frame["open" if "open" in frame.columns else "close"].to_numpy(float),
-            frame["close"].to_numpy(float),
+            close,
             frame[RANK_COLUMN].to_numpy(float),
+            close * volume,
         )
     all_days = sorted({day for days, *_ in frames.values() for day in days})
 
     out = []
     for day in all_days[252 + offset::hold]:
-        ranked: Dict[str, float] = {}
-        changes: Dict[str, float] = {}
-        everyone: List[float] = []
-        for symbol, (days, entry, close, rank) in frames.items():
+        candidates = []
+        for symbol, (days, entry, close, rank, turnover) in frames.items():
             i = int(np.searchsorted(days, day))
             if i >= len(days) or days[i] != day:
                 continue
@@ -94,10 +118,31 @@ def _periods(
             p0, p1 = entry[start], close[end]
             if not (p0 > 0 and p1 > 0):
                 continue
-            change = (p1 / p0 - 1.0) * 100.0
+            window = turnover[max(0, i - TURNOVER_WINDOW_BARS + 1): i + 1]
+            liquidity = float(np.nanmedian(window)) if len(window) else float("nan")
+            candidates.append((symbol, (p1 / p0 - 1.0) * 100.0, rank[i], liquidity))
+
+        if universe_size > 0:
+            # 売買代金が読めない銘柄は落とす（順位を付けられない）。
+            candidates = [c for c in candidates if np.isfinite(c[3])]
+            candidates.sort(key=lambda c: c[3], reverse=True)
+            candidates = candidates[:universe_size]
+
+        ranked: Dict[str, float] = {}
+        changes: Dict[str, float] = {}
+        everyone: List[float] = []
+        # **順位は絞った後の母集団の中で付け直す。** 627銘柄の中での上位10%と、
+        # 200銘柄の中での上位10%は別の集合である。付け直さないと、絞った母集団に
+        # 「元の627銘柄での上位10%」が何件残るか分からないまま測ることになる。
+        momentum = {c[0]: c[2] for c in candidates if np.isfinite(c[2])}
+        repercentiled = (
+            pd.Series(momentum).rank(pct=True).to_dict() if universe_size > 0 else None
+        )
+        for symbol, change, rank, _liquidity in candidates:
             everyone.append(change)
-            if np.isfinite(rank[i]):
-                ranked[symbol] = float(rank[i])
+            effective = repercentiled.get(symbol) if repercentiled is not None else rank
+            if effective is not None and np.isfinite(effective):
+                ranked[symbol] = float(effective)
                 changes[symbol] = change
         if len(everyone) >= 100 and len(ranked) >= 100:
             out.append((pd.Timestamp(day), {s: (ranked[s], changes[s]) for s in ranked}, everyone))
@@ -137,6 +182,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--horizons", type=int, nargs="+", default=[20, 60, 120])
     parser.add_argument("--hold", type=int, default=60, help="主判定に使う保有営業日数")
     parser.add_argument(
+        "--universe-size", type=int, default=0,
+        help="母集団を直近の売買代金で上位N銘柄に絞る（0=全件）。ライブで維持できる"
+             "規模でもエッジが残るかを見る",
+    )
+    parser.add_argument(
         "--no-prior", action="store_true",
         help="事前の根拠が無い仮説として判定する（新しい仮説はまずこちらで測ること）",
     )
@@ -152,36 +202,40 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"{args.csv_dir} に検証できる銘柄がありません。", file=sys.stderr)
         return 1
     bars = add_cross_sectional_percentile(bars, momentum_12_1, RANK_COLUMN)
-    print(f"銘柄 {len(bars)}件 / 上位10%を保有 / 非重複リバランス\n")
+    scope = (
+        f"全{len(bars)}件" if args.universe_size <= 0
+        else f"{len(bars)}件から売買代金で毎回{args.universe_size}件へ絞る"
+    )
+    print(f"母集団: {scope} / 上位{MOMENTUM_TOP_PCT*100:.0f}%を保有 / 非重複リバランス\n")
 
     per_year = 250.0 / args.hold
     # **時系列で並べ直す。** 位相ごとに連結したままだと、部分期間の分割が
     # 「リストの中央」になって暦の中央にならない（前半・後半が混ざる）。
     base = sorted(
-        (p for phase in PHASES for p in _periods(bars, args.hold, phase)),
+        (p for phase in PHASES for p in _periods(bars, args.hold, phase, args.universe_size)),
         key=lambda row: row[0],
     )
 
     # 1. 保有期間
     by_horizon = {}
     for horizon in args.horizons:
-        rows = [p for phase in PHASES for p in _periods(bars, horizon, phase)]
-        by_horizon[horizon] = float(np.mean(_bucket_excess(rows, 0.90, 1.01)))  # 対数
+        rows = [p for phase in PHASES for p in _periods(bars, horizon, phase, args.universe_size)]
+        by_horizon[horizon] = float(np.mean(_bucket_excess(rows, 1.0 - MOMENTUM_TOP_PCT, 1.01)))  # 対数
 
     # 2. 位相
     by_phase = [
-        float(np.mean(_bucket_excess(_periods(bars, args.hold, phase), 0.90, 1.01)))
+        float(np.mean(_bucket_excess(_periods(bars, args.hold, phase, args.universe_size), 1.0 - MOMENTUM_TOP_PCT, 1.01)))
         for phase in PHASES
     ]
 
     # 3. 測定空間（ここだけは3つとも見る。向きが揃うかが検定内容そのもの）
-    arithmetic = float(np.mean(_bucket_excess(base, 0.90, 1.01, "arith")))
-    log_mean = float(np.mean(_bucket_excess(base, 0.90, 1.01, "log")))
-    median = float(np.mean(_bucket_excess(base, 0.90, 1.01, "median")))
+    arithmetic = float(np.mean(_bucket_excess(base, 1.0 - MOMENTUM_TOP_PCT, 1.01, "arith")))
+    log_mean = float(np.mean(_bucket_excess(base, 1.0 - MOMENTUM_TOP_PCT, 1.01, "log")))
+    median = float(np.mean(_bucket_excess(base, 1.0 - MOMENTUM_TOP_PCT, 1.01, "median")))
 
     # 4. 単調性（上位10% > 上位20% > 母集団(=0) > 下位10%）
     buckets = [
-        float(np.mean(_bucket_excess(base, 0.90, 1.01))),
+        float(np.mean(_bucket_excess(base, 1.0 - MOMENTUM_TOP_PCT, 1.01))),
         float(np.mean(_bucket_excess(base, 0.80, 1.01))),
         0.0,
         float(np.mean(_bucket_excess(base, -0.01, 0.10))),
@@ -191,9 +245,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     midpoint = base[len(base) // 2][0] if base else None
     halves = {
         f"前半(〜{midpoint.date()})": float(np.mean(
-            _bucket_excess([p for p in base if p[0] <= midpoint], 0.90, 1.01))),
+            _bucket_excess([p for p in base if p[0] <= midpoint], 1.0 - MOMENTUM_TOP_PCT, 1.01))),
         f"後半({midpoint.date()}〜)": float(np.mean(
-            _bucket_excess([p for p in base if p[0] > midpoint], 0.90, 1.01))),
+            _bucket_excess([p for p in base if p[0] > midpoint], 1.0 - MOMENTUM_TOP_PCT, 1.01))),
     }
 
     # 7. 生存バイアス
