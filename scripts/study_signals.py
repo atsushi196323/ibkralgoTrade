@@ -28,7 +28,12 @@ import numpy as np
 import pandas as pd
 
 from backtest.csv_source import load_bars_from_csv
-from backtest.signal_study import SignalFn, build_equal_weight_index, study_signal
+from backtest.signal_study import (
+    SignalFn,
+    add_cross_sectional_percentile,
+    build_equal_weight_index,
+    study_signal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +127,57 @@ def signal_low_volatility(frame: pd.DataFrame) -> np.ndarray:
     return ((sd < 0.01) & _uptrend(close)).fillna(False).to_numpy()
 
 
+# --- 横断ランクのモメンタム -----------------------------------------------------
+# 上の `signal_momentum_12_1` は**絶対閾値**（12ヶ月で+30%以上）で測っている。
+# モメンタムのアノマリーとして頑健なのは「その日の全銘柄を順位付けして上位を買う」
+# 横断ランクの形であり、両者は別のシグナルである——絶対閾値は相場全体の水準で
+# 意味が変わり、上げ相場では母集団の大半が該当し、下げ相場では誰も該当しない。
+#
+# 順位の列は `main()` が事前に付ける（1銘柄のDataFrameからは決まらないため）。
+
+CS_MOMENTUM_COLUMN: str = "cs_momentum_rank"
+
+
+def momentum_12_1_value(frame: pd.DataFrame) -> pd.Series:
+    """12ヶ月モメンタム（直近1ヶ月を除く）。横断ランクの元になる値。
+
+    直近1ヶ月を除くのは短期反転を避けるためで、文献の標準的な定義に合わせてある。
+    値はその行までの情報だけで決まる（`shift`）。
+    """
+    close = frame["close"].astype(float)
+    return close.shift(21) / close.shift(252) - 1.0
+
+
+def _cs_momentum_between(frame: pd.DataFrame, low: float, high: float) -> np.ndarray:
+    rank = frame.get(CS_MOMENTUM_COLUMN)
+    if rank is None:
+        return np.zeros(len(frame), dtype=bool)
+    return ((rank > low) & (rank <= high)).fillna(False).to_numpy()
+
+
+def signal_cs_momentum_top_decile(frame: pd.DataFrame) -> np.ndarray:
+    """横断モメンタム上位10%。**これが本命の仮説である。**"""
+    return _cs_momentum_between(frame, 0.90, 1.01)
+
+
+def signal_cs_momentum_top_quintile(frame: pd.DataFrame) -> np.ndarray:
+    """横断モメンタム上位20%。**閾値を選ぶためではなく、頑健性を見るために置く。**
+
+    上位10%と符号も大きさも揃っていなければ、上位10%の結果は閾値の偶然である。
+    """
+    return _cs_momentum_between(frame, 0.80, 1.01)
+
+
+def signal_cs_momentum_bottom_decile(frame: pd.DataFrame) -> np.ndarray:
+    """**対照群。** 横断モメンタム下位10%（＝負けている銘柄）。
+
+    モメンタムが実在するなら、ここは上位10%と**逆符号**になるはずである。
+    上下とも同じ向きに動くなら、それはモメンタムではなく母集団か期間の性質を
+    拾っている。上位だけを見ていては区別がつかない。
+    """
+    return _cs_momentum_between(frame, -0.01, 0.10)
+
+
 def signal_always_in(frame: pd.DataFrame) -> np.ndarray:
     """**対照群。** 常に建てる。銘柄を選んでいない。
 
@@ -148,7 +204,10 @@ SIGNALS: Dict[str, SignalFn] = {
     "RSI(2) < 5 + 200日線上": signal_rsi2,
     "3日続落 + 200日線上": signal_three_down_days,
     "ギャップダウン -3% + 200日線上": signal_gap_down,
-    "モメンタム 12-1 > 30%": signal_momentum_12_1,
+    "モメンタム 12-1 > 30%（絶対閾値）": signal_momentum_12_1,
+    "横断モメンタム 上位10%": signal_cs_momentum_top_decile,
+    "横断モメンタム 上位20%": signal_cs_momentum_top_quintile,
+    "対照群: 横断モメンタム 下位10%": signal_cs_momentum_bottom_decile,
     "52週高値ブレイク": signal_52w_high_breakout,
     "低ボラ (日次SD<1%) + 200日線上": signal_low_volatility,
 }
@@ -195,6 +254,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not bars:
         print(f"{args.csv_dir} に検証できる銘柄がありません。", file=sys.stderr)
         return 1
+    # 横断ランクは1銘柄のDataFrameからは決まらないので、シグナル評価の前に
+    # 列として付けておく（`add_cross_sectional_percentile` の説明を参照）。
+    bars = add_cross_sectional_percentile(bars, momentum_12_1_value, CS_MOMENTUM_COLUMN)
+
     if args.benchmark == "equal-weight":
         benchmark = build_equal_weight_index(bars)
         benchmark_name = f"等ウェイト母集団（{len(bars)}銘柄）"
