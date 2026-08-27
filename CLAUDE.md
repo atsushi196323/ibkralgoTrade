@@ -1918,6 +1918,23 @@ MAX_WATCHLIST_SIZE × (600 / POLL_INTERVAL_SECONDS) ≦ 60
    **常に空を返す状態が実装からデプロイまで気付かれなかった**（テストも空を
    期待していたため通っていた）。**握り潰す範囲が広いほど、記録は目立つ側へ倒すこと。**
 
+   **同じ形の欠陥が他に無いかを、AST で全ファイル機械的に監査した**（2026-08-27）。
+   広い `except` で再raiseしない箇所は37件あり、うち記録が DEBUG 以下は8件だった。
+   **残してよい静かな握り潰しは、ログフィルタの中の2件だけである**
+   （`core/logging_setup.py`。ここでログを出すと再帰する）。監査で2件直した:
+
+   - **`cancelMktData` の失敗を DEBUG で消していた。** 解除に失敗した購読は張りっぱなしに
+     なり、積み上がると**IBKRの同時購読数の上限を食い潰す**（「6.4」）。そうなったときの
+     症状は「価格が取れない銘柄が増える」で、原因がここだと分かる手掛かりが1行も残らない
+   - **「無効だから静か」と「有効なのに何も起きない」を同じ分岐にしていた。**
+     `resolve_momentum_targets_async` が `if not ENABLE_MOMENTUM_TRACK or not universe`
+     と2つの条件を混ぜており、フラグを立てたのに母集団が空の場合も無言だった。
+     **前者は静かでよいが、後者はフラグを立てた人が原因に辿り着けない。**
+
+   `tests/test_main.py` の `test_enabling_the_track_with_an_empty_universe_is_an_error` /
+   `test_a_disabled_track_stays_silent`、`tests/test_market_data.py` の
+   `test_a_failed_subscription_cancel_is_reported` が番人。
+
    **動かないコードをコメントアウトして残してはならない。** 「将来使うかもしれない」コードはGitの履歴に残っているので消すこと。コメントアウトされたコードは、それが意図的に無効化された仕様なのか消し忘れなのかを後から判別できず、テストも型チェックも通らないまま腐る。意図的に無効化する機能は、`main.ENABLE_DAY_TRADING` のように**フラグと理由のコメントで表現する**（フラグなら分岐が生きたコードとして残り、テストで押さえられる）。
 
 ## 8. よく使うコマンド (Commands)
