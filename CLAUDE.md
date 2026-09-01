@@ -1958,7 +1958,7 @@ MAX_WATCHLIST_SIZE × (600 / POLL_INTERVAL_SECONDS) ≦ 60
 | --- | --- |
 | `ruff check .` | 既定(E4/E7/E9/F)に `B`(bugbear) と `W` を足す。整形系(I/UP)は入れない——全ファイルに機械的な差分が出て**本当の指摘が埋もれる**ため |
 | `mypy` | 戻り値の型注釈は331関数中329件(99%)ある。導入まで一度も走らせておらず、**装飾になっていた** |
-| `pytest -q` | 895件・約2秒。実行順はランダム（`pytest-randomly`） |
+| `pytest -q` | 896件・約2秒。実行順はランダム（`pytest-randomly`） |
 
 **不変条件:**
 

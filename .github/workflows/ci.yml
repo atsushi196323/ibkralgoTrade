@@ -65,9 +65,9 @@ jobs:
     name: pandas ${{ matrix.pandas }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           # 稼働環境(VPS)に合わせる。上げるときはVPS側と同時に。
           python-version: "3.11"
@@ -100,7 +100,7 @@ jobs:
         # 3.0.5 で16件と、**pandasの版で型検査の結果が変わっていた**）。
         run: mypy
 
-      - name: pytest（番人テスト895件・IBKRへの実接続なし）
+      - name: pytest（番人テスト・IBKRへの実接続なし）
         # 実行順はランダム（pytest-randomly）。順序で結果が変わる不具合を実際に
         # 踏んでいる（2026-08-06。`ENABLE_REAL_ORDERS` が main 側で固定されて
         # おらず、`importlib.reload(main)` の後だけ挙動が変わっていた）。
