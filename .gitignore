@@ -17,7 +17,10 @@ venv/
 logs*/
 
 # 検証用に取得したヒストリカルバー(scripts/fetch_bars.py)。再取得できるのでコミットしない。
-bars/
+# **先頭のスラッシュが要る。** `bars/` だと全階層に一致するので、
+# レビュアー向けに同梱している `examples/bars/` まで巻き込む
+# （2026-09-01に、新規cloneでサンプルが1件も入らない形で実測した）。
+/bars/
 
 # IB Gatewayの設定（VPSのDocker運用でvolumeとしてマウントする先）。口座情報を含む。
 deploy/ib-gateway/tws_settings/
