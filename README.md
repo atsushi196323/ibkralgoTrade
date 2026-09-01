@@ -30,6 +30,8 @@ Interactive Brokers の API を用い、米国株の押し目買い（日足の�
 
 サンプルの日足（10年・6銘柄）を同梱してあるので、IBKR の口座もAPIキーも不要で動く。
 
+動作環境は **Python 3.11**（`pyproject.toml` の ruff / mypy もこの版に合わせてある）。
+
 ```bash
 pip install -r requirements-dev.txt
 
@@ -59,7 +61,7 @@ python -m scripts.measure_alpha --csv-dir examples/bars \
 | 本体のコード | 14,756行 |
 | テストコード | 14,455行 / **938件** — IBKRへの実接続なし（全てモック）・約2秒で完走 |
 | カバレッジ | 87%（`main.py` 91% / `execution/order_manager.py` 96%） |
-| 型注釈 | 戻り値 331関数中 329（99%）・mypy 通過 |
+| 型注釈 | 戻り値 420関数中 413（98%）・mypy 通過 |
 | 構成 | 6パッケージ（接続 / データ取得 / 戦略判定 / 執行 / バックテスト / 運用スクリプト） |
 | 稼働 | VPS（Ubuntu）+ systemd による無人運用。平日22:15起動・翌06:05締め（日本時間） |
 | CI | GitHub Actions で lint（ruff）・型検査（mypy）・テストを、稼働環境と同じ Linux・pandas 2系/3系で実行 |
@@ -78,7 +80,7 @@ flowchart TD
         L[logging_setup.py<br/>定型通知の抑制]
     end
     subgraph data_[data/ IBKR APIとの境界]
-        D[market_data.py<br/>**IBKR取得の唯一の入口**]
+        D[market_data.py<br/>IBKR取得の唯一の入口]
         CA[cache.py<br/>日足は取引日単位]
     end
     subgraph strategy_[strategy/ 純粋な判定]
