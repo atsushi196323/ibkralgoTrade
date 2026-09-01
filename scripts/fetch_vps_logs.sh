@@ -45,6 +45,10 @@ rsync -avz --partial \
 
 echo
 echo "同期しました: ${LOCAL_DIR}/"
+# 同期結果を人が読むための一覧なので、`ls` の出力（サイズ・更新時刻）が
+# そのまま欲しい。ここへ入るのは logs/ 由来の固定の名前だけで、
+# SC2012 が想定する「空白や改行を含むファイル名」は現れない。
+# shellcheck disable=SC2012
 ls -la "${LOCAL_DIR}/" 2>/dev/null | tail -n +2
 
 cat <<'EOS'

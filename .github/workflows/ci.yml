@@ -100,6 +100,16 @@ jobs:
         # 3.0.5 で16件と、**pandasの版で型検査の結果が変わっていた**）。
         run: mypy
 
+      - name: shellcheck（起動・締めのシェル）
+        # **Pythonのテストはシェルの構文を見ていない。** 起動側の
+        # `scripts/start_bot.sh` と締めの `scripts/after_close.sh` は
+        # systemdから毎日呼ばれる唯一の入口で、ここが構文エラーで落ちると
+        # 症状は「毎日何も起きない」になる（判定の中身は
+        # `tests/test_operational_scripts.py` が静的に見ているが、
+        # そちらは分岐の形しか見ない）。shellcheck は ubuntu-latest に
+        # 同梱されているので、追加のインストールは要らない。
+        run: shellcheck scripts/*.sh
+
       - name: pytest（番人テスト・IBKRへの実接続なし）
         # 実行順はランダム（pytest-randomly）。順序で結果が変わる不具合を実際に
         # 踏んでいる（2026-08-06。`ENABLE_REAL_ORDERS` が main 側で固定されて
