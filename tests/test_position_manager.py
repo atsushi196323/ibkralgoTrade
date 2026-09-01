@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -218,6 +219,52 @@ def test_sync_discovers_untracked_broker_position() -> None:
     assert position.quantity == 10
     assert position.highest_price == 150.0
     assert position.strategy_type == STRATEGY_TYPE_UNKNOWN
+
+
+def test_an_untracked_broker_position_is_reported_as_a_warning(caplog) -> None:
+    """ローカルに記録の無い建玉の取り込みは WARNING で残ること。
+
+    正常な持ち越しは `logs/positions.json` から復元されるのでここには来ない。
+    来るのは「Botが発注したがローカルへ記録する前に落ちた」か「手動で建てた」
+    かのどちらかで、**前者はクラッシュの唯一の痕跡である**（発注カウンタは
+    placeOrder の前に永続化されるが、それだけでは銘柄が分からない）。
+
+    INFOで出していた頃は正常な稼働ログに紛れて区別できなかった。引け後の
+    サマリはWARNINGを種類別に数えるので、上げることで翌朝に気付ける。
+    """
+    manager = PositionManager()
+    ib = _make_mock_ib([_make_broker_position("AAPL", 10, 150.0)])
+
+    with caplog.at_level(logging.WARNING, logger="execution.position_manager"):
+        asyncio.run(manager.sync_with_broker_async(ib))
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "AAPL" in message
+    # 何が失われたかを名指しすること。「検出しました」だけでは、運用者が
+    # 建値のずれ・R倍率の欠落・クールダウン無しに気付けない。
+    assert "avgCost" in message
+    assert "クールダウン" in message
+
+
+def test_a_position_carried_over_in_the_state_file_is_not_warned_about(tmp_path, caplog) -> None:
+    """状態ファイルから復元できた建玉は WARNING を出さないこと。
+
+    毎サイクル同期するので、通常の持ち越しで警告が出ると**1日78行**積まれて
+    本当の異常が埋もれる（「3. 実行環境と設定」のログ方針）。
+    """
+    state = tmp_path / "positions.json"
+    manager = PositionManager(state_path=str(state))
+    manager.open_position("AAPL", entry_price=150.0, quantity=10)
+
+    restored = PositionManager(state_path=str(state))
+    ib = _make_mock_ib([_make_broker_position("AAPL", 10, 150.0)])
+
+    with caplog.at_level(logging.WARNING, logger="execution.position_manager"):
+        asyncio.run(restored.sync_with_broker_async(ib))
+
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 def test_sync_ignores_zero_quantity_broker_positions() -> None:
