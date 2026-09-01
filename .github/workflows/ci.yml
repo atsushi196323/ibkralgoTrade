@@ -1,0 +1,92 @@
+# 稼働環境(VPS)と同じ Linux で、番人テスト・lint・型検査を機械的に走らせる。
+#
+# **なぜCIが要るのか。** 本プロジェクトの主要な故障は例外を出さない
+# （ペーシング違反は空のバー列として返り、購読権限が無いスクリーナーは空を返し、
+# 注文の拒否は警告としてしか通知されない）。だから不変条件ごとに番人テストを
+# 置いているが、**その起動条件が「人間が思い出すこと」のままでは、番人自体が
+# 静かに動かなくなる。** 特に `ensure_account_is_paper` の番人は、壊れたまま
+# 気付かなければ実口座への発注に繋がる。CIは、本プロジェクトが既に採用している
+# 「静かな縮退は機械的に検知する」という原則を、一段上へ適用したものである。
+#
+# **緑が保証しないもの。** テストは全件モックなので、ブローカー側の実挙動
+# ——呼値違反(Warning 110)・OCAグループ名の書き換え(Error 10326)・
+# 取消未確定での売り超過(Error 201)・TIFの上書き(Error 10349)——は
+# **1バイトも検証していない**。これらは実発注でしか観測できない
+# （「決済の置き場所」節）。**CIが緑であることを「注文層が正しい」と
+# 読んではならない。** そう読んだ時点で、CIそのものが新しい静かな縮退になる。
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # 依存の腐りを、稼働ではなく事前に知るための定期実行（毎週月曜 09:00 JST）。
+    # yfinance は仕様変更で繰り返し壊れており、ib_async も更新され続ける。
+    # requirements.txt は下限しか固定していないので、こちらが何もしなくても
+    # 解決される版は動く。この実行が無いと、壊れた事実に気付くのは
+    # 22:15 JST の起動時——しかも症状は「毎日何も起きない」になる。
+    - cron: "0 0 * * 1"
+
+concurrency:
+  # 同じブランチへ連続でpushしたとき、古い実行を打ち切って無料枠を無駄にしない。
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      # 片方が落ちても、もう片方の結果を見たい（pandasの版差か否かの切り分け）。
+      fail-fast: false
+      matrix:
+        # 手元(macOS)は pandas 2.2.2、VPS(Ubuntu)は 3.0.5 で動いている。
+        # この分裂は実際に事故になった: 日中足CSVのタイムゾーン混在を
+        # 2.2.2 は通し 3.0.5 は例外にするため、**Macでは読めてVPSでは落ちる**
+        # 状態を2026-08-13に実測した（`backtest/csv_source.py`）。
+        # 環境で結果が変わる検証は信用できないので、両方で回す。
+        pandas: ["2.2.*", "3.*"]
+
+    name: pandas ${{ matrix.pandas }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 稼働環境(VPS)に合わせる。上げるときはVPS側と同時に。
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: 依存をインストール
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install "pandas==${{ matrix.pandas }}"
+
+      - name: 実際に入ったバージョンを記録する
+        # 落ちたときに「どの組み合わせで壊れたか」を後から読むための行。
+        # requirements.txt は下限しか固定していないので、残さないと再現できない。
+        run: pip list
+
+      - name: ruff（lint）
+        run: ruff check .
+
+      - name: mypy（型検査）
+        # 除外リストは pyproject.toml にあり、**縮める一方**にする約束である。
+        # pandas の型は pandas-stubs で実行時のpandasから切り離してあるので、
+        # この結果はマトリクスの両方で一致する（切り離す前は 2.2.2 で緑・
+        # 3.0.5 で16件と、**pandasの版で型検査の結果が変わっていた**）。
+        run: mypy
+
+      - name: pytest（番人テスト895件・IBKRへの実接続なし）
+        # 実行順はランダム（pytest-randomly）。順序で結果が変わる不具合を実際に
+        # 踏んでいる（2026-08-06。`ENABLE_REAL_ORDERS` が main 側で固定されて
+        # おらず、`importlib.reload(main)` の後だけ挙動が変わっていた）。
+        # **`-p no:randomly` で固定しないこと。** 固定すると、その種の順序依存が
+        # 入っても緑のままになる。
+        run: pytest -q

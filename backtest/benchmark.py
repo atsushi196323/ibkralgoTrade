@@ -87,7 +87,7 @@ def _close_by_day(bars: pd.DataFrame) -> Dict[object, float]:
         raise ValueError("ベンチマークのバーに date 列がありません。")
     return {
         _trading_day_of(date): float(close)
-        for date, close in zip(bars["date"], bars["close"])
+        for date, close in zip(bars["date"], bars["close"], strict=True)
     }
 
 

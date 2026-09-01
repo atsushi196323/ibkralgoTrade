@@ -196,7 +196,7 @@ def build_equal_weight_index(
             continue
         days = pd.to_datetime(frame["date"]).dt.normalize()
         returns = frame["close"].astype(float).pct_change()
-        for day, value in zip(days.iloc[1:], returns.iloc[1:]):
+        for day, value in zip(days.iloc[1:], returns.iloc[1:], strict=True):
             if pd.notna(value):
                 daily_returns.setdefault(day, []).append(float(value))
 

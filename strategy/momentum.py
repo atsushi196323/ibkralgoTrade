@@ -47,6 +47,10 @@ class MomentumConfig:
     min_symbols: int = MIN_SYMBOLS_FOR_RANKING
 
 
+#: 引数を省略したときの既定値。frozen なのでモジュール全体で共有してよい。
+DEFAULT_MOMENTUM_CONFIG = MomentumConfig()
+
+
 def momentum_value(closes: pd.Series) -> Optional[float]:
     """直近バーにおける 12-1 モメンタム。本数が足りなければ None。
 
@@ -76,11 +80,14 @@ def rank_percentiles(values: Dict[str, float]) -> Dict[str, float]:
     series = pd.Series(values, dtype=float).dropna()
     if series.empty:
         return {}
-    return series.rank(pct=True).to_dict()
+    # `to_dict()` のキーは pandas 上 Hashable なので、銘柄コード(str)として
+    # 明示し直す。値の中身は変わらない。
+    ranks = series.rank(pct=True)
+    return {str(symbol): float(rank) for symbol, rank in ranks.items()}
 
 
 def select_targets(
-    values: Dict[str, float], config: MomentumConfig = MomentumConfig(),
+    values: Dict[str, float], config: MomentumConfig = DEFAULT_MOMENTUM_CONFIG,
 ) -> List[str]:
     """その日に保有すべき銘柄を、モメンタムの高い順に `slots` 件返す。
 

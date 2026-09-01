@@ -45,6 +45,10 @@ class AttentionConfig:
     absent_rank: int = 101
 
 
+#: 引数を省略したときの既定値。frozen なのでモジュール全体で共有してよい。
+DEFAULT_ATTENTION_CONFIG = AttentionConfig()
+
+
 def build_rank_map(symbols: Sequence[str]) -> Dict[str, int]:
     """スキャナーが返した順序を「銘柄 -> 順位(1始まり)」に変換する。
 
@@ -85,7 +89,7 @@ def baseline_rank(
 def detect_rank_surges(
     today_ranks: Dict[str, int],
     history: Sequence[Dict[str, int]],
-    config: AttentionConfig = AttentionConfig(),
+    config: AttentionConfig = DEFAULT_ATTENTION_CONFIG,
 ) -> List[str]:
     """急に上位へ来た銘柄を、上昇幅の大きい順に返す。
 

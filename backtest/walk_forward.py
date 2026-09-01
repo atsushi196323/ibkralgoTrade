@@ -68,7 +68,7 @@ class ParameterGrid:
         return [
             BacktestConfig(
                 close_at_session_end=self.close_at_session_end,
-                **dict(zip(fields, combo)),
+                **dict(zip(fields, combo, strict=True)),
             )
             for combo in product(*value_lists)
         ]

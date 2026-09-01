@@ -56,7 +56,7 @@ def test_the_portfolio_engine_matches_the_single_symbol_engine() -> None:
 
     assert len(portfolio.trades) == len(single.trades) > 0
     assert portfolio.final_equity == pytest.approx(single.final_equity)
-    for a, b in zip(single.trades, portfolio.trades):
+    for a, b in zip(single.trades, portfolio.trades, strict=True):
         assert b.pnl == pytest.approx(a.pnl)
 
 

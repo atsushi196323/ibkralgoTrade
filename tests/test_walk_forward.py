@@ -106,7 +106,7 @@ def test_test_windows_tile_without_overlap() -> None:
     starts = [w.test_start_index for w in result.windows]
     ends = [w.test_end_index for w in result.windows]
     assert starts == [30, 40, 50, 60, 70]
-    assert all(end < next_start for end, next_start in zip(ends, starts[1:]))
+    assert all(end < next_start for end, next_start in zip(ends, starts[1:], strict=False))
 
 
 def test_step_bars_overrides_the_slide_width() -> None:

@@ -2,3 +2,13 @@
 pytest>=8.0.0
 # バックテスト検証用の日足取得(scripts/fetch_bars.py)。ボット本体は依存しない。
 yfinance>=0.2.40
+
+# CI(.github/workflows/ci.yml)で走らせる検査。手元でも同じものを回せるようにする。
+ruff>=0.16
+mypy>=1.17
+# テストの実行順をランダムにする。順序で結果が変わる不具合を実際に踏んでいる
+# （2026-08-06。conftest.py の `ENABLE_REAL_ORDERS` 固定の docstring を参照）。
+pytest-randomly>=3.15
+# pandas の型情報を実行時のpandasから切り離す。3系は型を同梱しないため、
+# stubs が無いと **pandas のバージョンで mypy の結果が変わる**（実測: 2.2.2 で緑・3.0.5 で16件）。
+pandas-stubs>=2.2

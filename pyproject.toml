@@ -1,0 +1,71 @@
+# ツール設定のみを置く。パッケージとして配布しないので [project] は持たない
+# （このリポジトリはアプリケーションであり、`pip install` される対象ではない）。
+
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["bars", "logs", "logs_vps", "logs_194k_20260731"]
+
+[tool.ruff.lint]
+# 既定(E4/E7/E9/F)に、静かな不具合を拾う規則だけを足す。
+#   B  : flake8-bugbear   —— 可変デフォルト引数・ループ変数の束縛など、例外を出さずに壊れる書き方
+#   W  : pycodestyle警告  —— 末尾の空白など
+# 整形系(I/UP)は入れていない。全ファイルに機械的な差分が出て、
+# **本当の指摘がその中に埋もれる**ため。追加は1規則ずつ、差分を確認しながら行うこと。
+select = ["E4", "E7", "E9", "F", "B", "W"]
+
+# E501(行長)は掛けない。コメントと docstring が日本語なので、
+# 文字数の上限は表示幅と一致せず、意味のある基準にならない。
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["main.py", "core", "data", "strategy", "execution", "backtest", "scripts"]
+exclude = "(^|/)(bars|logs)"
+
+# 現状の到達点に合わせた設定。**緩めるためではなく、緑から始めて締めていくための出発点である。**
+# 戻り値の型注釈は331関数中329件(99%)あるので、まず「注釈があるものを検査する」水準で回し、
+# 未注釈の関数本体まで踏み込むのは注釈を100%にしてからにする。
+check_untyped_defs = false
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+
+# 型情報を配布していない外部ライブラリ。ここに足すのは
+# **スタブが存在しないものだけ**にすること（安易に足すと自分のコードの誤りまで隠れる）。
+[[tool.mypy.overrides]]
+module = ["ib_async.*", "yfinance.*", "holidays.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# 型検査のラチェット
+#
+# 導入時点で型エラーが残っていた15モジュール。**このリストは縮める一方にする。**
+# 追加してはならない——足せる仕組みにしておくと、新しく壊した型を「既存の
+# 未対応」として押し込めてしまい、検査が静かに無効化される。本プロジェクトが
+# 最も警戒している故障の形そのものである。
+#
+# 除外していないモジュールで型エラーが出たらCIが落ちる。それがこの設定の役目で
+# あって、47件を今すぐ直すことではない（内訳は pandas / ib_async の動的な戻り値
+# との摩擦が大半だが、`main.py:1556` の `Position | None` のように
+# **待機注文の復元経路で AttributeError になりうる本物の穴**も混ざっている）。
+# 直すときは1モジュールずつ、この配列から1行消す形で行うこと。
+# ---------------------------------------------------------------------------
+[[tool.mypy.overrides]]
+module = [
+    "backtest.benchmark",
+    "backtest.portfolio",
+    "backtest.signal_study",
+    "core.connection",
+    "data.fundamentals",
+    "data.market_data",
+    "execution.order_manager",
+    "execution.position_manager",
+    "execution.tax_export",
+    "main",
+    "scripts.check_positions",
+    "scripts.check_robustness",
+    "scripts.daily_report",
+    "scripts.repair_resting_prices",
+    "strategy.exit_signal",
+]
+ignore_errors = true

@@ -120,7 +120,7 @@ def test_loaded_df_is_directly_usable_by_backtest_engine(tmp_path) -> None:
     """CSV経由でもIBKR経由と同じエンジンで検証できること（オフライン検証の要）。"""
     closes = [100.0] * 5 + [90.0, 100.0]
     dates = pd.date_range("2026-01-05", periods=len(closes), freq="D")
-    rows = "".join(f"{d.date()},{c}\n" for d, c in zip(dates, closes))
+    rows = "".join(f"{d.date()},{c}\n" for d, c in zip(dates, closes, strict=True))
     path = _write_csv(tmp_path, "SYNTH.csv", "Date,Close\n" + rows)
 
     df = load_bars_from_csv(path)

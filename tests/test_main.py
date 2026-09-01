@@ -1153,7 +1153,7 @@ def _main_loop_at(times, refresh_results):
         try:
             return next(clock)
         except StopIteration:
-            raise KeyboardInterrupt()
+            raise KeyboardInterrupt() from None
 
     async def fake_sleep(_seconds):
         return None
