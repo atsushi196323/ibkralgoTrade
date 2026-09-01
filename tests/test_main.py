@@ -2503,6 +2503,22 @@ def test_entry_proceeds_when_the_reference_price_is_fresh(trade_journal) -> None
     assert position_manager.has_position("AAPL") is True
 
 
+def test_stale_entry_prices_are_rejected_by_default() -> None:
+    """既定で「古い価格では新規建てしない」側であること。
+
+    挙動そのものは下の2件が両方向を押さえているが、どちらも
+    `main.REJECT_STALE_ENTRY_PRICE` を patch するため、**出荷される既定値は
+    どのテストも見ていなかった**（2026-09-01に、既定を False へ反転させても
+    895件すべてが緑のままであることを実測した）。
+
+    既定が False へ倒れると、参照価格が前営業日の終値のままブラケットが組まれ、
+    損切り・利確が実勢からずれた位置に置かれる。値段の妥当性検証
+    (`MAX_ORDER_PRICE_DEVIATION_PCT`) は参照価格を基準に測るので、
+    **この縮退を検出できない**（「価格の鮮度」節）。
+    """
+    assert main_module.REJECT_STALE_ENTRY_PRICE is True
+
+
 def test_stale_price_can_be_allowed_by_the_flag(trade_journal) -> None:
     """フラグを落とせば従来どおり建てられること（取得経路の想定が外れたときの逃げ道）。"""
     mock_order, position_manager = _run_entry_with_quote(

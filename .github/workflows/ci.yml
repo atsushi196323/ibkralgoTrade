@@ -27,7 +27,17 @@ on:
     # requirements.txt は下限しか固定していないので、こちらが何もしなくても
     # 解決される版は動く。この実行が無いと、壊れた事実に気付くのは
     # 22:15 JST の起動時——しかも症状は「毎日何も起きない」になる。
+    #
+    # **60日コミットが無いと、GitHubがこのスケジュールを自動で止める。**
+    # 止まったこと自体は通知されないので、開発が途切れた期間の後は
+    # Actionsタブで有効かを確かめること（手動実行は workflow_dispatch から）。
     - cron: "0 0 * * 1"
+
+# このワークフローはチェックアウトして検査するだけで、書き込む先が無い。
+# 既定の権限のまま走らせない（後で書き込む step を足したとき、
+# 「元から権限があった」状態で通ってしまうのを防ぐ）。
+permissions:
+  contents: read
 
 concurrency:
   # 同じブランチへ連続でpushしたとき、古い実行を打ち切って無料枠を無駄にしない。
@@ -37,6 +47,10 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # **非公開リポジトリでは無料枠が有限なので、上限を明示する。**
+    # 既定は6時間で、ハングした1ジョブだけで月2,000分の18%を焼く。
+    # 実測は2ジョブとも2分未満なので、15分は十分な余裕がある。
+    timeout-minutes: 15
     strategy:
       # 片方が落ちても、もう片方の結果を見たい（pandasの版差か否かの切り分け）。
       fail-fast: false
@@ -63,10 +77,13 @@ jobs:
             requirements-dev.txt
 
       - name: 依存をインストール
+        # **pandas の指定を同じコマンドに含めること。** 先に requirements-dev を
+        # 入れてから後で pandas を下げると、pandas-stubs は最初の解決結果
+        # （最新版）のまま残り、pandas と版がずれる。今は動くが、pip に
+        # 整合を任せていない状態なので、1回の解決にまとめる。
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
-          pip install "pandas==${{ matrix.pandas }}"
+          pip install -r requirements-dev.txt "pandas==${{ matrix.pandas }}"
 
       - name: 実際に入ったバージョンを記録する
         # 落ちたときに「どの組み合わせで壊れたか」を後から読むための行。
