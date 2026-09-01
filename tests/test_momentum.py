@@ -1,7 +1,7 @@
 """横断ランクのモメンタムの判定ロジック。
 
 **この層はバックテスト・一貫性テスト・ライブで共有する。** ここが分かれると
-「測ったもの」と「動くもの」が別物になる（CLAUDE.md「レイヤーの責務」）。
+「測ったもの」と「動くもの」が別物になる（docs/DECISIONS.md「レイヤーの責務」）。
 """
 
 import pandas as pd
@@ -136,7 +136,7 @@ def test_the_series_and_scalar_definitions_agree():
 
     **2026-08-27まで、この2行が `scripts/` の3ファイルへ書き写されていた。**
     片方だけ直すと、測っているものとライブで動くものが別々に育つ
-    （CLAUDE.md「レイヤーの責務」）。
+    （docs/DECISIONS.md「レイヤーの責務」）。
     """
     closes = _closes([100.0 + i for i in range(300)])
 

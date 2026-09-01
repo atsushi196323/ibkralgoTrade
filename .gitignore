@@ -1,6 +1,12 @@
 .env
 __pycache__/
 *.pyc
+
+# 検査ツールの生成物。キャッシュ類は各ツールが自分で .gitignore を書くが、
+# カバレッジのデータファイルは書かないので明示する。
+.coverage
+.coverage.*
+htmlcov/
 .venv/
 venv/
 

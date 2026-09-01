@@ -10,7 +10,7 @@
 出力は `backtest/csv_source.py` が読める形式（date,open,high,low,close,volume）。
 
 **IBKRのデータ取得APIを直接呼ばず、`data.market_data` を経由する**
-（CLAUDE.md「6.3 必ず経由すべき入口」）。ペーシング制限（10分あたり60件）は
+（docs/DECISIONS.md「6.3 必ず経由すべき入口」）。ペーシング制限（10分あたり60件）は
 そちらのレートリミッターが守る。42銘柄なら1銘柄1リクエストで収まる。
 
 実行方法:
@@ -105,7 +105,7 @@ async def _fetch_one_async(ib, symbol: str, args: argparse.Namespace) -> Optiona
         timeout=args.timeout,
     )
     if bars is None or bars.empty:
-        # ペーシング違反は例外ではなく空のバー列として返る（CLAUDE.md「6.1」）。
+        # ペーシング違反は例外ではなく空のバー列として返る（docs/DECISIONS.md「6.1」）。
         # 「データが無い銘柄」と区別がつかないため、空は必ず記録に残す。
         logger.warning("[%s] バーが0本でした（ペーシング違反・期間の上限超過の可能性）。", symbol)
         return None

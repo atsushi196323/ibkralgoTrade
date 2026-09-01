@@ -176,7 +176,7 @@ linger・スワップ・タイマーの有効化・systemdのバージョン・A
 **Gatewayを新しく立てたら Order Presets を確認すること。** プリセットが注文の
 有効期間(TIF)を書き換えると `Error 10349` が出るが、**上書きは注文を拒否しないので
 気付けない**。子注文が `DAY` に落とされると、持ち越すスイングの建玉が引けで
-無防備になる（CLAUDE.md「決済の置き場所」）。VNCで繋いで
+無防備になる（docs/DECISIONS.md「決済の置き場所」）。VNCで繋いで
 Global Configuration → Presets を見る:
 
 ```bash

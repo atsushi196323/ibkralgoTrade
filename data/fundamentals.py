@@ -110,7 +110,7 @@ async def run_turnover_scan_async(
     株価の帯は `above_price` / `below_price` としてサーバー側へ渡す。手元で
     絞ると、買えない銘柄のぶんまでランキングの枠を消費してしまう。
 
-    スキャナーは購読権限が無いと**例外ではなく空を返す**（CLAUDE.md「6.2」）ので、
+    スキャナーは購読権限が無いと**例外ではなく空を返す**（docs/DECISIONS.md「6.2」）ので、
     0件のときは警告を出す。
     """
     subscription = ScannerSubscription(

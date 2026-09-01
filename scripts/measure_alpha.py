@@ -120,8 +120,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--risk-pct", type=float, default=1.0,
         help="1トレードのリスク（資金比）。**小口座ではこれが最大の設計変数である**"
-             "——建玉金額 = 資金 × (リスク% / 損切り%) なので、1%は $1,220 で $244 の"
-             "建玉になり、往復$2.00が約定代金の0.82%を占める。必要な超過リターンが"
+             "——建玉金額 = 資金 × (リスク%% / 損切り%%) なので、1%%は $1,220 で $244 の"
+             "建玉になり、往復$2.00が約定代金の0.82%%を占める。必要な超過リターンが"
              "そのぶん高くなる。",
     )
     parser.add_argument("--watchlist-size", type=int, default=24,

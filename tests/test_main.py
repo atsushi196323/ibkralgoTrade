@@ -1284,7 +1284,7 @@ def test_the_watchlist_cap_does_not_worsen_the_pacer_backlog_beyond_one_window()
 
     上の不変条件は「銘柄あたり毎サイクル1リクエスト」を前提にした式である。
     実際には `get_current_price_async` がヒストリカル終値のフォールバック
-    （購読権限が無い口座で使われる経路。CLAUDE.md「6.2」）まで落ちると、
+    （購読権限が無い口座で使われる経路。docs/DECISIONS.md「6.2」）まで落ちると、
     同じ銘柄で日中足とは別にもう1件消費しうる。
 
     **その最悪ケースは 20銘柄の時点で既に枠(55件/10分)を超えていた**
@@ -2163,7 +2163,7 @@ def test_market_filter_blocks_entry_when_drop_is_market_wide(trade_journal) -> N
 def test_market_index_is_not_fetched_while_filter_is_disabled(trade_journal) -> None:
     """既定（フィルター無効）では指数のリクエストを一切出さないこと。
 
-    ペーシング制限(CLAUDE.md 6.1)に効くため、使っていない機能で
+    ペーシング制限(docs/DECISIONS.md 6.1)に効くため、使っていない機能で
     リクエストが増えていないことを固定する。
     """
     contract = MagicMock(symbol="AAPL")

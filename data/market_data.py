@@ -155,7 +155,7 @@ def drop_unconfirmed_today_bars(
     """当日（米国東部時間）の日付を持つ末尾のバーを取り除く。
 
     取引時間中のIBKR日足には**まだ確定していない当日のバー**が並ぶ（寄り付き
-    直後を除く。CLAUDE.md「価格の鮮度」の実測表を参照）。この行の終値は
+    直後を除く。docs/DECISIONS.md「価格の鮮度」の実測表を参照）。この行の終値は
     現在値と一緒に動くため、シグナル判定に含めると次の2つの問題が出る:
 
     - 日足を取引日単位でキャッシュする前提（DailyBarCache）が崩れる。その日
@@ -237,7 +237,7 @@ async def _get_streaming_price_async(
             # **ただし取引日1回へ絞る。** この経路は監視銘柄×毎サイクルで走るので
             # （38銘柄×52サイクル＝1976回/日）、系統的に失敗し始めると
             # WARNINGだけで1日2000行になり、「読むべき1行」を埋める側に回る
-            # （CLAUDE.md「3. 実行環境と設定」のログ方針）。
+            # （docs/DECISIONS.md「3. 実行環境と設定」のログ方針）。
             if should_log_once_per_trading_day("cancel_mkt_data", contract.symbol):
                 logger.warning(
                     "%s のストリーミング購読を解除できませんでした。"

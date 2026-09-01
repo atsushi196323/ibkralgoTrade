@@ -71,7 +71,7 @@ def test_silent_degradations_are_surfaced():
     """スクリーニングの空応答と株価帯の除外は、例外にならない縮退である。
 
     この2つが拾えなくなると「なぜ1件も建たなかったのか」が
-    サマリから消える（CLAUDE.md「3. 実行環境と設定」）。
+    サマリから消える（docs/DECISIONS.md「3. 実行環境と設定」）。
     """
     lines = _lines(
         "2026-08-03 22:30:10,000 [WARNING] data.fundamentals: 時価総額スキャンの結果が0件でした: "
@@ -220,7 +220,7 @@ def test_trades_are_selected_by_eastern_trading_day():
 
 
 def test_zero_commission_trades_are_flagged_as_dry_run():
-    """手数料0の記録を実発注の成績として読ませない（CLAUDE.md「9. 禁止事項」）。"""
+    """手数料0の記録を実発注の成績として読ませない（docs/DECISIONS.md「9. 禁止事項」）。"""
     dry_run_trade = TradeRecord(
         symbol="KO", entry_price=80.0, exit_price=88.0, quantity=3, reason="TAKE_PROFIT",
         pnl=24.0, pnl_pct=10.0, r_multiple=2.0,
@@ -602,7 +602,7 @@ def test_the_order_layer_status_is_judged_across_all_days_not_just_today():
 
 
 def test_the_deadline_matches_the_one_recorded_in_the_exit_conditions():
-    """CLAUDE.mdの「撤退条件」節と同じ日付であること。
+    """docs/DECISIONS.mdの「撤退条件」節と同じ日付であること。
 
     片方だけ動かすと、文書と稼働の判定が食い違う。
     """

@@ -197,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-population", type=int, default=100,
         help="1期あたりの母集団の下限。**下げると横断ランクの意味が薄れる**"
-             "（20銘柄中の上位10%は2銘柄で、測定した構成ではない）",
+             "（20銘柄中の上位10%%は2銘柄で、測定した構成ではない）",
     )
     parser.add_argument(
         "--no-prior", action="store_true",

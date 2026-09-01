@@ -7,7 +7,7 @@
 「情報があるか」→「口座で成立するか」。逆にすると、枠の取り合いや株数クランプの
 偶然を、シグナルの良し悪しとして読むことになる。
 
-**読み方の規律（`CLAUDE.md` の「ベンチマークを基準に測る」節と同じ）:**
+**読み方の規律（`docs/DECISIONS.md` の「ベンチマークを基準に測る」節と同じ）:**
 
 - 判定は**重なり補正後の t値**で行い、2.0 未満は不採用とする
 - **有意でも、資金額から決まる必要アルファを下回るものは実装しない。**
@@ -61,7 +61,7 @@ def signal_current_pullback(frame: pd.DataFrame) -> np.ndarray:
 
 
 def signal_sigma_pullback(frame: pd.DataFrame) -> np.ndarray:
-    """乖離を%ではなくσで測る（`CLAUDE.md` が未検証として挙げていた軸）。
+    """乖離を%ではなくσで測る（`docs/DECISIONS.md` が未検証として挙げていた軸）。
 
     -5%が「異常」かは銘柄のボラティリティ次第である。日次SD 1.7%の大型株では
     3σ級だが、SD 12%のMRNAでは0.4日ぶんの動きにすぎない。
@@ -243,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--required-alpha", type=float, default=0.92,
         help="このコストを上回らないシグナルは実装しない。既定は $1,220・"
-             "1建玉$244（リスク1%/損切り5%）での往復手数料+スリッページ。",
+             "1建玉$244（リスク1%%/損切り5%%）での往復手数料+スリッページ。",
     )
     parser.add_argument("--only", nargs="*", default=None, help="名前の部分一致で絞る")
     return parser
