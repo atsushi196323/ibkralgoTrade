@@ -108,6 +108,17 @@
 - 利確LMTの約定を観測したとき
 - **2026-09-30 までに観測できなかったとき。** そのときは「OCAの取消連動は片側で確認済み」として閉じる。+10%へ届く建玉が出るかは相場しだいで、待つことは検証ではない
 
+**そしてこの期限は、文章ではなく毎朝のサマリが判定する**（`scripts/daily_report.assess_order_layer`、2026-09-01に実装）。**日付を書いただけでは期限にならない**——その日が来たことに誰も気付かなければ、静かに過ぎるだけである。CIで番人テストを人手の記憶から機械的な起動へ移したのと同じ理由で、ここも機械に判定させる。
+
+- **判定の材料は `logs/fills.jsonl` の `order_type` である。** 待機注文の約定は STP / LMT、Bot側の成行決済は MKT として記録される。**`trade_journal.csv` の `reason` では区別できない**——待機注文の逆指値もBot側のポーリング判定も、どちらも `STOP_LOSS` として記録されるためである
+- **観測は累積で判定する。** 乖離の節はその取引日のぶんだけを出すが、「利確LMTを一度でも観測したか」は別の問いである。混ぜると、観測した翌日にサマリが未観測へ戻る
+- **ドライランの行を数えない。** 実約定が無いので何も観測していない
+- **行動が要るときだけ、サマリの冒頭にも出す。** 節の中だけに置くと、下まで読まれなかった日に見落とす。毎日冒頭に出すと、その行自体が読み飛ばされる側になる
+- **既に終わった観測（transmit順序・親子関係・OCAの取消連動・子注文の逆指値約定）をチェックリストに並べ直さない。** 残り1点が埋もれる
+- **期限の判定は実時刻ではなく対象の取引日で行う。** `--date` を指定したときに過去のサマリが再現できなくなるため
+
+`tests/test_daily_report.py` の `test_passing_the_order_layer_deadline_calls_for_closing` / `test_a_take_profit_limit_fill_closes_the_order_layer_verification` / `test_a_bot_side_market_exit_is_not_a_take_profit_limit_fill` / `test_the_order_layer_status_is_judged_across_all_days_not_just_today` / `test_the_call_to_close_is_printed_before_the_report` / `test_the_deadline_matches_the_one_recorded_in_the_exit_conditions` が番人。**最後の1件は、この節の日付と `ORDER_LAYER_DEADLINE` がずれることを防いでいる**（片方だけ動かすと、文書と稼働の判定が食い違う）。
+
 **閉じたら、その日のうちにタイマーを止めること**（`systemctl --user disable --now ibkralgotrade.timer ibkralgotrade-afterclose.timer`）。惰性で動かし続けると、**`logs/trade_journal.csv` に「検証のための往復」と「惰性の往復」が混ざり、後から区別できなくなる**。$1,220 での期待値は -0.05%/trade（実測手数料。「検証時の初期資金」節）なので、積むほど記録が薄まる方向にしか働かない。
 
 **止めるときの手順**（記録は再生成できない。「3. 実行環境と設定」の控えの節）:

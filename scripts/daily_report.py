@@ -30,7 +30,13 @@ from datetime import date, datetime, timedelta, tzinfo
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 from core.market_hours import MARKET_CLOSE, US_EASTERN, is_us_market_holiday
-from execution.fill_log import DEFAULT_FILL_LOG_PATH, EVENT_ENTRY, FillLog, FillRecord
+from execution.fill_log import (
+    DEFAULT_FILL_LOG_PATH,
+    EVENT_ENTRY,
+    EVENT_EXIT,
+    FillLog,
+    FillRecord,
+)
 from execution.trade_journal import DEFAULT_JOURNAL_PATH, TradeJournal, TradeRecord
 
 DEFAULT_LOG_PATH: str = "logs/bot.log"
@@ -129,6 +135,86 @@ class LogLine:
     message: str
 
 
+# --- 注文層の検証 ---------------------------------------------------------
+#
+# **期限を書いただけでは期限にならない。** 「撤退条件」節で 2026-09-30 と決めたが、
+# 文章のままでは、その日が来たことに誰も気付かない——本プロジェクトが一貫して
+# 警戒している静かな縮退の形そのものである。CIで番人テストを機械的に起動したのと
+# 同じ理由で、期限も毎朝のサマリから機械的に判定する。
+ORDER_LAYER_DEADLINE: date = date(2026, 9, 30)
+
+# 残っている未観測は「利確LMTの約定」1点だけである。transmit順序・親子関係・
+# OCAの取消連動・子注文の逆指値約定は、2026-08-18(permId 470578603)と
+# 08-24(permId 1408826975)で実測済みで、**この判定では見に行かない**
+# （終わった観測を毎日チェックリストに並べ直すと、残り1点が埋もれる）。
+#
+# 判定の材料は `logs/fills.jsonl` の `order_type` である。待機注文の約定は
+# STP / LMT、Bot側の成行決済は MKT として記録されるので、
+# **`trade_journal.csv` の `reason` では区別できない**（どちらも STOP_LOSS に
+# なりうる）。ドライランの行は実約定を持たないので数えない。
+_TAKE_PROFIT_ORDER_TYPE: str = "LMT"
+
+
+@dataclass
+class OrderLayerStatus:
+    """注文層の検証が閉じてよい状態かどうか。"""
+
+    observed_on: Optional[date]
+    deadline: date
+    days_left: int
+
+    @property
+    def should_close(self) -> bool:
+        """観測が揃ったか、期限に達したか。"""
+        return self.observed_on is not None or self.days_left < 0
+
+    def headline(self) -> str:
+        if self.observed_on is not None:
+            return (
+                f"!!! 利確LMTの約定を {self.observed_on} に観測しました。"
+                "注文層の検証は完了です——「撤退条件」節の手順で稼働を止めること。"
+            )
+        if self.days_left < 0:
+            return (
+                f"!!! 注文層の検証の期限（{self.deadline}）を {-self.days_left}日 超過しています。"
+                "利確LMTの約定は未観測ですが、OCAの取消連動は逆指値側で2回再現しており"
+                "（2026-08-18 / 08-24）、OCAは対称なので利確側から得られる情報は小さい。"
+                "「片側で確認済み」として閉じること。"
+            )
+        return ""
+
+
+def assess_order_layer(
+    fills: Iterable[FillRecord], today: date, deadline: date = ORDER_LAYER_DEADLINE,
+) -> OrderLayerStatus:
+    """利確LMTの約定を観測できたか、期限に達したかを判定する。
+
+    **観測できた日を返すこと**（真偽値ではなく）。いつ閉じてよくなったのかが
+    分からないと、サマリを遡って探すことになる。
+    """
+    observed_on: Optional[date] = None
+    for record in fills:
+        if record.event != EVENT_EXIT or record.order_type != _TAKE_PROFIT_ORDER_TYPE:
+            continue
+        # ドライランの行は実約定を持たない。0で埋まっている行も同じ扱いにする。
+        if record.dry_run or record.fill_price is None:
+            continue
+        try:
+            day = date.fromisoformat(record.trading_day)
+        except (TypeError, ValueError):
+            # 日付が読めない行で判定を落とさない。観測はあったので、最初の
+            # 1件が読めなくても他の行で拾える。
+            continue
+        if observed_on is None or day < observed_on:
+            observed_on = day
+
+    return OrderLayerStatus(
+        observed_on=observed_on,
+        deadline=deadline,
+        days_left=(deadline - today).days,
+    )
+
+
 @dataclass
 class DayReport:
     trading_day: date
@@ -154,6 +240,8 @@ class DayReport:
     connection_failure_rounds: int = 0
     manual_login_hint: bool = False
     warnings: Counter = field(default_factory=Counter)
+    # 注文層の検証が閉じてよいか。**期限は文章ではなく毎朝ここで判定する。**
+    order_layer: Optional[OrderLayerStatus] = None
     errors: Counter = field(default_factory=Counter)
     trades: List[TradeRecord] = field(default_factory=list)
     # その取引日の約定（想定価格との乖離込み）。決済単位の `trades` とは粒度が
@@ -237,9 +325,15 @@ def build_day_report(
     fills: Iterable[FillRecord] = (),
 ) -> DayReport:
     report = DayReport(trading_day=trading_day)
+    # **注文層の判定は全期間の約定を見る。** 乖離の節はその日のぶんだけを出すが、
+    # 「利確LMTを一度でも観測したか」は累積の問いである。
+    all_fills = list(fills)
     report.fills = [
-        fill for fill in fills if fill.trading_day == trading_day.isoformat()
+        fill for fill in all_fills if fill.trading_day == trading_day.isoformat()
     ]
+    # 期限の判定は実時刻ではなく対象の取引日で行う。`--date` を指定したときに
+    # 過去のサマリが再現できなくなるため（レポートの他の節と同じ扱い）。
+    report.order_layer = assess_order_layer(all_fills, today=trading_day)
 
     for line in log_lines:
         if line.trading_day != trading_day:
@@ -491,6 +585,36 @@ def _format_fills(fills: List[FillRecord]) -> str:
     return "\n".join(lines)
 
 
+def _format_order_layer(status: Optional[OrderLayerStatus]) -> str:
+    """注文層の検証の残り。**現フェーズの目的そのものなので毎日出す。**"""
+    if status is None:
+        return "--- 注文層の検証 ---\n  判定できませんでした。"
+
+    lines = ["--- 注文層の検証 ---"]
+    if status.observed_on is not None:
+        lines.append(
+            f"  利確LMTの約定を {status.observed_on} に観測済み。**検証は完了しています。**"
+        )
+        lines.append(
+            "  「撤退条件」節の手順で稼働を止めること"
+            "（惰性で続けると trade_journal.csv に検証の往復と惰性の往復が混ざる）。"
+        )
+    elif status.days_left < 0:
+        lines.append(
+            f"  未観測のまま期限（{status.deadline}）を {-status.days_left}日 超過。"
+            "**片側で確認済みとして閉じること。**"
+        )
+    else:
+        lines.append(
+            f"  残る未観測は利確LMTの約定1点。期限 {status.deadline} まで あと{status.days_left}日。"
+        )
+        lines.append(
+            "  逆指値側のOCA取消連動は2026-08-18 / 08-24に実測済み。"
+            "期限までに観測できなければ片側で確認済みとして閉じる。"
+        )
+    return "\n".join(lines)
+
+
 def format_report(report: DayReport) -> str:
     lines: List[str] = []
     lines.append(f"===== {report.trading_day} (米国東部時間) の稼働サマリ =====")
@@ -533,6 +657,9 @@ def format_report(report: DayReport) -> str:
             "  検証した母集団の一部が使われていない状態。増資すると帯を通る件数が"
             "増えるので、枠(MAX_WATCHLIST_SIZE)とポーリング間隔を併せて見直すこと。"
         )
+
+    lines.append("")
+    lines.append(_format_order_layer(report.order_layer))
 
     lines.append("")
     lines.append(_format_fills(report.fills))
@@ -723,6 +850,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     report = build_day_report(log_lines, trades, trading_day, fills)
     if warning:
         print(warning)
+        print()
+    # 節の中だけに置くと、下まで読まれなかった日に期限を見落とす。**行動が要る
+    # ときだけ**冒頭にも出す（毎日出すと、この行自体が読み飛ばされる側になる）。
+    if report.order_layer is not None and report.order_layer.should_close:
+        print(report.order_layer.headline())
         print()
     print(format_report(report))
     return 0

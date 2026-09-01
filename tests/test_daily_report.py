@@ -10,6 +10,9 @@ from datetime import date, datetime, timedelta, timezone
 from execution.fill_log import FillRecord
 from execution.trade_journal import TradeRecord
 from scripts.daily_report import (
+    ORDER_LAYER_DEADLINE,
+    main as daily_report_main,
+    assess_order_layer,
     build_day_report,
     format_report,
     last_closed_trading_day,
@@ -513,3 +516,122 @@ def test_no_truncation_section_when_everything_fits():
     rendered = format_report(build_day_report(_lines(), [], date(2026, 8, 27)))
 
     assert "監視枠からあふれた銘柄" not in rendered
+
+
+# --- 注文層の検証の期限 ---------------------------------------------------------
+
+
+def _lmt_exit(day: str, **overrides) -> FillRecord:
+    """利確LMTの約定。**待機注文の約定は order_type で見分ける。**"""
+    payload = dict(
+        recorded_at=f"{day}T13:31:00+00:00", trading_day=day, symbol="INTC",
+        event="exit", action="SELL", order_type="LMT", quantity=2,
+        intended_price=112.66, fill_price=112.70, deviation_pct=0.04,
+        adverse_usd=0.0, dry_run=False,
+    )
+    payload.update(overrides)
+    return FillRecord(**payload)
+
+
+def test_the_order_layer_deadline_is_reported_before_it_passes():
+    """期限前は残り日数を出すこと。**期限は文章ではなく毎朝ここで判定する。**"""
+    status = assess_order_layer([], today=date(2026, 9, 1))
+
+    assert status.observed_on is None
+    assert status.days_left == 29
+    assert status.should_close is False
+
+
+def test_passing_the_order_layer_deadline_calls_for_closing():
+    """期限を過ぎたら閉じるよう促すこと。
+
+    「撤退条件」節に日付を書いただけでは、その日が来たことに誰も気付かない
+    ——本プロジェクトが警戒している静かな縮退そのものである。
+    """
+    status = assess_order_layer([], today=date(2026, 10, 6))
+
+    assert status.should_close is True
+    assert "超過" in status.headline()
+
+
+def test_a_take_profit_limit_fill_closes_the_order_layer_verification():
+    """利確LMTの約定を観測したら、期限前でも完了として扱うこと。"""
+    status = assess_order_layer([_lmt_exit("2026-09-12")], today=date(2026, 9, 15))
+
+    assert status.observed_on == date(2026, 9, 12)
+    assert status.should_close is True
+
+
+def test_a_bot_side_market_exit_is_not_a_take_profit_limit_fill():
+    """Bot側の成行決済(MKT)を待機注文の約定と数えないこと。
+
+    **`trade_journal.csv` の `reason` では区別できない**——待機注文の逆指値も
+    Bot側のポーリング判定も、どちらも STOP_LOSS として記録される。区別が
+    付くのは `fills.jsonl` の `order_type` だけである。
+    """
+    status = assess_order_layer(
+        [_lmt_exit("2026-09-12", order_type="MKT")], today=date(2026, 9, 15),
+    )
+
+    assert status.observed_on is None
+
+
+def test_a_dry_run_exit_does_not_close_the_verification():
+    """ドライランの行で完了にしないこと。実約定が無いので何も観測していない。"""
+    status = assess_order_layer(
+        [_lmt_exit("2026-09-12", dry_run=True)], today=date(2026, 9, 15),
+    )
+
+    assert status.observed_on is None
+
+
+def test_the_order_layer_status_is_judged_across_all_days_not_just_today():
+    """観測は累積の問いなので、その取引日のぶんだけで判定しないこと。
+
+    乖離の節はその日のぶんだけを出すが、「利確LMTを一度でも観測したか」は
+    別の問いである。混ぜると、観測した翌日にサマリが未観測へ戻る。
+    """
+    report = build_day_report(
+        [], [], date(2026, 9, 15), fills=[_lmt_exit("2026-09-12")],
+    )
+
+    assert report.fills == []
+    assert report.order_layer is not None
+    assert report.order_layer.observed_on == date(2026, 9, 12)
+    assert "2026-09-12" in format_report(report)
+
+
+def test_the_deadline_matches_the_one_recorded_in_the_exit_conditions():
+    """CLAUDE.mdの「撤退条件」節と同じ日付であること。
+
+    片方だけ動かすと、文書と稼働の判定が食い違う。
+    """
+    assert ORDER_LAYER_DEADLINE == date(2026, 9, 30)
+
+
+def test_the_call_to_close_is_printed_before_the_report(tmp_path, capsys):
+    """期限超過の案内を、レポート本体より前に出すこと。
+
+    節の中だけに置くと、下まで読まれなかった日に見落とす。**これはこの機能で
+    唯一「行動が要る」ことを伝える行なので、埋もれさせてはならない。**
+
+    `--date` を渡すのはタイムゾーン差で判定が揺れないようにするため（手元は
+    JST・CIはUTCで、ログの時刻文字列から導く取引日が食い違う）。
+    """
+    log = tmp_path / "bot.log"
+    log.write_text("2026-10-06 23:00:00,000 [INFO] __main__: 起動しました。\n", encoding="utf-8")
+    journal = tmp_path / "trade_journal.csv"
+    journal.write_text("", encoding="utf-8")
+    fills = tmp_path / "fills.jsonl"
+    fills.write_text("", encoding="utf-8")
+
+    exit_code = daily_report_main([
+        "--date", "2026-10-06",
+        "--log", str(log), "--journal", str(journal), "--fills", str(fills),
+    ])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "超過" in out
+    # レポート本体（最初の節）より前にあること。
+    assert out.index("超過") < out.index("--- 注文層の検証 ---")
