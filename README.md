@@ -54,6 +54,17 @@ python -m scripts.measure_alpha --csv-dir examples/bars \
     --benchmark examples/index/SPY.csv --initial-equity 1220 --watchlist-size 0
 ```
 
+**同じ結果が出ることを確かめる**——`--report` は、結果に**入力の指紋・パラメータ・実行環境**を添えて書き出す。
+
+```bash
+python -m backtest.run --csv examples/bars/AAPL.csv --mode backtest \
+    --initial-equity 1220 --report report.md
+```
+
+先頭に出る `result_digest` は `SHA-256(入力の指紋 + パラメータ + 結果)` で、**同じデータ・同じ設定の実行なら一致する**。数字が前と違ったときに、**データが変わったのか・パラメータが変わったのか・コードが変わったのか**を切り分けられる。
+
+**実行時刻と実行環境は digest に含めない。** 前者を入れると同じ入力の2回が必ず別の値になり、確認そのものが成立しない。後者は意図的で、確かめたいのは「**環境が変わっても数字が変わらないこと**」だからである（CIは pandas 2系と3系の両方で digest の一致を検証している）。
+
 ## 規模
 
 | | |

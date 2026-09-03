@@ -16,11 +16,14 @@ CSVは `python -m scripts.fetch_bars` で用意できる（IBKR接続不要）�
 
 import argparse
 import asyncio
+import datetime as dt
 import glob
 import logging
 import os
-from dataclasses import replace
-from typing import Dict, List, Optional, Sequence
+import shlex
+import sys
+from dataclasses import asdict, replace
+from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
 
@@ -29,6 +32,13 @@ from backtest.csv_source import load_bars_from_csv
 from backtest.engine import BacktestConfig, run_backtest
 from backtest.market_reference import DEFAULT_MARKET_MA_WINDOW, attach_market_deviation
 from backtest.metrics import PerformanceMetrics, compute_metrics
+from backtest.report import (
+    InputFingerprint,
+    RunReport,
+    fingerprint_bars,
+    sha256_of_file,
+    write_report,
+)
 from backtest.multi_symbol import format_report, run_multi_symbol_walk_forward
 from backtest.walk_forward import (
     DEFAULT_MIN_TRADES_FOR_SELECTION,
@@ -176,6 +186,15 @@ def _parse_args() -> argparse.Namespace:
         help="手数料・スリッページを一切かけない（コスト影響の比較専用。収益性の判断には使わないこと）。",
     )
 
+    parser.add_argument(
+        "--report", metavar="PATH",
+        help=(
+            "検証結果を、入力の指紋・パラメータ・実行環境つきでファイルへ書き出す。"
+            "拡張子が .md なら人が読む形、それ以外はJSON。"
+            "同じデータ・同じパラメータの実行は result_digest が一致する。"
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.csv and args.csv_dir:
@@ -293,15 +312,85 @@ def _log_metrics(metrics: PerformanceMetrics, total_commission: Optional[float] 
         logger.info("支払い手数料の合計=%.2f USD（上記の損益は控除後）", total_commission)
 
 
+def _parameters(args: argparse.Namespace, grid: ParameterGrid, cost_model: CostModel) -> Dict[str, Any]:
+    """レポートに残す設定。**結果を変えうるものだけを入れる。**
+
+    `--verbose` や `--report` のような出力の設定は入れない。入れると、
+    ログを増やしただけで digest が変わり、再現性の確認が使えなくなる。
+    """
+    params: Dict[str, Any] = {
+        "initial_equity": args.initial_equity,
+        "price_column": args.price_column,
+        "grid": asdict(grid),
+        "costs": asdict(cost_model),
+    }
+    if args.mode == "walk-forward":
+        params["walk_forward"] = {
+            "train_bars": args.train_bars,
+            "test_bars": args.test_bars,
+            "step_bars": args.step_bars,
+            "min_trades_for_selection": args.min_trades,
+        }
+    if args.market_csv:
+        # 指数はファイル名だけ残す（中身の指紋は inputs 側に入る）。
+        params["market_reference"] = {
+            "file": os.path.basename(args.market_csv),
+            "ma_window": args.market_ma_window,
+        }
+    return params
+
+
+def _fingerprint(symbol: str, df: pd.DataFrame, path: Optional[str]) -> InputFingerprint:
+    return fingerprint_bars(
+        symbol, df, path=path,
+        file_sha256=sha256_of_file(path) if path else None,
+    )
+
+
+def _emit_report(
+    args: argparse.Namespace, *, mode: str, inputs: List[InputFingerprint],
+    results: Dict[str, Any], parameters: Dict[str, Any],
+) -> None:
+    if not args.report:
+        return
+    report = RunReport(
+        mode=mode,
+        command="python -m backtest.run " + shlex.join(sys.argv[1:]),
+        parameters=parameters,
+        inputs=inputs,
+        results=results,
+        generated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+    )
+    digest = write_report(args.report, report)
+    logger.info("レポートを書き出しました: %s", args.report)
+    logger.info("result_digest=%s（同じ入力・同じ設定なら一致する）", digest)
+
+
+def _metrics_dict(metrics: PerformanceMetrics) -> Dict[str, Any]:
+    return asdict(metrics)
+
+
+def _csv_paths_by_symbol(directory: str) -> Dict[str, str]:
+    """ディレクトリ内の *.csv を「銘柄 -> パス」で返す。
+
+    **読み込みと指紋づくりが同じ関数を見るようにしてある。** 別々に glob すると、
+    片方だけ並び順や拡張子の扱いを変えたときに、レポートが実際に検証した
+    ファイルと違うものを指しうる。
+    """
+    return {
+        os.path.splitext(os.path.basename(path))[0].upper(): path
+        for path in sorted(glob.glob(os.path.join(directory, "*.csv")))
+    }
+
+
 def _load_csv_directory(directory: str, price_column: Optional[str]) -> Dict[str, pd.DataFrame]:
     """ディレクトリ内の *.csv を「銘柄 -> バー」の辞書として読み込む。"""
-    paths = sorted(glob.glob(os.path.join(directory, "*.csv")))
-    if not paths:
+    paths_by_symbol = _csv_paths_by_symbol(directory)
+    if not paths_by_symbol:
         raise ValueError(f"CSVが1件も見つかりません: {directory}")
 
     frames: Dict[str, pd.DataFrame] = {}
-    for path in paths:
-        symbol = os.path.splitext(os.path.basename(path))[0].upper()
+    for symbol, path in paths_by_symbol.items():
         try:
             frames[symbol] = load_bars_from_csv(path, price_column=price_column)
         except ValueError:
@@ -343,6 +432,34 @@ def _run_multi_symbol(args: argparse.Namespace, cost_model: CostModel) -> None:
     )
     print(f"\n  支払い手数料の合計 : {total_commission:,.2f} USD（上記の損益は控除後）")
 
+    # **引数の組み立てを guard の内側に置く。** `asdict` や銘柄別の集計は
+    # レポートを書かない実行では純粋な無駄で、呼び出し側の型にも依存する。
+    if not args.report:
+        return
+    paths = _csv_paths_by_symbol(args.csv_dir)
+    _emit_report(
+        args, mode="walk-forward-multi",
+        inputs=[_fingerprint(sym, df, paths.get(sym)) for sym, df in frames.items()],
+        parameters=_parameters(args, _build_grid(args), cost_model),
+        results={
+            "combined": asdict(report.combined),
+            "total_commission": total_commission,
+            "num_symbols": len(report.outcomes),
+            "per_symbol": [
+                {
+                    "symbol": o.symbol,
+                    "num_trades": o.summary.num_trades,
+                    "win_rate_pct": o.summary.win_rate_pct,
+                    "profit_factor": o.summary.profit_factor,
+                    "total_pnl": o.summary.total_pnl,
+                    "num_windows": o.num_windows,
+                    "skipped_windows": o.skipped_windows,
+                }
+                for o in report.outcomes
+            ],
+        },
+    )
+
 
 async def main() -> None:
     args = _parse_args()
@@ -377,7 +494,21 @@ async def main() -> None:
             relative_threshold_pct=grid.relative_threshold_pct[-1],
         )
         result = run_backtest(symbol, df, config)
-        _log_metrics(compute_metrics(result), sum(t.commission for t in result.trades))
+        metrics = compute_metrics(result)
+        total_commission = sum(t.commission for t in result.trades)
+        _log_metrics(metrics, total_commission)
+        if not args.report:
+            return
+        _emit_report(
+            args, mode="backtest",
+            inputs=[_fingerprint(symbol, df, args.csv)],
+            parameters=_parameters(args, grid, cost_model),
+            results={
+                "metrics": _metrics_dict(metrics),
+                "total_commission": total_commission,
+                "final_equity": result.final_equity,
+            },
+        )
         return
 
     grid = _build_grid(args)
@@ -405,9 +536,28 @@ async def main() -> None:
         "trades=%d win_rate=%.1f%% profit_factor=%.2f total_pnl=%.2f",
         summary.num_trades, summary.win_rate_pct, summary.profit_factor, summary.total_pnl,
     )
-    logger.info(
-        "支払い手数料の合計=%.2f USD（上記の損益は控除後）",
-        sum(t.commission for w in wf_result.windows for t in w.test_trades),
+    total_commission = sum(t.commission for w in wf_result.windows for t in w.test_trades)
+    logger.info("支払い手数料の合計=%.2f USD（上記の損益は控除後）", total_commission)
+    if not args.report:
+        return
+    _emit_report(
+        args, mode="walk-forward",
+        inputs=[_fingerprint(symbol, df, args.csv)],
+        parameters=_parameters(args, grid, cost_model),
+        results={
+            "combined_test_summary": asdict(summary),
+            "total_commission": total_commission,
+            "skipped_windows": wf_result.skipped_windows,
+            "windows": [
+                {
+                    "test_start_index": w.test_start_index,
+                    "test_end_index": w.test_end_index,
+                    "best_config": asdict(w.best_config),
+                    "test_metrics": _metrics_dict(w.test_metrics),
+                }
+                for w in wf_result.windows
+            ],
+        },
     )
 
 
