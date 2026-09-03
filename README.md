@@ -35,7 +35,7 @@ Interactive Brokers の API を用い、米国株の押し目買い（日足の�
 ```bash
 pip install -r requirements-dev.txt
 
-# 番人テスト 938件（IBKRへの実接続なし・全てモック）
+# 番人テスト 953件（IBKRへの実接続なし・全てモック）
 python -m pytest -q
 
 # 単一銘柄のバックテスト（コスト込み・1秒未満）
@@ -58,59 +58,95 @@ python -m scripts.measure_alpha --csv-dir examples/bars \
 
 | | |
 | --- | --- |
-| 本体のコード | 14,756行 |
-| テストコード | 14,455行 / **938件** — IBKRへの実接続なし（全てモック）・約2秒で完走 |
+| 本体のコード | 14,677行 |
+| テストコード | 14,732行 / **953件** — IBKRへの実接続なし（全てモック）・約2秒で完走 |
 | カバレッジ | 87%（`main.py` 91% / `execution/order_manager.py` 96%） |
-| 型注釈 | 戻り値 420関数中 413（98%）・mypy 通過 |
+| 型注釈 | 戻り値 416関数中 413（99%）・mypy 通過 |
 | 構成 | 6パッケージ（接続 / データ取得 / 戦略判定 / 執行 / バックテスト / 運用スクリプト） |
 | 稼働 | VPS（Ubuntu）+ systemd による無人運用。平日22:15起動・翌06:05締め（日本時間） |
 | CI | GitHub Actions で lint（ruff）・型検査（mypy）・テストを、稼働環境と同じ Linux・pandas 2系/3系で実行 |
 
 ## 構成
 
+### モジュールの依存関係
+
 ```mermaid
 flowchart TD
-    subgraph entry[エントリーポイント]
-        M[main.py<br/>非同期の監視ループ]
+    M["main.py<br/>非同期の監視ループ 450秒"]
+
+    subgraph core_["core/ 基盤"]
+        C["connection.py 再接続・指数バックオフ"]
+        P["pacing.py 10分60件の制限を守る"]
+        H["market_hours.py 立会時間・休場日"]
+        L["logging_setup.py 定型通知の抑制"]
     end
-    subgraph core_[core/ 基盤]
-        C[connection.py<br/>再接続・指数バックオフ]
-        P[pacing.py<br/>10分60件の制限を守る]
-        H[market_hours.py<br/>立会時間・休場日]
-        L[logging_setup.py<br/>定型通知の抑制]
+    subgraph data_["data/ IBKR APIとの唯一の境界"]
+        D["market_data.py 取得の唯一の入口"]
+        CA["cache.py 日足は取引日単位"]
     end
-    subgraph data_[data/ IBKR APIとの境界]
-        D[market_data.py<br/>IBKR取得の唯一の入口]
-        CA[cache.py<br/>日足は取引日単位]
+    subgraph strategy_["strategy/ 純粋な判定・I/O非依存"]
+        S1["pullback.py 押し目"]
+        S2["exit_signal.py 決済"]
+        S3["momentum.py 横断ランク"]
+        S4["screener.py 銘柄選定"]
     end
-    subgraph strategy_[strategy/ 純粋な判定]
-        S1[pullback.py 押し目]
-        S2[exit_signal.py 決済]
-        S3[momentum.py 横断ランク]
-        S4[screener.py 銘柄選定]
+    subgraph exec_["execution/ 執行と記録"]
+        E1["order_manager.py ブラケット・OCA・約定の読み取り"]
+        E2["position_manager.py 状態の永続化・ブローカー同期"]
+        E3["trade_journal.py / fill_log.py 損益と乖離の記録"]
     end
-    subgraph exec_[execution/ 執行と記録]
-        E1[order_manager.py<br/>ブラケット・OCA・約定の読み取り]
-        E2[position_manager.py<br/>状態の永続化・ブローカー同期]
-        E3[trade_journal.py / fill_log.py<br/>損益と乖離の記録]
+    subgraph bt["backtest/ 測定の道具（互いに独立）"]
+        B1["engine.py / walk_forward.py<br/>コスト込み・過剰最適化の検出"]
+        B2["portfolio.py 口座水準の再現"]
+        B3["benchmark.py 超過リターン"]
+        B6["signal_study.py 対照群つきイベントスタディ"]
+        B5["survivorship.py 生存バイアスの損益分岐"]
+        B4["robustness.py 採否の判定・一貫性8項目"]
     end
-    subgraph bt[backtest/ 検証]
-        B1[engine.py / walk_forward.py]
-        B2[portfolio.py 口座水準]
-        B3[benchmark.py 超過リターン]
-        B4[robustness.py 採否の判定]
-        B5[survivorship.py 生存バイアス]
+    subgraph sc["scripts/ 道具を組み合わせる入口"]
+        R1["measure_alpha.py"]
+        R2["check_robustness.py"]
+        R3["daily_report.py"]
     end
 
-    M --> C & D & S1 & S2 & E1 & E2
-    D --> CA
-    S1 -.同じ判定ロジックを共有.-> B1
-    S2 -.同上.-> B1
-    B1 --> B2 --> B3 --> B4
-    B5 --> B4
+    M --> core_ & data_ & strategy_ & exec_
+    CA --> D
+    D --> P
+    strategy_ -. ライブとバックテストで同一のコードが動く .-> bt
+    R1 --> B2 --> B3
+    R2 --> B6 & B5 & B4
+    exec_ -. 記録を読む .-> R3
 ```
 
-**`data/` が IBKR API との唯一の境界である。** ペーシング制限とキャッシュを迂回させないため、他パッケージから IBKR のデータ取得APIを直接呼ぶことを禁じている。`strategy/` は I/O に依存しない純粋関数で、**ライブとバックテストで同じコードが動く**。
+**読み方の要点が3つある。**
+
+- **`data/` が IBKR API との唯一の境界である。** ペーシング制限（10分60件）とキャッシュを迂回させないため、他パッケージから IBKR のデータ取得APIを直接呼ぶことを禁じている。破ると例外ではなく**空のバー列**が返り、「データが無い銘柄」と区別がつかなくなる
+- **`strategy/` は I/O に依存しない純粋関数で、ライブとバックテストが同じコードを動かす。** 点線がその共有を示している。ここが分岐すると、検証した戦略と稼働する戦略が別物になる
+- **`backtest/` の各モジュールは pipeline ではなく、独立した測定の道具である。** 互いを import しておらず、組み合わせているのは `scripts/` 側である（`robustness.py` は `backtest/` から何も import しない）。新しい仮説が現れたとき、測る道具だけが再利用される
+
+### 1日のサイクル
+
+```mermaid
+flowchart LR
+    subgraph vps["VPS (Ubuntu) · systemd"]
+        T1["ibkralgotrade.timer<br/>月〜金 22:15 JST"]
+        T2["ibkralgotrade-afterclose.timer<br/>火〜土 06:05 JST"]
+        BOT["main.py<br/>監視上限 38銘柄 / 450秒間隔<br/>同時保有 2銘柄"]
+    end
+    IBG["IB Gateway<br/>ペーパー口座<br/>IBCが日次の再ログインを代行"]
+    MKT[("IBKR<br/>米国株")]
+    LOGS["logs/ (Git管理外)<br/>trade_journal.csv · fills.jsonl<br/>positions.json · bot.log"]
+
+    T1 -->|"取引日か判定<br/>休場なら起動しない"| BOT
+    BOT <-->|ib_async| IBG <--> MKT
+    BOT -->|"利確LMT / 損切りSTP を<br/>ブローカー側に置く"| IBG
+    BOT --> LOGS
+    T2 -->|"Bot停止 → 控え → 約定価格の確認 → サマリ"| LOGS
+```
+
+**2本のタイマーの曜日が1日ずれているのは誤りではない。** 金曜22:15に始まったセッションを閉じるのは土曜06:05のジョブなので、締め側を月〜金にすると**金曜のセッションが週末まで走り続ける**。
+
+**祝日はスケジューラでは表現できない**（systemd の `OnCalendar` に除外の仕組みが無い）ため、判定は起動直前に行う。このとき**休場日（終了コード1）と判定失敗を区別すること**が要る——まとめて「起動しない」に倒すと、設定を間違えた日が休場日と同じ見た目になり、しかもスケジューラには成功として記録される。
 
 ### ここから読む
 
