@@ -22,7 +22,8 @@ const KIND_LABEL: Record<Change["kind"], string> = {
 /** 葉の単位の差分。**節（inputs / parameters / results）を必ず添える。** */
 export function DiffTable({ changes }: { readonly changes: readonly Change[] }) {
   return (
-    <table>
+    <div className="scroller">
+      <table>
       <thead>
         <tr>
           <th>節</th>
@@ -41,10 +42,11 @@ export function DiffTable({ changes }: { readonly changes: readonly Change[] }) 
             <td className="mono">{change.path}</td>
             <td className="mono">{render(change.left)}</td>
             <td className="mono">{render(change.right)}</td>
-            <td>{KIND_LABEL[change.kind]}</td>
+            <td className="kind">{KIND_LABEL[change.kind]}</td>
           </tr>
         ))}
-      </tbody>
-    </table>
+        </tbody>
+      </table>
+    </div>
   );
 }

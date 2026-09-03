@@ -68,7 +68,12 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
 .pill.ok { color: var(--ok); border-color: var(--ok); }
 .pill.bad { color: var(--bad); border-color: var(--bad); }
 
+/* 64桁のハッシュが入るので、表は横スクロールできる箱に入れる。
+   入れないと最後の列（種類）が縦書きに潰れて読めなくなる。 */
+.scroller { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+td.mono { word-break: break-all; }
+td.kind { white-space: nowrap; }
 th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-weight: 600; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -88,3 +93,6 @@ button:hover { border-color: var(--accent); }
 
 .error { color: var(--bad); font-size: 0.85rem; }
 .note { color: var(--muted); font-size: 0.85rem; }
+
+.samples { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 1.25rem 0 0; }
+.samples .note { margin-right: 0.25rem; }

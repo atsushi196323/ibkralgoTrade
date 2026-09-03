@@ -4,8 +4,9 @@
   "private": true,
   "description": "バックテストのレポートJSONを2つ突き合わせ、result_digest の一致と、一致しない場合はどこが動いたかを示す",
   "scripts": {
-    "dev": "next dev",
+    "dev": "node scripts/copy-fixtures.mjs && next dev",
     "build": "next build",
+    "prebuild": "node scripts/copy-fixtures.mjs",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",

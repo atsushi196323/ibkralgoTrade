@@ -14,9 +14,38 @@ interface Slot {
 
 const EMPTY: Slot = { report: null, error: null };
 
+/**
+ * 公開した画面を開いた人が、手元にレポートを持っていなくても試せるようにする。
+ *
+ * **見本は Python 側が生成したもの**（`python -m scripts.make_web_fixtures`）で、
+ * `fixtures/` から `public/samples/` へ複製している。ここで作った偽物ではない
+ * ——偽物を置くと、この画面が確かめていること（**Python が書いた digest を
+ * 計算し直して一致させる**）を、自分で作った値で確かめることになる。
+ */
+const SAMPLES = [
+  { label: "同じ入力・同じ設定", file: "report_base.json" },
+  { label: "入力だけ違う", file: "report_changed_input.json" },
+  { label: "設定だけ違う", file: "report_changed_parameters.json" },
+  { label: "結果だけ違う", file: "report_changed_results.json" },
+  { label: "環境だけ違う（digest は一致）", file: "report_same_digest_other_environment.json" },
+] as const;
+
+// 静的書き出しでは basePath の下に置かれるので、そこを起点にする。
+const SAMPLE_BASE = `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/samples`;
+
 export default function Page() {
   const [left, setLeft] = useState<Slot>(EMPTY);
   const [right, setRight] = useState<Slot>(EMPTY);
+
+  async function loadSample(name: string, set: (slot: Slot) => void): Promise<void> {
+    try {
+      const response = await fetch(`${SAMPLE_BASE}/${name}`);
+      if (!response.ok) throw new Error(`見本を取得できません（HTTP ${response.status}）`);
+      set({ report: await readReport(name, await response.text()), error: null });
+    } catch (error) {
+      set({ report: null, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
 
   async function load(file: File, set: (slot: Slot) => void): Promise<void> {
     try {
@@ -54,6 +83,22 @@ export default function Page() {
         <br />
         ファイルはブラウザの中だけで処理し、どこにも送らない。
       </p>
+
+      <div className="samples">
+        <span className="note">手元にレポートが無ければ、見本で試せる（左＝基準）:</span>
+        {SAMPLES.map((sample) => (
+          <button
+            key={sample.file}
+            type="button"
+            onClick={() => {
+              void loadSample("report_base.json", setLeft);
+              void loadSample(sample.file, setRight);
+            }}
+          >
+            {sample.label}
+          </button>
+        ))}
+      </div>
 
       <div className="slots">
         <ReportSlot
