@@ -1,0 +1,74 @@
+# `web/` のビューアを GitHub Pages へ公開する。
+#
+# **公開するのは検証レポートを読む画面だけで、口座のデータは1バイトも含まない。**
+# 静的書き出し（`output: "export"`）なので、動かすのにサーバもデータベースも
+# 認証も無い。読み込んだレポートはブラウザの中だけで処理され、どこへも送られない。
+#
+# **検査（web.yml）とは別の workflow にしてある。** 公開は「検査が通ったから
+# 出す」ものであって、検査そのものではない。混ぜると、公開の都合（Pages の
+# 権限や環境）で検査が落ちるようになり、CIが何を保証しているのか読めなくなる。
+
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 既定の権限では Pages へ書けない。**ここで足す権限は公開に必要な最小限である。**
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 公開は最新の1つだけでよい。ただし**進行中の公開は打ち切らない**
+# （途中で止めると、中途半端な内容が残りうる）。
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: web
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+
+      # **公開前にもテストを走らせる。** web.yml と重なるが、こちらは
+      # 「この成果物が緑だった」ことを公開の履歴に残すためのもので、
+      # 落ちた版が Pages に出ない歯止めになる。
+      - run: npm test
+
+      - name: 静的書き出し
+        env:
+          # プロジェクトページは `/<リポジトリ名>/` の下に置かれる。
+          # 空のままだと、公開したページが CSS も JS も読めない見た目になる。
+          NEXT_PUBLIC_BASE_PATH: /${{ github.event.repository.name }}
+        run: npm run build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
