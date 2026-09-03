@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           # digest の計算に使う crypto.subtle は Node 18 以降に標準で入っている。
           node-version: "22"
