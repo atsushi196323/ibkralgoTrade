@@ -171,3 +171,38 @@ def test_an_unreadable_file_does_not_stop_the_report(tmp_path) -> None:
 @pytest.mark.parametrize("closes", [(100.0, 101.0), (100.0, 101.0, 102.0)])
 def test_the_bar_count_is_part_of_the_fingerprint(closes) -> None:
     assert fingerprint_bars("AAPL", _bars(closes)).num_bars == len(closes)
+
+
+def test_a_non_finite_number_is_still_valid_json(tmp_path) -> None:
+    """`inf` を数値のまま書かない。
+
+    Pythonの `json` は既定で `Infinity` という**標準JSONに無い表記**を出すため、
+    その行が入ったレポートは `JSON.parse` 等で読めなくなる。プロフィット
+    ファクターは負けトレードが0件だと `inf` になるので、例外的な状況ではない。
+    """
+    path = tmp_path / "report.json"
+    write_report(str(path), _report(results={"profit_factor": float("inf")}))
+
+    text = path.read_text(encoding="utf-8")
+    assert "Infinity" not in text
+    assert json.loads(text)["results"]["profit_factor"] == "inf"
+
+
+def test_the_written_report_still_hashes_to_its_own_digest(tmp_path) -> None:
+    """書き出したファイルから計算し直した digest が、中の値と一致すること。
+
+    **これは他言語の実装との契約でもある**（`web/` のビューアは digest を
+    信じるのではなく計算し直して照合する）。書き出しの都合で値の表記を
+    変えると、その照合が黙って失敗する。
+    """
+    path = tmp_path / "report.json"
+    write_report(str(path), _report(results={"profit_factor": float("inf"), "num_trades": 3}))
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    recomputed = compute_digest({
+        "mode": payload["mode"],
+        "parameters": payload["parameters"],
+        "inputs": payload["inputs"],
+        "results": payload["results"],
+    })
+    assert recomputed == payload["result_digest"]

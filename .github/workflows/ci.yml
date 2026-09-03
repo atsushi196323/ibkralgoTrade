@@ -18,6 +18,11 @@
 name: CI
 
 on:
+  # **`web/` を paths-ignore で外さない。** 一見すると無駄な実行を減らせるが、
+  # `web/fixtures/` は Python 側が生成し `tests/test_web_fixtures.py` が
+  # 見張っているので、見本だけを手で書き換えた push でその番人が走らなくなる。
+  # 2つの言語が同じ digest を出すことがこのリポジトリの契約である以上、
+  # **片方の検査が黙って動かない状態を作る方が高くつく**（実行は2分未満）。
   push:
   pull_request:
   workflow_dispatch:

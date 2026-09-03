@@ -452,6 +452,12 @@ scripts/
   check_survivorship.py     生存バイアスの損益分岐を出す（IBKR接続不要）
   check_robustness.py       横断ランクのシグナルを一貫性の基準で判定する（IBKR接続不要）
   export_tax_report.py      確定申告用CSVを出力するCLI
+  make_web_fixtures.py      web/ のビューアが読む見本レポートを生成する（2言語の契約の土台）
+web/                        検証レポートを2つ突き合わせるビューア（Next.js / TypeScript）
+  lib/json-source.ts        整数と実数の区別を保ってJSONを読む（JSON.parse では digest がずれる）
+  lib/canonical.ts          Python と同じ正規化・同じ digest を独立に計算し直す
+  lib/diff.ts               入力・パラメータ・結果のどこが動いたかを葉の単位で出す
+  fixtures/                 Python が生成する見本（scripts/make_web_fixtures.py）
 deploy/systemd/             VPS(Linux)運用のsystemd unit（現行の稼働環境）。2本のタイマーで1日が閉じる
 deploy/ib-gateway/          IB Gatewayをヘッドレスで動かすdocker-compose（IBCが日次の再ログインを代行する）
 .github/workflows/ci.yml    CI。稼働環境と同じLinux・pandas 2系/3系でlint・型検査・番人テストを回す
@@ -1004,6 +1010,34 @@ python -m backtest.run --csv-dir bars --initial-equity 1220 --report report.md
 **実測（2026-09-03）:** 同じ入力の2回の実行で digest が一致し、日足1本の終値を
 $0.01 動かすと変わり、`--initial-equity` を1ドル動かすと変わり、`--report` の
 出力先だけを変えても変わらないことを確認した。
+
+#### digest は2つの言語で独立に計算する（2026-09-03に追加）
+
+**レポートに書いてある digest を読み上げるだけでは、再現性を確かめたことにならない。**
+中身を書き換えたレポートも「一致」と表示されるためである。そこで `web/`
+（Next.js / TypeScript のビューア）は、同じ正規化を独立に実装して**計算し直してから**
+照合する。**2つの言語が同じ digest を出せること自体が、正規化が言語に依存して
+いないことの証明になっている。**
+
+揃えるために明示的に潰した食い違いが5つある。いずれも「動くが、ときどき違う
+答えを出す」形なので、**テストが無ければ気付けない**。
+
+| | Python | 素直に書いた TypeScript |
+| --- | --- | --- |
+| **整数と実数の区別** | `45` はそのまま / `1220.0` は `"1220.000000"` | `JSON.parse` が両方 `number` にして**区別が消える** |
+| **負のゼロ** | `-0.000000` | `(-0).toFixed(6)` は符号を落として `"0.000000"` |
+| **`inf` / `nan`** | 名前の文字列 | `JSON.parse` は `Infinity` を**読めない**（標準JSONに無い） |
+| **鍵の並び** | `sorted()` ＝文字列順 | 「整数に見える鍵」を数値順で先に置く |
+| **大きすぎる実数** | `%f` は常に展開 | `toFixed` は 1e21 以上で指数表記へ |
+
+**この過程で、書き出し側の欠陥が1つ見つかった。** Pythonの `json` は既定で
+`Infinity` / `NaN` という**標準JSONに無い表記**を書くため、プロフィットファクターが
+`inf` になった検証（負けトレードが0件）のレポートは、**他言語のパーサで読めない
+ファイルになっていた**。`_json_safe` で digest と同じ文字列へ落として直した
+（`tests/test_report.py` の `test_a_non_finite_number_is_still_valid_json` が番人）。
+
+**正規化に手を入れるときは、必ず両方を揃えること。** 手順と番人はルートの
+`CLAUDE.md` にある。**片方だけ緑にして先へ進んではならない。**
 
 ## 5. 取引ロジックの要件 (Trading Requirements)
 

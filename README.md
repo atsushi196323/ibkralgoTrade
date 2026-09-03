@@ -76,6 +76,7 @@ python -m backtest.run --csv examples/bars/AAPL.csv --mode backtest \
 | 構成 | 6パッケージ（接続 / データ取得 / 戦略判定 / 執行 / バックテスト / 運用スクリプト） |
 | 稼働 | VPS（Ubuntu）+ systemd による無人運用。平日22:15起動・翌06:05締め（日本時間） |
 | CI | GitHub Actions で lint（ruff）・型検査（mypy）・テストを、稼働環境と同じ Linux・pandas 2系/3系で実行 |
+| [`web/`](web/) | 検証レポートを突き合わせるビューア（Next.js / TypeScript strict・テスト43件）。**Python が書いた digest を独立に計算し直して照合する** |
 
 ## 構成
 
@@ -159,6 +160,20 @@ flowchart LR
 
 **祝日はスケジューラでは表現できない**（systemd の `OnCalendar` に除外の仕組みが無い）ため、判定は起動直前に行う。このとき**休場日（終了コード1）と判定失敗を区別すること**が要る——まとめて「起動しない」に倒すと、設定を間違えた日が休場日と同じ見た目になり、しかもスケジューラには成功として記録される。
 
+### レポートの突き合わせ（`web/`）
+
+`--report` が書いたレポートを2つ読み込み、**`result_digest` を計算し直して**照合する Next.js のビューア。一致しなければ、入力・パラメータ・結果のどこが動いたのかを葉の単位で示す。
+
+```bash
+cd web && npm install && npm run dev
+```
+
+**レポートに書いてある digest を読み上げるだけでは、確かめたことにならない**——中身を書き換えたレポートも「一致」と表示されてしまう。そこで正規化を TypeScript で独立に実装し、計算し直してから照合する。**2つの言語が同じ digest を出せること自体が、正規化が言語に依存していないことの証明になる。**
+
+揃えるのに明示的な処理が要った食い違いが5つある（`JSON.parse` が整数と実数の区別を落とす／`toFixed` が負のゼロの符号を落とす／`Infinity` が標準JSONに無い／JSが「整数に見える鍵」を数値順に並べる／`toFixed` が 1e21 以上で指数表記になる）。いずれも**動くが、ときどき違う答えを出す**形の食い違いで、テストが無ければ気付けない。詳細は [`web/README.md`](web/README.md)。
+
+見本は Python 側が生成し（`python -m scripts.make_web_fixtures`）、**Python と TypeScript の両方に番人テストがある**。片方の正規化だけを変えると、必ずどちらかが落ちる。
+
 ### ここから読む
 
 | 見たいもの | ファイル |
@@ -168,6 +183,7 @@ flowchart LR
 | 採否の判定（一貫性8項目） | [`backtest/robustness.py`](backtest/robustness.py) |
 | 生存バイアスを「消せないので上限で縛る」 | [`backtest/survivorship.py`](backtest/survivorship.py) |
 | 「なぜ1件も建たなかったか」を1画面で | [`scripts/daily_report.py`](scripts/daily_report.py) |
+| 2つの言語で同じ digest を出す | [`backtest/report.py`](backtest/report.py) と [`web/lib/canonical.ts`](web/lib/canonical.ts) |
 
 ## このシステムが難しい理由
 

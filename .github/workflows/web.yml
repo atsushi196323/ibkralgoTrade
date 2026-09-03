@@ -1,0 +1,68 @@
+# `web/`（レポートの突き合わせビューア）の検査。
+#
+# **Python側のCIとは別の workflow にしてある。** 片方のツールチェーンの都合で
+# もう片方が落ちると、CIが「何を保証しているか」が読めなくなる。
+# ただし**実行は絞らない**（下記）。
+#
+# **このジョブが本当に守っているもの。** lint と型検査は前提であって、
+# 中心は `lib/canonical.test.ts` である——Python が書いた見本から
+# TypeScript が独立に digest を計算し直し、一致するかを見る。
+# ここが緑であることは、**正規化の設計が言語に依存していない**ことの証明になる。
+# 逆にここが落ちたときは、どちらかの言語だけで正規化を変えたということなので、
+# 「テストを直す」のではなく **両方を揃える** のが正しい直し方である。
+
+name: web
+
+# **paths で絞らない。** `web/fixtures/` は Python 側（`backtest/report.py` と
+# `scripts/make_web_fixtures.py`）が生成するので、Pythonだけの変更でも
+# TypeScript側の照合が落ちうる。**落ちるべきときに走らないCIは、
+# 緑であること自体が誤った知らせになる。**
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: web
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          # digest の計算に使う crypto.subtle は Node 18 以降に標準で入っている。
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # 依存は package-lock.json のとおりに入れる（npm install だと解決が動きうる）。
+      - run: npm ci
+
+      - name: 既知の脆弱性が無いこと
+        # 公開リポジトリなので、依存の警告を放置した状態が外から見える。
+        run: npm audit --audit-level=high
+
+      - name: eslint
+        run: npm run lint
+
+      - name: 型検査（strict）
+        run: npm run typecheck
+
+      - name: テスト（Pythonが書いた digest との照合を含む）
+        run: npm test
+
+      - name: 静的書き出しが通ること
+        run: npm run build

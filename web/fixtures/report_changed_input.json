@@ -1,0 +1,81 @@
+{
+  "command": "python -m backtest.run --csv-dir bars --report report.json",
+  "environment": {
+    "pandas": "2.2.2",
+    "platform": "linux",
+    "python": "3.11.10"
+  },
+  "generated_at": "2026-09-03T00:00:00+00:00",
+  "inputs": [
+    {
+      "bars_sha256": "fa566b0ecb2b4176aef125cb1510dc4f5f50b55d12771095391c29cacdf01bbc",
+      "columns": [
+        "close",
+        "date"
+      ],
+      "file_sha256": null,
+      "first_date": "2026-01-02T00:00:00",
+      "last_date": "2026-01-04T00:00:00",
+      "num_bars": 3,
+      "path": null,
+      "symbol": "AAPL"
+    },
+    {
+      "bars_sha256": "a7870ebf386aa6607f0f2c876e730e3a76476ff2ce244b942b4aff0e6a96dda7",
+      "columns": [
+        "close",
+        "date"
+      ],
+      "file_sha256": null,
+      "first_date": "2026-01-02T00:00:00",
+      "last_date": "2026-01-03T00:00:00",
+      "num_bars": 2,
+      "path": null,
+      "symbol": "KO"
+    }
+  ],
+  "mode": "walk-forward-multi",
+  "parameters": {
+    "costs": {
+      "commission_per_share": 0.0035,
+      "max_commission_pct_of_notional": 1.0,
+      "min_commission_per_order": 1.0,
+      "slippage_pct": 0.05
+    },
+    "grid": {
+      "close_at_session_end": false,
+      "ma_window": [
+        20,
+        30,
+        40
+      ]
+    },
+    "initial_equity": 1220.0,
+    "note": "日本語のラベルもそのまま入る",
+    "price_column": null
+  },
+  "result_digest": "3c430a309864f7d32719c222a1a6a4f6c72e86049eb37641568e1e6931bc5929",
+  "results": {
+    "combined": {
+      "num_trades": 45,
+      "profit_factor": 1.164321,
+      "total_pnl": -0.0,
+      "win_rate_pct": 37.777777
+    },
+    "per_symbol": [
+      {
+        "num_trades": 30,
+        "profit_factor": 1.25,
+        "symbol": "AAPL"
+      },
+      {
+        "num_trades": 15,
+        "profit_factor": 0.98,
+        "symbol": "KO"
+      }
+    ],
+    "skipped_windows": 2,
+    "unbeaten_profit_factor": "inf"
+  },
+  "schema_version": 1
+}

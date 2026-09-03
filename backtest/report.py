@@ -77,6 +77,27 @@ def _canonical(value: Any) -> Any:
     return str(value)
 
 
+def _json_safe(value: Any) -> Any:
+    """JSONとして書き出せる形へ落とす。
+
+    **`inf` / `nan` を数値のまま書いてはならない。** Pythonの `json` は既定で
+    `Infinity` / `NaN` という**標準JSONに無い表記**を出すため、その行が入った
+    レポートは他の言語のパーサ（`JSON.parse` 等）で読めなくなる。
+    プロフィットファクターは負けトレードが0件だと `inf` になるので、
+    これは例外的な状況ではない。
+
+    **digest と同じ文字列に落とすこと**（`_canonical` を参照）。別の表記に
+    すると、書き出したレポートから digest を計算し直した値が合わなくなる。
+    """
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        return _canonical(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def compute_digest(payload: Any) -> str:
     """辞書やリストから、環境に依存しない SHA-256 を作る。"""
     canonical = json.dumps(
@@ -343,7 +364,9 @@ def write_report(path: str, report: RunReport) -> str:
     if path.lower().endswith(".md"):
         payload = format_markdown(report)
     else:
-        payload = json.dumps(report.to_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        payload = json.dumps(
+            _json_safe(report.to_dict()), ensure_ascii=False, indent=2, sort_keys=True,
+        ) + "\n"
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(payload)
     return report.result_digest
