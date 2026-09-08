@@ -34,7 +34,24 @@ body {
   line-height: 1.7;
 }
 
-main { max-width: 1000px; margin: 0 auto; padding: 2.5rem 1.25rem 5rem; }
+main { max-width: 1000px; margin: 0 auto; padding: 2rem 1.25rem 5rem; }
+
+/* 単体で開かれる画面なので、どのプロジェクトの一部かを常に上に出しておく。 */
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: baseline;
+  justify-content: space-between;
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 0.9rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.85rem;
+}
+.topbar-title { color: var(--muted); }
+.topbar-title strong { color: var(--fg); }
+.topbar a { color: var(--accent); }
 
 h1 { font-size: 1.5rem; margin: 0 0 0.5rem; }
 h2 { font-size: 1.1rem; margin: 2.5rem 0 0.75rem; }
@@ -53,6 +70,9 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
   background: var(--panel);
 }
 .slot.filled { border-style: solid; }
+/* ドロップできることは、ドラッグしてみるまで分からない。離してよい場所であることを返す。 */
+.slot.dragging { border-color: var(--accent); border-style: solid; }
+.slot-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
 .slot h3 { margin: 0 0 0.5rem; font-size: 0.95rem; }
 .slot dl { display: grid; grid-template-columns: auto 1fr; gap: 0.15rem 0.75rem; margin: 0.5rem 0 0; }
 .slot dt { color: var(--muted); font-size: 0.8rem; }
@@ -91,8 +111,45 @@ button {
 }
 button:hover { border-color: var(--accent); }
 
+/* 入力そのものは見た目から外すが、フォーカスは受ける（キーボードで辿り着ける）。 */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.picker {
+  display: block;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  cursor: pointer;
+  text-align: center;
+}
+.picker:hover { border-color: var(--accent); }
+/* 入力を隠しているので、フォーカスリングはラベル側に出す。 */
+.slot:focus-within .picker { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* 読み込んだ後も差し替えられるように残すが、主役はレポートの中身なので小さくする。 */
+.slot.filled .picker { padding: 0.35rem 0.6rem; }
+.slot.filled .picker-sub { display: none; }
+.picker-main { display: block; font-size: 0.9rem; }
+.slot.filled .picker-main { font-size: 0.8rem; color: var(--muted); }
+.picker-sub { display: block; color: var(--muted); font-size: 0.75rem; }
+
+button.ghost { padding: 0.15rem 0.6rem; font-size: 0.8rem; background: transparent; }
+button.chosen { border-color: var(--accent); color: var(--accent); }
+
 .error { color: var(--bad); font-size: 0.85rem; }
+/* 読み上げのために常に置いてあるので、空のときは場所を取らせない。 */
+.error:empty { margin: 0; }
 .note { color: var(--muted); font-size: 0.85rem; }
 
 .samples { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 1.25rem 0 0; }
-.samples .note { margin-right: 0.25rem; }
+/* 見本は5つあり、注記と同じ行に置くと最後の1つだけが折り返して迷子になる。 */
+.samples .note { flex-basis: 100%; margin: 0; }

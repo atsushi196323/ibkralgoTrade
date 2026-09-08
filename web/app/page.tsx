@@ -36,6 +36,9 @@ const SAMPLE_BASE = `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/samples`;
 export default function Page() {
   const [left, setLeft] = useState<Slot>(EMPTY);
   const [right, setRight] = useState<Slot>(EMPTY);
+  // どの見本を見ているかは、押した後の画面からは読み取れない
+  // （左右のファイル名は出るが、5つのどれを押したのかは分からない）。
+  const [sample, setSample] = useState<string | null>(null);
 
   async function loadSample(name: string, set: (slot: Slot) => void): Promise<void> {
     try {
@@ -48,6 +51,7 @@ export default function Page() {
   }
 
   async function load(file: File, set: (slot: Slot) => void): Promise<void> {
+    setSample(null);
     try {
       const report = await readReport(file.name, await file.text());
       set({ report, error: null });
@@ -86,16 +90,19 @@ export default function Page() {
 
       <div className="samples">
         <span className="note">手元にレポートが無ければ、見本で試せる（左＝基準）:</span>
-        {SAMPLES.map((sample) => (
+        {SAMPLES.map((item) => (
           <button
-            key={sample.file}
+            key={item.file}
             type="button"
+            className={sample === item.file ? "chosen" : undefined}
+            aria-pressed={sample === item.file}
             onClick={() => {
+              setSample(item.file);
               void loadSample("report_base.json", setLeft);
-              void loadSample(sample.file, setRight);
+              void loadSample(item.file, setRight);
             }}
           >
-            {sample.label}
+            {item.label}
           </button>
         ))}
       </div>
@@ -106,12 +113,20 @@ export default function Page() {
           report={left.report}
           error={left.error}
           onFile={(file) => void load(file, setLeft)}
+          onClear={() => {
+            setLeft(EMPTY);
+            setSample(null);
+          }}
         />
         <ReportSlot
           label="右のレポート"
           report={right.report}
           error={right.error}
           onFile={(file) => void load(file, setRight)}
+          onClear={() => {
+            setRight(EMPTY);
+            setSample(null);
+          }}
         />
       </div>
 

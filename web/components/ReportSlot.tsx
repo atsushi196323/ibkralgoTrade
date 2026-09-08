@@ -1,5 +1,7 @@
 "use client";
 
+import { useId, useState } from "react";
+
 import type { Report } from "@/lib/report";
 
 interface Props {
@@ -7,34 +9,72 @@ interface Props {
   readonly report: Report | null;
   readonly error: string | null;
   readonly onFile: (file: File) => void;
+  readonly onClear: () => void;
 }
 
 /** 1つ分のレポート受け口。**digest の真偽をここで必ず出す。** */
-export function ReportSlot({ label, report, error, onFile }: Props) {
+export function ReportSlot({ label, report, error, onFile, onClear }: Props) {
+  // ドロップできることは、実際にドラッグしてみるまで分からない。
+  // **枠の見た目を変えて、離してよい場所であることをその場で返す。**
+  const [dragging, setDragging] = useState(false);
+  const inputId = useId();
+
+  const classes = ["slot"];
+  if (report) classes.push("filled");
+  if (dragging) classes.push("dragging");
+
   return (
-    <div
-      className={report ? "slot filled" : "slot"}
-      onDragOver={(event) => event.preventDefault()}
+    <section
+      className={classes.join(" ")}
+      aria-label={label}
+      onDragOver={(event) => {
+        event.preventDefault();
+        setDragging(true);
+      }}
+      onDragLeave={() => setDragging(false)}
       onDrop={(event) => {
         event.preventDefault();
+        setDragging(false);
         const file = event.dataTransfer.files[0];
         if (file) onFile(file);
       }}
     >
-      <h3>{label}</h3>
+      <div className="slot-head">
+        <h3>{label}</h3>
+        {report && (
+          <button type="button" className="ghost" onClick={onClear}>
+            外す
+          </button>
+        )}
+      </div>
 
-      <label>
-        <input
-          type="file"
-          accept="application/json,.json"
-          onChange={(event) => {
-            const file = event.target.files?.[0];
-            if (file) onFile(file);
-          }}
-        />
+      {/* **`<label>` にテキストを持たせる。** 素の `<input type="file">` だけだと、
+          読み上げでは「ファイル選択」としか聞こえず、左右どちらの受け口かが分からない。
+          入力自体は見た目から外すがフォーカスは受けるので、キーボードでも辿り着ける。 */}
+      <label className="picker" htmlFor={inputId}>
+        <span className="picker-main">
+          {report ? "別のファイルに差し替える" : "JSONファイルを選ぶ"}
+        </span>
+        <span className="picker-sub">ここへドラッグしても読み込む</span>
       </label>
+      <input
+        id={inputId}
+        className="visually-hidden"
+        type="file"
+        accept="application/json,.json"
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          if (file) onFile(file);
+          // 同じファイルを選び直しても `change` が起きるようにする
+          // （外した直後に同じものを読み込めないと、行き止まりに見える）。
+          event.target.value = "";
+        }}
+      />
 
-      {error && <p className="error">{error}</p>}
+      {/* 読み込みの失敗は、その場で読み上げられないと「反応しない画面」になる。 */}
+      <p className="error" role="status">
+        {error}
+      </p>
 
       {report && (
         <>
@@ -68,6 +108,6 @@ export function ReportSlot({ label, report, error, onFile }: Props) {
           </dl>
         </>
       )}
-    </div>
+    </section>
   );
 }

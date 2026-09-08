@@ -167,6 +167,9 @@ flowchart LR
 
 **公開先: <https://atsushi196323.github.io/ibkralgoTrade/>**（GitHub Pages・静的書き出し。読み込んだレポートはブラウザの中だけで処理され、どこへも送られない）
 
+[![レポートの突き合わせ画面](docs/images/report-viewer.png)](https://atsushi196323.github.io/ibkralgoTrade/)
+
+
 `--report` が書いたレポートを2つ読み込み、**`result_digest` を計算し直して**照合する Next.js のビューア。一致しなければ、入力・パラメータ・結果のどこが動いたのかを葉の単位で示す。手元にレポートが無い場合のために、Python 側が生成した見本を5通り同梱してある（同じ入力／入力だけ違う／設定だけ違う／結果だけ違う／環境だけ違う）。
 
 ```bash
