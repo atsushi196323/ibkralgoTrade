@@ -48,6 +48,17 @@ export function ReportSlot({ label, report, error, onFile, onClear }: Props) {
         )}
       </div>
 
+      {report && (
+        <p className="slot-id">
+          <span className="mono">{report.name}</span>{" "}
+          {report.digestIsAuthentic ? (
+            <span className="pill ok">digest 照合 OK</span>
+          ) : (
+            <span className="pill bad">digest が中身と一致しない</span>
+          )}
+        </p>
+      )}
+
       {/* **`<label>` にテキストを持たせる。** 素の `<input type="file">` だけだと、
           読み上げでは「ファイル選択」としか聞こえず、左右どちらの受け口かが分からない。
           入力自体は見た目から外すがフォーカスは受けるので、キーボードでも辿り着ける。 */}
@@ -77,17 +88,11 @@ export function ReportSlot({ label, report, error, onFile, onClear }: Props) {
       </p>
 
       {report && (
-        <>
-          <p>
-            {report.digestIsAuthentic ? (
-              <span className="pill ok">digest 照合 OK</span>
-            ) : (
-              <span className="pill bad">digest が中身と一致しない</span>
-            )}
-          </p>
+        // **既定では畳む。** digest 64桁・生成時刻・実行環境は、照合が失敗した
+        // ときに初めて読む値であって、正常時に画面の一番広い面積を取る理由が無い。
+        <details className="meta">
+          <summary>詳細（digest・生成時刻・実行環境）</summary>
           <dl>
-            <dt>ファイル</dt>
-            <dd>{report.name}</dd>
             <dt>digest</dt>
             <dd className="mono">{report.recomputedDigest}</dd>
             <dt>モード</dt>
@@ -97,7 +102,12 @@ export function ReportSlot({ label, report, error, onFile, onClear }: Props) {
             <dt>入力</dt>
             <dd>
               {report.inputs.length}銘柄 /{" "}
-              {report.inputs.reduce((total, input) => total + input.numBars, 0).toLocaleString()}本
+              {/* ロケールを固定する。**書き出し時（Node）と閲覧時（ブラウザ）で
+                  区切り文字が変わると、prerender した HTML と食い違う。** */}
+              {report.inputs
+                .reduce((total, input) => total + input.numBars, 0)
+                .toLocaleString("ja-JP")}
+              本
             </dd>
             <dt>環境</dt>
             <dd>
@@ -106,7 +116,7 @@ export function ReportSlot({ label, report, error, onFile, onClear }: Props) {
                 .join("  ")}
             </dd>
           </dl>
-        </>
+        </details>
       )}
     </section>
   );

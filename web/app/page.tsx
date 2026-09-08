@@ -1,198 +1,58 @@
-"use client";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 
-import { useMemo, useState } from "react";
-
-import { DiffTable } from "@/components/DiffTable";
-import { ReportSlot } from "@/components/ReportSlot";
-import { describeDiff, diffPayloads } from "@/lib/diff";
-import { readReport, type Report } from "@/lib/report";
-
-interface Slot {
-  readonly report: Report | null;
-  readonly error: string | null;
-}
-
-const EMPTY: Slot = { report: null, error: null };
+import { Comparer, type SampleSource } from "@/components/Comparer";
+import { readReport } from "@/lib/report";
+import { BASE_FILE, DEFAULT_SAMPLE_ID, findSample, SAMPLES } from "@/lib/samples";
 
 /**
- * 公開した画面を開いた人が、手元にレポートを持っていなくても試せるようにする。
+ * **開いた瞬間に、この画面の答えが見えている状態にする。**
  *
- * **見本は Python 側が生成したもの**（`python -m scripts.make_web_fixtures`）で、
- * `fixtures/` から `public/samples/` へ複製している。ここで作った偽物ではない
- * ——偽物を置くと、この画面が確かめていること（**Python が書いた digest を
- * 計算し直して一致させる**）を、自分で作った値で確かめることになる。
+ * 空の受け口を先に見せると、読み手は「JSONを選べと言われた」で離脱する。
+ * この画面の値打ちは差分が並んだ結果の側にあるので、書き出しの時点で既定の
+ * 見本を突き合わせておき、静的HTMLにその結果ごと入れる。
+ *
+ * **見本は取得しに行かず、ビルド時に埋め込む**（1件あたり2KB弱）。開いた
+ * 直後に空の画面が一瞬出ることが無く、経路も1本で済む——`fetch` にすると
+ * 「既定の見本」と「押して切り替えた見本」で読み込み方が二手に分かれる。
+ *
+ * **ただしここで計算した digest は、そのまま結論にしない。** ブラウザ側で
+ * 必ず計算し直す（`components/Comparer.tsx`）。読む側が計算し直して初めて
+ * 「その digest がその中身から出た」と言える、というのがこの画面の主張である。
  */
-const SAMPLES = [
-  { label: "同じ入力・同じ設定", file: "report_base.json" },
-  { label: "入力だけ違う", file: "report_changed_input.json" },
-  { label: "設定だけ違う", file: "report_changed_parameters.json" },
-  { label: "結果だけ違う", file: "report_changed_results.json" },
-  { label: "環境だけ違う（digest は一致）", file: "report_same_digest_other_environment.json" },
-] as const;
+async function loadSamples(): Promise<readonly SampleSource[]> {
+  const directory = path.join(process.cwd(), "fixtures");
+  return Promise.all(
+    SAMPLES.map(async (sample) => ({
+      ...sample,
+      text: await readFile(path.join(directory, sample.file), "utf8"),
+    })),
+  );
+}
 
-// 静的書き出しでは basePath の下に置かれるので、そこを起点にする。
-const SAMPLE_BASE = `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/samples`;
+export default async function Page() {
+  const samples = await loadSamples();
 
-export default function Page() {
-  const [left, setLeft] = useState<Slot>(EMPTY);
-  const [right, setRight] = useState<Slot>(EMPTY);
-  // どの見本を見ているかは、押した後の画面からは読み取れない
-  // （左右のファイル名は出るが、5つのどれを押したのかは分からない）。
-  const [sample, setSample] = useState<string | null>(null);
+  const initial = findSample(DEFAULT_SAMPLE_ID);
+  if (!initial) throw new Error(`既定の見本 ${DEFAULT_SAMPLE_ID} が SAMPLES にありません。`);
 
-  async function loadSample(name: string, set: (slot: Slot) => void): Promise<void> {
-    try {
-      const response = await fetch(`${SAMPLE_BASE}/${name}`);
-      if (!response.ok) throw new Error(`見本を取得できません（HTTP ${response.status}）`);
-      set({ report: await readReport(name, await response.text()), error: null });
-    } catch (error) {
-      set({ report: null, error: error instanceof Error ? error.message : String(error) });
-    }
-  }
+  const textOf = (file: string): string => {
+    const found = samples.find((sample) => sample.file === file);
+    if (!found) throw new Error(`見本 ${file} を読み込めませんでした。`);
+    return found.text;
+  };
 
-  async function load(file: File, set: (slot: Slot) => void): Promise<void> {
-    setSample(null);
-    try {
-      const report = await readReport(file.name, await file.text());
-      set({ report, error: null });
-    } catch (error) {
-      // **例外を握り潰さない。** 利用者が渡すのは任意のファイルなので、
-      // 何が悪かったのかを言わないと「反応しない画面」になる。
-      set({ report: null, error: error instanceof Error ? error.message : String(error) });
-    }
-  }
-
-  const comparison = useMemo(() => {
-    if (!left.report || !right.report) return null;
-    const summary = diffPayloads(left.report.payload, right.report.payload);
-    return { summary, headline: describeDiff(summary) };
-  }, [left.report, right.report]);
-
-  const digestsMatch =
-    left.report && right.report
-      ? left.report.recomputedDigest === right.report.recomputedDigest
-      : null;
-
-  const tampered =
-    (left.report && !left.report.digestIsAuthentic) ||
-    (right.report && !right.report.digestIsAuthentic);
+  const [initialLeft, initialRight] = await Promise.all([
+    readReport(BASE_FILE, textOf(BASE_FILE)),
+    readReport(initial.file, textOf(initial.file)),
+  ]);
 
   return (
-    <main>
-      <h1>レポートの突き合わせ</h1>
-      <p className="lede">
-        <code>python -m backtest.run --report out.json</code> が書いたレポートを2つ読み込み、
-        <code>result_digest</code> を<strong>計算し直して</strong>照合する。一致しなければ、
-        入力・パラメータ・結果のどこが動いたのかを葉の単位で並べる。
-        <br />
-        ファイルはブラウザの中だけで処理し、どこにも送らない。
-      </p>
-
-      <div className="samples">
-        <span className="note">手元にレポートが無ければ、見本で試せる（左＝基準）:</span>
-        {SAMPLES.map((item) => (
-          <button
-            key={item.file}
-            type="button"
-            className={sample === item.file ? "chosen" : undefined}
-            aria-pressed={sample === item.file}
-            onClick={() => {
-              setSample(item.file);
-              void loadSample("report_base.json", setLeft);
-              void loadSample(item.file, setRight);
-            }}
-          >
-            {item.label}
-          </button>
-        ))}
-      </div>
-
-      <div className="slots">
-        <ReportSlot
-          label="左のレポート"
-          report={left.report}
-          error={left.error}
-          onFile={(file) => void load(file, setLeft)}
-          onClear={() => {
-            setLeft(EMPTY);
-            setSample(null);
-          }}
-        />
-        <ReportSlot
-          label="右のレポート"
-          report={right.report}
-          error={right.error}
-          onFile={(file) => void load(file, setRight)}
-          onClear={() => {
-            setRight(EMPTY);
-            setSample(null);
-          }}
-        />
-      </div>
-
-      {tampered && (
-        <div className="verdict tampered">
-          <strong>digest が中身と一致しないレポートがあります。</strong>
-          <p className="note">
-            書かれている <code>result_digest</code> と、中身から計算し直した値が違う。
-            レポートが編集されたか、書き出した実装とこのビューアの正規化がずれている。
-            <strong>どちらであれ、この比較の結果は当てにできない。</strong>
-          </p>
-        </div>
-      )}
-
-      {comparison && digestsMatch !== null && (
-        <>
-          <div className={digestsMatch ? "verdict match" : "verdict differ"}>
-            <strong>
-              {digestsMatch
-                ? "digest が一致：同じ入力・同じ設定・同じ結果"
-                : "digest が不一致：本文のどこかが違う"}
-            </strong>
-            <p className="note">{comparison.headline}</p>
-          </div>
-
-          {!comparison.summary.identical && (
-            <>
-              <h2>変化した箇所（{comparison.summary.changes.length}件）</h2>
-              <DiffTable changes={comparison.summary.changes} />
-            </>
-          )}
-
-          {comparison.summary.identical && !digestsMatch && (
-            <p className="note">
-              本文に差が無いのに digest が違う。
-              <strong>正規化の実装がずれている疑いがある。</strong>
-            </p>
-          )}
-        </>
-      )}
-
-      <h2>この画面が答えること</h2>
-      <table>
-        <tbody>
-          <tr>
-            <td>入力だけが違う</td>
-            <td>別のデータで回した。結果が違うのは当然</td>
-          </tr>
-          <tr>
-            <td>パラメータだけが違う</td>
-            <td>設定を変えた。同じ条件の比較になっていない</td>
-          </tr>
-          <tr>
-            <td>
-              <strong>入力もパラメータも同じなのに結果が違う</strong>
-            </td>
-            <td>
-              <strong>コードが変わったか、実装に環境依存が入り込んだ</strong>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <p className="note">
-        実行時刻・実行環境・コマンドは digest に含まれない。確かめたいのは
-        「環境が変わっても数字が変わらないこと」なので、環境を混ぜると比較そのものが成立しない。
-      </p>
-    </main>
+    <Comparer
+      samples={samples}
+      defaultSampleId={DEFAULT_SAMPLE_ID}
+      initialLeft={initialLeft}
+      initialRight={initialRight}
+    />
   );
 }

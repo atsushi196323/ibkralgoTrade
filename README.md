@@ -169,6 +169,8 @@ flowchart LR
 
 [![レポートの突き合わせ画面](docs/images/report-viewer.png)](https://atsushi196323.github.io/ibkralgoTrade/)
 
+**開いた瞬間に、上の画像の状態から始まる**（見本を1組ビルド時に埋め込んである）。見本は URL で指せる: [結果だけ違う](https://atsushi196323.github.io/ibkralgoTrade/#results) / [設定だけ違う](https://atsushi196323.github.io/ibkralgoTrade/#parameters) / [環境だけ違う（digest は一致）](https://atsushi196323.github.io/ibkralgoTrade/#environment)
+
 
 `--report` が書いたレポートを2つ読み込み、**`result_digest` を計算し直して**照合する Next.js のビューア。一致しなければ、入力・パラメータ・結果のどこが動いたのかを葉の単位で示す。手元にレポートが無い場合のために、Python 側が生成した見本を5通り同梱してある（同じ入力／入力だけ違う／設定だけ違う／結果だけ違う／環境だけ違う）。
 
