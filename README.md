@@ -1,6 +1,9 @@
 # 米国株 自動売買システム（Interactive Brokers API）
 
 [![CI](https://github.com/atsushi196323/ibkralgoTrade/actions/workflows/ci.yml/badge.svg)](https://github.com/atsushi196323/ibkralgoTrade/actions/workflows/ci.yml)
+[![web](https://github.com/atsushi196323/ibkralgoTrade/actions/workflows/web.yml/badge.svg)](https://github.com/atsushi196323/ibkralgoTrade/actions/workflows/web.yml)
+
+**動くものを先に見る場合:** [レポートの突き合わせビューア](https://atsushi196323.github.io/ibkralgoTrade/)（インストール不要・見本を同梱してあるので手元にレポートが無くても押すだけで動く）
 
 Interactive Brokers の API を用い、米国株の押し目買い（日足の移動平均からの下方乖離）を検知して発注し、利確・損切りをブローカー側の待機注文（ブラケット注文）として置く自動売買システム。VPS 上で systemd により無人稼働する。
 
@@ -35,7 +38,7 @@ Interactive Brokers の API を用い、米国株の押し目買い（日足の�
 ```bash
 pip install -r requirements-dev.txt
 
-# 番人テスト 953件（IBKRへの実接続なし・全てモック）
+# 番人テスト 994件（IBKRへの実接続なし・全てモック）
 python -m pytest -q
 
 # 単一銘柄のバックテスト（コスト込み・1秒未満）
@@ -70,7 +73,7 @@ python -m backtest.run --csv examples/bars/AAPL.csv --mode backtest \
 | | |
 | --- | --- |
 | 本体のコード | 14,677行 |
-| テストコード | 14,732行 / **953件** — IBKRへの実接続なし（全てモック）・約2秒で完走 |
+| テストコード | 15,029行 / **994件** — IBKRへの実接続なし（全てモック）・約2秒で完走 |
 | カバレッジ | 87%（`main.py` 91% / `execution/order_manager.py` 96%） |
 | 型注釈 | 戻り値 416関数中 413（99%）・mypy 通過 |
 | 構成 | 6パッケージ（接続 / データ取得 / 戦略判定 / 執行 / バックテスト / 運用スクリプト） |
@@ -162,7 +165,9 @@ flowchart LR
 
 ### レポートの突き合わせ（`web/`）
 
-`--report` が書いたレポートを2つ読み込み、**`result_digest` を計算し直して**照合する Next.js のビューア。一致しなければ、入力・パラメータ・結果のどこが動いたのかを葉の単位で示す。
+**公開先: <https://atsushi196323.github.io/ibkralgoTrade/>**（GitHub Pages・静的書き出し。読み込んだレポートはブラウザの中だけで処理され、どこへも送られない）
+
+`--report` が書いたレポートを2つ読み込み、**`result_digest` を計算し直して**照合する Next.js のビューア。一致しなければ、入力・パラメータ・結果のどこが動いたのかを葉の単位で示す。手元にレポートが無い場合のために、Python 側が生成した見本を5通り同梱してある（同じ入力／入力だけ違う／設定だけ違う／結果だけ違う／環境だけ違う）。
 
 ```bash
 cd web && npm install && npm run dev
