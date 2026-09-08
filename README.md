@@ -5,6 +5,26 @@
 
 **動くものを先に見る場合:** [レポートの突き合わせビューア](https://atsushi196323.github.io/ibkralgoTrade/)（インストール不要・見本を同梱してあるので手元にレポートが無くても押すだけで動く）
 
+<details>
+<summary><b>In English</b> — what this repository is</summary>
+
+An automated US-equity trading system on the Interactive Brokers API (Python, `ib_async`), running unattended
+on a VPS under systemd — together with the measurement toolkit built to decide whether the strategy was worth
+running at all. **The conclusion is that it was not, and proving that is the deliverable.**
+
+Measured against a benchmark instead of against zero, the mean-reversion strategy's excess return is **+0.047%
+per trade (t = 0.09)**: 96% of its apparent profit was just the market rising while positions were held. Nine
+candidate signals were then evaluated with control groups and a survivorship-bias sensitivity analysis, and
+**none passed the eight-part consistency test.** No real money was ever deployed — the conditions for
+deploying it were defined in advance and never met.
+
+994 tests (all brokers mocked), CI across two pandas majors, and a Next.js viewer that **independently
+recomputes** the SHA-256 report digest Python writes; the two implementations agreeing is what shows the
+normalisation is not language-dependent. Design decisions, measurements and exit conditions are recorded in
+[`docs/DECISIONS.md`](docs/DECISIONS.md) (Japanese).
+
+</details>
+
 Interactive Brokers の API を用い、米国株の押し目買い（日足の移動平均からの下方乖離）を検知して発注し、利確・損切りをブローカー側の待機注文（ブラケット注文）として置く自動売買システム。VPS 上で systemd により無人稼働する。
 
 **現在はペーパー口座で注文層を検証している段階であり、実資金は投入していない。**
